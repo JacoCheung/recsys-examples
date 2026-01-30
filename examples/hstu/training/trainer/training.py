@@ -28,6 +28,7 @@ from commons.pipeline.train_pipeline import (
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logger import print_rank_0
 from commons.utils.stringify import stringify_dict
+from commons.utils.watchdog import watched_iter
 from megatron.core import parallel_state
 from model import RankingGR, RetrievalGR
 from modules.metrics import RetrievalTaskMetricWithSampling
@@ -156,7 +157,7 @@ def train_with_pipeline(
     pipeline._model.train()
     for batched_iterator in iter_slices:
         # for one slice(every eval interval)
-        for train_iter in count(start_iter):
+        for train_iter in watched_iter(count(start_iter), timeout=60, check_interval=1):
             if trainer_args.profile and train_iter == trainer_args.profile_step_start:
                 dist.barrier(device_ids=[torch.cuda.current_device()])
                 torch.cuda.profiler.start()
