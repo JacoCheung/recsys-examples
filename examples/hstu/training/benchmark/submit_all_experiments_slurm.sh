@@ -27,9 +27,8 @@
 #   └── {batch_timestamp}/           # Timestamp of this batch submission
 #       ├── exp0_baseline/           # First experiment
 #       │   ├── exp0_baseline_*.log
-#       │   ├── exp0_baseline_*.nsys-rep  (if nsys enabled)
-#       │   ├── hstu_exp0_baseline_*.out  # SLURM stdout
-#       │   └── hstu_exp0_baseline_*.err  # SLURM stderr
+#       │   ├── hstu_exp0_baseline_*.out  # SLURM stdout/stderr
+#       │   └── exp0_baseline_*.nsys-rep  (if nsys enabled)
 #       ├── exp1_cutlass/            # Second experiment
 #       │   ├── ...
 #       └── summary.txt              # Batch experiment summary
@@ -147,19 +146,21 @@ elif [ -z "$HSTU_ROOT" ]; then
 fi
 # If env var is set, use it directly (no additional action needed)
 
-# Verify HSTU_ROOT directory exists
-if [ ! -d "$HSTU_ROOT" ]; then
-    echo "❌ Error: HSTU_ROOT directory does not exist: $HSTU_ROOT"
-    exit 1
-fi
+# Verify HSTU_ROOT directory exists (skip in dry-run mode)
+if [ ${DRY_RUN} -eq 0 ]; then
+    if [ ! -d "$HSTU_ROOT" ]; then
+        echo "❌ Error: HSTU_ROOT directory does not exist: $HSTU_ROOT"
+        exit 1
+    fi
 
-# Verify directory structure (check for training subdirectory)
-if [ ! -d "$HSTU_ROOT/training" ]; then
-    echo "❌ Error: Invalid HSTU_ROOT - missing 'training' subdirectory"
-    echo "  HSTU_ROOT: $HSTU_ROOT"
-    echo ""
-    echo "Please ensure HSTU_ROOT points to 'recsys-examples/examples/hstu'"
-    exit 1
+    # Verify directory structure (check for training subdirectory)
+    if [ ! -d "$HSTU_ROOT/training" ]; then
+        echo "❌ Error: Invalid HSTU_ROOT - missing 'training' subdirectory"
+        echo "  HSTU_ROOT: $HSTU_ROOT"
+        echo ""
+        echo "Please ensure HSTU_ROOT points to 'recsys-examples/examples/hstu'"
+        exit 1
+    fi
 fi
 
 # Path configuration
@@ -188,38 +189,56 @@ BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 # ============================================================================
 # Check Experiment List File
 # ============================================================================
+# In dry-run mode, --exp-file is optional (will show command template)
 if [ -z "$EXP_FILE" ]; then
-    echo "❌ Error: Missing experiment list file (--exp-file=<file>)"
-    echo "Use --help for usage information"
-    exit 1
+    if [ ${DRY_RUN} -eq 0 ]; then
+        echo "❌ Error: Missing experiment list file (--exp-file=<file>)"
+        echo "Use --help for usage information"
+        exit 1
+    fi
 fi
 
-# If relative path, make it relative to examples/hstu
-if [[ ! "$EXP_FILE" = /* ]]; then
-    EXP_FILE="${HSTU_ROOT}/${EXP_FILE}"
-fi
-
-if [ ! -f "$EXP_FILE" ]; then
-    echo "❌ Error: Experiment list file not found: $EXP_FILE"
-    exit 1
-fi
-
-# Read experiment list (skip comments and empty lines)
+# Read experiment list if provided
 declare -a EXP_NAMES
 declare -a CONFIG_FILES
-while IFS=',' read -r exp_name config_path || [ -n "$exp_name" ]; do
-    # Skip empty lines and comments
-    [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
-    # Trim leading/trailing whitespace
-    exp_name=$(echo "$exp_name" | xargs)
-    config_path=$(echo "$config_path" | xargs)
-    EXP_NAMES+=("$exp_name")
-    CONFIG_FILES+=("$config_path")
-done < "$EXP_FILE"
 
-if [ ${#EXP_NAMES[@]} -eq 0 ]; then
-    echo "❌ Error: No experiments found in $EXP_FILE"
-    exit 1
+if [ -n "$EXP_FILE" ]; then
+    # If relative path, make it relative to examples/hstu
+    if [[ ! "$EXP_FILE" = /* ]]; then
+        EXP_FILE="${HSTU_ROOT}/${EXP_FILE}"
+    fi
+
+    if [ ! -f "$EXP_FILE" ]; then
+        if [ ${DRY_RUN} -eq 1 ]; then
+            echo "⚠️  Experiment list file not found: $EXP_FILE"
+            echo "   No experiments to run."
+            exit 0
+        else
+            echo "❌ Error: Experiment list file not found: $EXP_FILE"
+            exit 1
+        fi
+    fi
+
+    # Read experiment list (skip comments and empty lines)
+    while IFS=',' read -r exp_name config_path || [ -n "$exp_name" ]; do
+        # Skip empty lines and comments
+        [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
+        # Trim leading/trailing whitespace
+        exp_name=$(echo "$exp_name" | xargs)
+        config_path=$(echo "$config_path" | xargs)
+        EXP_NAMES+=("$exp_name")
+        CONFIG_FILES+=("$config_path")
+    done < "$EXP_FILE"
+
+    if [ ${#EXP_NAMES[@]} -eq 0 ]; then
+        if [ ${DRY_RUN} -eq 1 ]; then
+            echo "⚠️  No experiments found in $EXP_FILE"
+            exit 0
+        else
+            echo "❌ Error: No experiments found in $EXP_FILE"
+            exit 1
+        fi
+    fi
 fi
 
 # ============================================================================
@@ -252,6 +271,33 @@ echo ""
 echo -e "${BLUE}NSYS Profiling:${NC}"
 echo "  Enabled:          $([ ${ENABLE_NSYS} -eq 1 ] && echo -e '${GREEN}YES${NC}' || echo 'NO')"
 echo ""
+
+if [ ${DRY_RUN} -eq 1 ]; then
+    echo -e "${YELLOW}⚠️  DRY RUN MODE - Commands will be printed but not executed${NC}"
+    echo ""
+fi
+
+# If no experiment file provided (dry-run only), show command template and exit
+if [ -z "$EXP_FILE" ]; then
+    echo -e "${YELLOW}No experiment file provided. Showing sbatch command template:${NC}"
+    echo ""
+    echo "sbatch \\"
+    echo "    --job-name=hstu_<EXP_NAME> \\"
+    echo "    --output=<OUTPUT_DIR>/hstu_<EXP_NAME>_%j.out \\"
+    echo "    --partition=${PARTITION} \\"
+    echo "    --nodes=${NODES} \\"
+    echo "    --ntasks-per-node=${RANKS_PER_NODE} \\"
+    echo "    --gpus-per-node=${GPUS_PER_NODE} \\"
+    echo "    --cpus-per-task=8 \\"
+    echo "    --mem=0 \\"
+    echo "    --time=${TIME_LIMIT} \\"
+    echo "    --exclusive \\"
+    echo "    --export=HSTU_ROOT=<HSTU_ROOT>,EXP_NAME=<EXP_NAME>,CONFIG_FILE=<CONFIG_FILE>,EXP_OUTPUT_DIR=<OUTPUT_DIR>,ENABLE_NSYS=${ENABLE_NSYS} \\"
+    echo "    ${SCRIPT_DIR}/slurm_job.sub"
+    echo ""
+    exit 0
+fi
+
 echo -e "${BLUE}Batch timestamp:   ${BATCH_TIMESTAMP}${NC}"
 echo -e "${BLUE}Output directory:  ${BATCH_OUTPUT_DIR}${NC}"
 echo ""
@@ -262,11 +308,6 @@ for i in "${!EXP_NAMES[@]}"; do
     echo "  - ${EXP_NAMES[$i]}: ${CONFIG_FILES[$i]}"
 done
 echo ""
-
-if [ ${DRY_RUN} -eq 1 ]; then
-    echo -e "${YELLOW}⚠️  DRY RUN MODE - Commands will be printed but not executed${NC}"
-    echo ""
-fi
 
 # ============================================================================
 # Confirm Submission
@@ -309,7 +350,6 @@ for i in "${!EXP_NAMES[@]}"; do
     SBATCH_CMD="sbatch"
     SBATCH_CMD+=" --job-name=hstu_${exp}"
     SBATCH_CMD+=" --output=${EXP_OUTPUT_DIR}/hstu_${exp}_%j.out"
-    SBATCH_CMD+=" --error=${EXP_OUTPUT_DIR}/hstu_${exp}_%j.err"
     SBATCH_CMD+=" --partition=${PARTITION}"
     SBATCH_CMD+=" --nodes=${NODES}"
     SBATCH_CMD+=" --ntasks-per-node=${RANKS_PER_NODE}"
@@ -418,10 +458,11 @@ else
     for exp in "${EXP_NAMES[@]}"; do
         echo "  ├── ${exp}/"
         echo "  │   ├── ${exp}_*.log"
-        echo "  │   ├── hstu_${exp}_*.out"
-        echo "  │   ├── hstu_${exp}_*.err"
         if [ ${ENABLE_NSYS} -eq 1 ]; then
+            echo "  │   ├── hstu_${exp}_*.out"
             echo "  │   └── ${exp}_*.nsys-rep"
+        else
+            echo "  │   └── hstu_${exp}_*.out"
         fi
     done
     echo "  └── summary.txt"

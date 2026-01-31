@@ -111,23 +111,24 @@ elif [ -z "$HSTU_ROOT" ]; then
     HSTU_ROOT=$(pwd)
 fi
 
-# Verify HSTU_ROOT directory exists
-if [ ! -d "$HSTU_ROOT" ]; then
-    echo "❌ Error: HSTU_ROOT directory does not exist: $HSTU_ROOT"
-    exit 1
-fi
+# Verify HSTU_ROOT directory exists (skip in dry-run mode)
+if [ ${DRY_RUN} -eq 0 ]; then
+    if [ ! -d "$HSTU_ROOT" ]; then
+        echo "❌ Error: HSTU_ROOT directory does not exist: $HSTU_ROOT"
+        exit 1
+    fi
 
-# Verify directory structure
-if [ ! -d "$HSTU_ROOT/training" ]; then
-    echo "❌ Error: Invalid HSTU_ROOT - missing 'training' subdirectory"
-    echo "  HSTU_ROOT: $HSTU_ROOT"
-    echo ""
-    echo "Please ensure HSTU_ROOT points to 'recsys-examples/examples/hstu'"
-    exit 1
+    # Verify directory structure
+    if [ ! -d "$HSTU_ROOT/training" ]; then
+        echo "❌ Error: Invalid HSTU_ROOT - missing 'training' subdirectory"
+        echo "  HSTU_ROOT: $HSTU_ROOT"
+        echo ""
+        echo "Please ensure HSTU_ROOT points to 'recsys-examples/examples/hstu'"
+        exit 1
+    fi
 fi
 
 # Path configuration
-PROJECT_ROOT="${HSTU_ROOT}/../.."
 SCRIPT_DIR="${HSTU_ROOT}/training/benchmark"
 RESULTS_BASE="${SCRIPT_DIR}/results"
 
@@ -158,10 +159,12 @@ if [[ ! "$CONFIG_FILE" = /* ]]; then
     CONFIG_FILE="${HSTU_ROOT}/${CONFIG_FILE}"
 fi
 
-# Check config file
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "❌ Error: Config file not found: $CONFIG_FILE"
-    exit 1
+# Check config file (skip in dry-run mode)
+if [ ${DRY_RUN} -eq 0 ]; then
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "❌ Error: Config file not found: $CONFIG_FILE"
+        exit 1
+    fi
 fi
 
 # Color output
@@ -184,8 +187,8 @@ fi
 echo "=========================================="
 echo ""
 
-# Environment variable setup
-export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+# Environment variable setup (add HSTU_ROOT's parent directory to PYTHONPATH)
+export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 # Log file
@@ -241,7 +244,8 @@ echo "📝 Logging to: ${LOG_FILE}"
 echo "⏰ Started at: $(date)"
 echo ""
 
-# Already in examples/hstu directory, no need to cd
+# Change to HSTU_ROOT directory before running training
+cd ${HSTU_ROOT}
 
 if [ ${ENABLE_NSYS} -eq 1 ]; then
     # ========================================================================

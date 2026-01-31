@@ -21,7 +21,6 @@
 #SBATCH --container-image=gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest
 #SBATCH --container-mounts=/lustre:/lustre
 #SBATCH --output=hstu-e2e-benchmark-%j.out
-#SBATCH --error=hstu-e2e-benchmark-%j.err
 
 # ============================================================================
 # Parameter Description:
@@ -55,9 +54,6 @@ fi
 
 # Change to examples/hstu directory
 cd ${HSTU_ROOT}
-
-# Path configuration (based on examples/hstu as working directory)
-PROJECT_ROOT="${HSTU_ROOT}/../.."
 
 # Create output directory
 mkdir -p ${EXP_OUTPUT_DIR}
@@ -99,9 +95,9 @@ echo "=========================================="
 echo ""
 
 # ============================================================================
-# Environment Variable Setup
+# Environment Variable Setup (add HSTU_ROOT's parent directory to PYTHONPATH)
 # ============================================================================
-export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 
@@ -194,7 +190,8 @@ WRAPPER_EOF
     srun --kill-on-bad-exit=1 \
         bash -c "
             cd ${HSTU_ROOT} && \
-            ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} && \
+            export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
+            ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
             python ${TRAIN_CMD}
         " 2>&1 | tee ${LOG_FILE}
     
@@ -215,7 +212,7 @@ else
     echo ""
     
     srun --kill-on-bad-exit=1 \
-        bash -c "cd ${HSTU_ROOT} && python ${TRAIN_CMD}" \
+        bash -c "cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && python ${TRAIN_CMD}" \
         2>&1 | tee ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}

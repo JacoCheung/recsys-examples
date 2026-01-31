@@ -450,7 +450,6 @@ sbatch \
 # Redirect stdout/stderr to custom files
 sbatch \
     --output=/path/to/output/my_job_%j.out \
-    --error=/path/to/output/my_job_%j.err \
     --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=/path/to/output \
     /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
 ```
@@ -469,8 +468,7 @@ The script has the following default SLURM resource settings (can be overridden 
 | `--exclusive` | - | Exclusive node access |
 | `--container-image` | `gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest` | Container image |
 | `--container-mounts` | /lustre:/lustre | Mount host filesystem into container |
-| `--output` | hstu-e2e-benchmark-%j.out | SLURM stdout file (%j = job ID) |
-| `--error` | hstu-e2e-benchmark-%j.err | SLURM stderr file (%j = job ID) |
+| `--output` | hstu-e2e-benchmark-%j.out | SLURM stdout/stderr file (%j = job ID) |
 
 #### Output Structure
 
@@ -605,8 +603,7 @@ All logs are saved in the `results/` directory, filenames include experiment nam
 results/
 ├── {exp_name}_{timestamp}.log                    # Local run log
 ├── {exp_name}_{jobid}_{timestamp}.log            # SLURM job log
-├── {exp_name}_{jobid}.out                        # SLURM stdout
-├── {exp_name}_{jobid}.err                        # SLURM stderr
+├── {exp_name}_{jobid}.out                        # SLURM stdout/stderr
 └── submission_{timestamp}.log                    # Submission record
 ```
 

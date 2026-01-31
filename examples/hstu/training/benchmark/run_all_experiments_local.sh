@@ -102,19 +102,21 @@ elif [ -z "$HSTU_ROOT" ]; then
     HSTU_ROOT=$(pwd)
 fi
 
-# Verify HSTU_ROOT directory exists
-if [ ! -d "$HSTU_ROOT" ]; then
-    echo "❌ Error: HSTU_ROOT directory does not exist: $HSTU_ROOT"
-    exit 1
-fi
+# Verify HSTU_ROOT directory exists (skip in dry-run mode)
+if [ ${DRY_RUN} -eq 0 ]; then
+    if [ ! -d "$HSTU_ROOT" ]; then
+        echo "❌ Error: HSTU_ROOT directory does not exist: $HSTU_ROOT"
+        exit 1
+    fi
 
-# Verify directory structure
-if [ ! -d "$HSTU_ROOT/training" ]; then
-    echo "❌ Error: Invalid HSTU_ROOT - missing 'training' subdirectory"
-    echo "  HSTU_ROOT: $HSTU_ROOT"
-    echo ""
-    echo "Please ensure HSTU_ROOT points to 'recsys-examples/examples/hstu'"
-    exit 1
+    # Verify directory structure
+    if [ ! -d "$HSTU_ROOT/training" ]; then
+        echo "❌ Error: Invalid HSTU_ROOT - missing 'training' subdirectory"
+        echo "  HSTU_ROOT: $HSTU_ROOT"
+        echo ""
+        echo "Please ensure HSTU_ROOT points to 'recsys-examples/examples/hstu'"
+        exit 1
+    fi
 fi
 
 # Path configuration
@@ -147,14 +149,21 @@ if [[ ! "$EXP_FILE" = /* ]]; then
     EXP_FILE="${HSTU_ROOT}/${EXP_FILE}"
 fi
 
-if [ ! -f "$EXP_FILE" ]; then
-    echo "❌ Error: Experiment list file not found: $EXP_FILE"
-    exit 1
-fi
-
-# Read experiment list (skip comments and empty lines)
+# Read experiment list
 declare -a EXP_NAMES
 declare -a CONFIG_FILES
+
+if [ ! -f "$EXP_FILE" ]; then
+    if [ ${DRY_RUN} -eq 1 ]; then
+        echo "⚠️  Experiment list file not found: $EXP_FILE"
+        echo "   No experiments to run."
+        exit 0
+    else
+        echo "❌ Error: Experiment list file not found: $EXP_FILE"
+        exit 1
+    fi
+fi
+
 while IFS=',' read -r exp_name config_path || [ -n "$exp_name" ]; do
     # Skip empty lines and comments
     [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
@@ -166,8 +175,13 @@ while IFS=',' read -r exp_name config_path || [ -n "$exp_name" ]; do
 done < "$EXP_FILE"
 
 if [ ${#EXP_NAMES[@]} -eq 0 ]; then
-    echo "❌ Error: No experiments found in $EXP_FILE"
-    exit 1
+    if [ ${DRY_RUN} -eq 1 ]; then
+        echo "⚠️  No experiments found in $EXP_FILE"
+        exit 0
+    else
+        echo "❌ Error: No experiments found in $EXP_FILE"
+        exit 1
+    fi
 fi
 
 # Color output
@@ -223,12 +237,14 @@ if [ ${DRY_RUN} -eq 1 ]; then
             echo "        --config=${config} \\"
             echo "        --nproc=${NPROC} \\"
             echo "        --output-dir=${EXP_OUTPUT_DIR} \\"
+            echo "        --hstu-root=${HSTU_ROOT} \\"
             echo "        --nsys"
         else
             echo "    ${SCRIPT_DIR}/run_single_experiment_local.sh ${exp} \\"
             echo "        --config=${config} \\"
             echo "        --nproc=${NPROC} \\"
-            echo "        --output-dir=${EXP_OUTPUT_DIR}"
+            echo "        --output-dir=${EXP_OUTPUT_DIR} \\"
+            echo "        --hstu-root=${HSTU_ROOT}"
         fi
         echo ""
     done
@@ -298,8 +314,8 @@ for i in "${!EXP_NAMES[@]}"; do
     EXP_START=$(date +%s)
     EXP_START_DATE=$(date)
     
-    # Build run command, pass output directory
-    RUN_CMD="${SCRIPT_DIR}/run_single_experiment_local.sh ${exp} --config=${config} --nproc=${NPROC} --output-dir=${EXP_OUTPUT_DIR}"
+    # Build run command, pass output directory and HSTU_ROOT
+    RUN_CMD="${SCRIPT_DIR}/run_single_experiment_local.sh ${exp} --config=${config} --nproc=${NPROC} --output-dir=${EXP_OUTPUT_DIR} --hstu-root=${HSTU_ROOT}"
     if [ ${ENABLE_NSYS} -eq 1 ]; then
         RUN_CMD="${RUN_CMD} --nsys"
     fi
