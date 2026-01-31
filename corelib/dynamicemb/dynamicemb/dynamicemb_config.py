@@ -478,15 +478,14 @@ def get_constraint_capacity(
         dim + get_optimizer_state_dim(optimizer_type, dim, dtype)
     ) * dtype_to_bytes(dtype)
     bucket_size_in_bytes = bucket_capacity * byte_consume_per_vector
-    # If reserved HBM is less than one bucket, round up to one bucket
     if memory_bytes < bucket_size_in_bytes:
         warnings.warn(
-            f"Reserved HBM ({memory_bytes} bytes) is less than one bucket "
-            f"({bucket_size_in_bytes} bytes). Rounding up to one bucket.",
-            UserWarning,
+            f"reserved HBM bytes {memory_bytes} is less than one bucket {bucket_size_in_bytes}, will use {bucket_size_in_bytes} as the capacity"
         )
         memory_bytes = bucket_size_in_bytes
-    capacity = memory_bytes // byte_consume_per_vector  # at least one bucket
+    capacity = (
+        memory_bytes // byte_consume_per_vector
+    )  # maybe zero, we need at least one bucket
     return (capacity // bucket_capacity) * bucket_capacity
 
 

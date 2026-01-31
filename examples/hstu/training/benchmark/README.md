@@ -3,7 +3,7 @@
 In hstu example, we have provided a set of performance optimization guidelines for single HSTU layer, including
 1. Fast and memory-efficient hstu attention integration.
 2. Kernel fusions: layer norm + multiplication + dropout 
-3. Seletive forward recompute.
+3. Selective forward recompute.
 
 You can run script `run_hstu_benchmark.sh` to see the performance over the base implementation. The baseline is from [Meta's open source HSTU implementation](https://github.com/meta-recsys/generative-recommenders/tree/bb389f9539b054e7268528efcd35457a6ad52439), which features in:
 

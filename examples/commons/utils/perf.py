@@ -705,6 +705,7 @@ def get_mfu_summary(
     )
 
 
+
 def _compute_attn_fwd_flops(
     offsets: torch.Tensor,
     num_heads: int,

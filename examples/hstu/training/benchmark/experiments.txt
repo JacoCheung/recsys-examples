@@ -1,0 +1,26 @@
+# HSTU Benchmark Experiment List
+# Format: exp_name,generate_gin_config_options
+# Comment lines start with #
+#
+# The second column contains options for generate_gin_config.py script
+# Empty options means using all default values (baseline)
+#
+# Available options:
+#   --kernel_backend [triton|cutlass]   (default: triton)
+#   --recompute_layernorm               (default: False)
+#   --balanced_shuffler                 (default: False)
+#   --caching                           (default: False)
+#   --ratio FLOAT                       (default: 0, auto-set to 0.1 when caching enabled)
+#   --evict [lru|lfu]                   (default: lru)
+#   --pipeline_type [none|prefetch]     (default: none)
+#   --tp_size INT                       (default: 1)
+
+exp0_baseline,
+exp1_cutlass,--kernel_backend cutlass
+exp2_recompute,--kernel_backend cutlass --recompute_layernorm
+exp3_workload_balancer,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler
+exp4_dynamicemb_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
+exp5_lfu,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu
+exp6_pipeline,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch
+exp7_tp,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
+exp8_full,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
