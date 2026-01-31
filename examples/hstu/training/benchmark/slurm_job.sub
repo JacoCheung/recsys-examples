@@ -19,6 +19,7 @@
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
 #SBATCH --container-image=gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest
+#SBATCH --container-mounts=/lustre:/lustre
 #SBATCH --output=hstu-e2e-benchmark-%j.out
 #SBATCH --error=hstu-e2e-benchmark-%j.err
 
@@ -191,13 +192,11 @@ WRAPPER_EOF
     
     # Use srun to launch distributed training + nsys profile
     srun --kill-on-bad-exit=1 \
-        ${WRAPPER_SCRIPT} \
-        ${EXP_NAME} \
-        ${EXP_OUTPUT_DIR} \
-        ${SLURM_JOB_ID} \
-        ${NSYS_TIMESTAMP} \
-        python ${TRAIN_CMD} \
-        2>&1 | tee ${LOG_FILE}
+        bash -c "
+            cd ${HSTU_ROOT} && \
+            ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} && \
+            python ${TRAIN_CMD}
+        " 2>&1 | tee ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
     
@@ -216,7 +215,7 @@ else
     echo ""
     
     srun --kill-on-bad-exit=1 \
-        python ${TRAIN_CMD} \
+        bash -c "cd ${HSTU_ROOT} && python ${TRAIN_CMD}" \
         2>&1 | tee ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}

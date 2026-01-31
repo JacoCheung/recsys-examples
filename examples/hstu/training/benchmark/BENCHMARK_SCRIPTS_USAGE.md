@@ -409,17 +409,101 @@ cd /path/to/recsys-examples/examples/hstu
 
 ### slurm_job.sub
 
-SLURM job script, automatically called by `submit_all_experiments_slurm.sh`.
+SLURM job script that can be called automatically by `submit_all_experiments_slurm.sh` or used standalone.
 
 #### Environment Variables
 
 The script receives parameters through the following environment variables:
 
-| Variable | Description | Source |
-|----------|-------------|--------|
-| `EXP_NAME` | Experiment name | Passed by submit script |
-| `CONFIG_FILE` | Configuration file path | Passed by submit script |
-| `ENABLE_NSYS` | Enable nsys (0/1) | Passed by submit script |
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `HSTU_ROOT` | Absolute path to `examples/hstu` directory | ✅ | - |
+| `EXP_NAME` | Experiment name | ❌ | `exp0_baseline` |
+| `CONFIG_FILE` | Configuration file path (relative to `examples/hstu` or absolute) | ✅ | - |
+| `EXP_OUTPUT_DIR` | Output directory for logs and nsys profiles | ✅ | - |
+| `ENABLE_NSYS` | Enable nsys profiling (0/1) | ❌ | `0` |
+
+#### Standalone Usage
+
+You can use `slurm_job.sub` directly with `sbatch` without going through `submit_all_experiments_slurm.sh`:
+
+```bash
+# Basic usage - submit a single experiment
+sbatch \
+    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=/path/to/output \
+    /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
+
+# With nsys profiling enabled
+sbatch \
+    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=/path/to/output,ENABLE_NSYS=1 \
+    /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
+
+# Override SLURM parameters (nodes, partition, time limit, etc.)
+sbatch \
+    --nodes=4 \
+    --partition=h100 \
+    --time=08:00:00 \
+    --job-name=my_custom_job \
+    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp8_full,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp8_full.gin,EXP_OUTPUT_DIR=/path/to/output,ENABLE_NSYS=1 \
+    /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
+
+# Redirect stdout/stderr to custom files
+sbatch \
+    --output=/path/to/output/my_job_%j.out \
+    --error=/path/to/output/my_job_%j.err \
+    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=/path/to/output \
+    /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
+```
+
+#### Default SLURM Resource Configuration
+
+The script has the following default SLURM resource settings (can be overridden via `sbatch` command line):
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `--nodes` | 2 | Number of nodes |
+| `--ntasks-per-node` | 8 | Tasks (ranks) per node |
+| `--cpus-per-task` | 8 | CPUs per task |
+| `--time` | 04:00:00 | Time limit |
+| `--mem` | 0 | Use all available memory |
+| `--exclusive` | - | Exclusive node access |
+| `--container-image` | `gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest` | Container image |
+| `--container-mounts` | /lustre:/lustre | Mount host filesystem into container |
+| `--output` | hstu-e2e-benchmark-%j.out | SLURM stdout file (%j = job ID) |
+| `--error` | hstu-e2e-benchmark-%j.err | SLURM stderr file (%j = job ID) |
+
+#### Output Structure
+
+```
+{EXP_OUTPUT_DIR}/
+├── {exp_name}_{jobid}_{timestamp}.log           # Training log
+└── {exp_name}_{timestamp}_job{jobid}_node{N}_rank{R}_{hostname}.nsys-rep  # nsys profiles (if enabled)
+```
+
+#### Practical Examples
+
+```bash
+# Example 1: Quick test with baseline config
+sbatch \
+    --nodes=1 \
+    --time=01:00:00 \
+    --export=HSTU_ROOT=$(pwd),EXP_NAME=test_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=$(pwd)/training/benchmark/results/test \
+    training/benchmark/slurm_job.sub
+
+# Example 2: Full optimization experiment with profiling
+sbatch \
+    --nodes=2 \
+    --partition=gpu \
+    --export=HSTU_ROOT=$(pwd),EXP_NAME=exp8_full,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp8_full.gin,EXP_OUTPUT_DIR=$(pwd)/training/benchmark/results/exp8,ENABLE_NSYS=1 \
+    training/benchmark/slurm_job.sub
+
+# Example 3: Using absolute paths
+HSTU_ROOT=/home/user/recsys-examples/examples/hstu
+OUTPUT_DIR=/scratch/user/benchmark_results
+sbatch \
+    --export=HSTU_ROOT=${HSTU_ROOT},EXP_NAME=exp2_fusion,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp2_fusion.gin,EXP_OUTPUT_DIR=${OUTPUT_DIR},ENABLE_NSYS=1 \
+    ${HSTU_ROOT}/training/benchmark/slurm_job.sub
+```
 
 ---
 
