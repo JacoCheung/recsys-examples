@@ -18,9 +18,13 @@
 #SBATCH --mem=0
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
-#SBATCH --container-image=gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest
-#SBATCH --container-mounts=/lustre:/lustre
 #SBATCH --output=hstu-e2e-benchmark-%j.out
+
+# ============================================================================
+# Container Configuration (used with srun, not sbatch)
+# ============================================================================
+CONTAINER_IMAGE="gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest"
+CONTAINER_MOUNTS="/lustre:/lustre"
 
 # ============================================================================
 # Parameter Description:
@@ -186,8 +190,10 @@ exec nsys profile \
 WRAPPER_EOF
     chmod +x ${WRAPPER_SCRIPT}
     
-    # Use srun to launch distributed training + nsys profile
+    # Use srun to launch distributed training + nsys profile (in container)
     srun --kill-on-bad-exit=1 \
+        --container-image=${CONTAINER_IMAGE} \
+        --container-mounts=${CONTAINER_MOUNTS} \
         bash -c "
             cd ${HSTU_ROOT} && \
             export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
@@ -212,6 +218,8 @@ else
     echo ""
     
     srun --kill-on-bad-exit=1 \
+        --container-image=${CONTAINER_IMAGE} \
+        --container-mounts=${CONTAINER_MOUNTS} \
         bash -c "cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && python ${TRAIN_CMD}" \
         2>&1 | tee ${LOG_FILE}
     

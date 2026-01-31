@@ -14,10 +14,11 @@
 #   --results-dir=PATH   Output directory (default: training/benchmark/results)
 #   --nsys               Enable nsys profile sampling
 #   --sequential         Sequential execution (use dependencies, start next after previous completes)
-#   --partition=NAME     SLURM partition name (default: gpu)
+#   --partition=NAME     SLURM partition name (default: batch)
+#   --account=NAME       SLURM account name (optional, passed to sbatch -A)
+#   --job-name=NAME    SLURM job name prefix (optional, passed to sbatch -J)
 #   --nodes=N            Number of nodes (default: 2)
 #   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
-#   --gpus-per-node=N    Number of GPUs per node (default: 8)
 #   --time=HH:MM:SS      Job time limit (default: 04:00:00)
 #   --dry-run            Print sbatch commands only, do not submit
 #   --help               Show help information
@@ -27,7 +28,7 @@
 #   └── {batch_timestamp}/           # Timestamp of this batch submission
 #       ├── exp0_baseline/           # First experiment
 #       │   ├── exp0_baseline_*.log
-#       │   ├── hstu_exp0_baseline_*.out  # SLURM stdout/stderr
+#       │   ├── {job_name}_*.out         # SLURM stdout/stderr
 #       │   └── exp0_baseline_*.nsys-rep  (if nsys enabled)
 #       ├── exp1_cutlass/            # Second experiment
 #       │   ├── ...
@@ -56,10 +57,11 @@ set -e
 # ============================================================================
 ENABLE_NSYS=0
 SEQUENTIAL=0
-PARTITION="gpu"
+PARTITION="batch"
+ACCOUNT=""
+JOB_PREFIX=""
 NODES=2
 RANKS_PER_NODE=8
-GPUS_PER_NODE=8
 TIME_LIMIT="04:00:00"
 DRY_RUN=0
 EXP_FILE=""
@@ -70,7 +72,7 @@ CUSTOM_HSTU_ROOT=""
 # Help Information
 # ============================================================================
 show_help() {
-    head -46 "$0" | tail -43
+    head -51 "$0" | tail -50
     exit 0
 }
 
@@ -103,16 +105,20 @@ while [[ $# -gt 0 ]]; do
             PARTITION="${1#*=}"
             shift
             ;;
+        --account=*|-A=*)
+            ACCOUNT="${1#*=}"
+            shift
+            ;;
+        --job-name=*|-J=*)
+            JOB_PREFIX="${1#*=}"
+            shift
+            ;;
         --nodes=*)
             NODES="${1#*=}"
             shift
             ;;
         --ranks-per-node=*)
             RANKS_PER_NODE="${1#*=}"
-            shift
-            ;;
-        --gpus-per-node=*)
-            GPUS_PER_NODE="${1#*=}"
             shift
             ;;
         --time=*)
@@ -261,9 +267,10 @@ echo -e "${CYAN}==========================================${NC}"
 echo ""
 echo -e "${BLUE}SLURM Configuration:${NC}"
 echo "  Partition:        ${PARTITION}"
+[ -n "$ACCOUNT" ] && echo "  Account:          ${ACCOUNT}"
+[ -n "$JOB_PREFIX" ] && echo "  Job prefix:       ${JOB_PREFIX}"
 echo "  Nodes:            ${NODES}"
 echo "  Ranks per node:   ${RANKS_PER_NODE}"
-echo "  GPUs per node:    ${GPUS_PER_NODE}"
 echo "  Total ranks:      $((NODES * RANKS_PER_NODE))"
 echo "  Time limit:       ${TIME_LIMIT}"
 echo "  Sequential mode:  $([ ${SEQUENTIAL} -eq 1 ] && echo 'YES' || echo 'NO')"
@@ -285,13 +292,15 @@ if [ -z "$EXP_FILE" ]; then
     echo "    --job-name=hstu_<EXP_NAME> \\"
     echo "    --output=<OUTPUT_DIR>/hstu_<EXP_NAME>_%j.out \\"
     echo "    --partition=${PARTITION} \\"
+    [ -n "$ACCOUNT" ] && echo "    --account=${ACCOUNT} \\"
+    [ -n "$JOB_PREFIX" ] && echo "    # (job-prefix applied to job-name) \\"
     echo "    --nodes=${NODES} \\"
     echo "    --ntasks-per-node=${RANKS_PER_NODE} \\"
-    echo "    --gpus-per-node=${GPUS_PER_NODE} \\"
     echo "    --cpus-per-task=8 \\"
     echo "    --mem=0 \\"
     echo "    --time=${TIME_LIMIT} \\"
     echo "    --exclusive \\"
+    echo "    --network=sharp \\"
     echo "    --export=HSTU_ROOT=<HSTU_ROOT>,EXP_NAME=<EXP_NAME>,CONFIG_FILE=<CONFIG_FILE>,EXP_OUTPUT_DIR=<OUTPUT_DIR>,ENABLE_NSYS=${ENABLE_NSYS} \\"
     echo "    ${SCRIPT_DIR}/slurm_job.sub"
     echo ""
@@ -347,17 +356,30 @@ for i in "${!EXP_NAMES[@]}"; do
     fi
     
     # Build sbatch command
+    # Determine job name (with optional prefix)
+    if [ -n "$JOB_PREFIX" ]; then
+        FULL_JOB_NAME="${JOB_PREFIX}-hstu.${exp}"
+    else
+        FULL_JOB_NAME="hstu_${exp}"
+    fi
+    
     SBATCH_CMD="sbatch"
-    SBATCH_CMD+=" --job-name=hstu_${exp}"
-    SBATCH_CMD+=" --output=${EXP_OUTPUT_DIR}/hstu_${exp}_%j.out"
+    SBATCH_CMD+=" --job-name=${FULL_JOB_NAME}"
+    SBATCH_CMD+=" --output=${EXP_OUTPUT_DIR}/${FULL_JOB_NAME}_%j.out"
     SBATCH_CMD+=" --partition=${PARTITION}"
+    
+    # Add account if specified
+    if [ -n "$ACCOUNT" ]; then
+        SBATCH_CMD+=" --account=${ACCOUNT}"
+    fi
+    
     SBATCH_CMD+=" --nodes=${NODES}"
     SBATCH_CMD+=" --ntasks-per-node=${RANKS_PER_NODE}"
-    SBATCH_CMD+=" --gpus-per-node=${GPUS_PER_NODE}"
     SBATCH_CMD+=" --cpus-per-task=8"
     SBATCH_CMD+=" --mem=0"
     SBATCH_CMD+=" --time=${TIME_LIMIT}"
     SBATCH_CMD+=" --exclusive"
+    SBATCH_CMD+=" --network=sharp"
     
     # Sequential execution mode: add dependency
     if [ ${SEQUENTIAL} -eq 1 ] && [ -n "$PREV_JOB_ID" ]; then
@@ -409,9 +431,10 @@ if [ ${DRY_RUN} -eq 0 ]; then
         echo ""
         echo "SLURM Configuration:"
         echo "  Partition:        ${PARTITION}"
+        [ -n "$ACCOUNT" ] && echo "  Account:          ${ACCOUNT}"
+        [ -n "$JOB_PREFIX" ] && echo "  Job prefix:       ${JOB_PREFIX}"
         echo "  Nodes:            ${NODES}"
         echo "  Ranks per node:   ${RANKS_PER_NODE}"
-        echo "  GPUs per node:    ${GPUS_PER_NODE}"
         echo "  Time limit:       ${TIME_LIMIT}"
         echo "  Sequential:       $([ ${SEQUENTIAL} -eq 1 ] && echo 'YES' || echo 'NO')"
         echo "  NSYS Profiling:   $([ ${ENABLE_NSYS} -eq 1 ] && echo 'YES' || echo 'NO')"
@@ -456,13 +479,19 @@ else
     echo "Directory structure:"
     echo "  ${BATCH_OUTPUT_DIR}/"
     for exp in "${EXP_NAMES[@]}"; do
+        # Determine job name pattern for display
+        if [ -n "$JOB_PREFIX" ]; then
+            JOB_NAME_PATTERN="${JOB_PREFIX}-${exp}"
+        else
+            JOB_NAME_PATTERN="hstu_${exp}"
+        fi
         echo "  ├── ${exp}/"
         echo "  │   ├── ${exp}_*.log"
         if [ ${ENABLE_NSYS} -eq 1 ]; then
-            echo "  │   ├── hstu_${exp}_*.out"
+            echo "  │   ├── ${JOB_NAME_PATTERN}_*.out"
             echo "  │   └── ${exp}_*.nsys-rep"
         else
-            echo "  │   └── hstu_${exp}_*.out"
+            echo "  │   └── ${JOB_NAME_PATTERN}_*.out"
         fi
     done
     echo "  └── summary.txt"
