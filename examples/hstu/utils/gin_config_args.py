@@ -161,6 +161,7 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
 
     # the precedence is `global_hbm_for_values` > `item_vocab_gpu_capacity` > `item_vocab_gpu_capacity_ratio`
     # without optimizer consideration
+    # when caching is True, global_hbm_for_values gives the cache size
     global_hbm_for_values: Optional[int] = None
     item_vocab_gpu_capacity: Optional[float] = None
     item_vocab_gpu_capacity_ratio: Optional[float] = None
@@ -394,6 +395,13 @@ class RankingArgs:
                 "relu",
                 "gelu",
             ], "prediction_head_act_type should be in ['relu', 'gelu']"
+        self.eval_metrics = tuple(metric.upper() for metric in self.eval_metrics)
+        for metric in self.eval_metrics:
+            assert metric in [
+                "AUC",
+                "NDCG",
+                "HR",
+            ], "eval_metrics should be in ['AUC', 'NDCG', 'HR']"
 
 
 @gin.configurable
