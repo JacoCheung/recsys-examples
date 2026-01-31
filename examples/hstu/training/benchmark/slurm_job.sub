@@ -1,0 +1,241 @@
+#!/bin/bash
+# ============================================================================
+# SLURM Job Script - Single Experiment
+# This script is automatically submitted by submit_all_experiments_slurm.sh
+# 
+# Important: Working directory must be recsys-examples/examples/hstu
+# 
+# Output Directory Structure (new version):
+#   {EXP_OUTPUT_DIR}/
+#   ├── {exp_name}_{jobid}_{timestamp}.log
+#   └── {exp_name}_*_job{jobid}_*.nsys-rep  (if nsys enabled)
+# ============================================================================
+
+#SBATCH --job-name=hstu_benchmark
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=8
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=0
+#SBATCH --time=04:00:00
+#SBATCH --exclusive
+#SBATCH --container-image=gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest
+
+# ============================================================================
+# Parameter Description:
+#   HSTU_ROOT      - Absolute path to examples/hstu directory (required)
+#   EXP_NAME       - Experiment name (required)
+#   CONFIG_FILE    - Config file path (relative to examples/hstu)
+#   EXP_OUTPUT_DIR - Experiment output directory (required, passed by submit script)
+#   ENABLE_NSYS    - Whether to enable nsys profile (0/1, default 0)
+# ============================================================================
+
+set -e
+
+# Get parameters
+HSTU_ROOT=${HSTU_ROOT:-""}
+EXP_NAME=${EXP_NAME:-"exp0_baseline"}
+CONFIG_FILE=${CONFIG_FILE:-""}
+EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR:-""}
+ENABLE_NSYS=${ENABLE_NSYS:-0}
+
+# Check HSTU_ROOT
+if [ -z "$HSTU_ROOT" ]; then
+    echo "❌ Error: HSTU_ROOT environment variable not set"
+    exit 1
+fi
+
+# Check EXP_OUTPUT_DIR
+if [ -z "$EXP_OUTPUT_DIR" ]; then
+    echo "❌ Error: EXP_OUTPUT_DIR environment variable not set"
+    exit 1
+fi
+
+# Change to examples/hstu directory
+cd ${HSTU_ROOT}
+
+# Path configuration (based on examples/hstu as working directory)
+PROJECT_ROOT="${HSTU_ROOT}/../.."
+
+# Create output directory
+mkdir -p ${EXP_OUTPUT_DIR}
+
+# If config file is a relative path, make it relative to examples/hstu
+if [ -n "$CONFIG_FILE" ] && [[ ! "$CONFIG_FILE" = /* ]]; then
+    CONFIG_FILE="${HSTU_ROOT}/${CONFIG_FILE}"
+fi
+
+# Check config file
+if [ -z "$CONFIG_FILE" ]; then
+    echo "❌ Error: CONFIG_FILE environment variable not set"
+    exit 1
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "❌ Error: Config file not found: $CONFIG_FILE"
+    exit 1
+fi
+
+# ============================================================================
+# SLURM Environment Information
+# ============================================================================
+echo "=========================================="
+echo "🚀 HSTU Benchmark - SLURM Job"
+echo "=========================================="
+echo "Experiment:       ${EXP_NAME}"
+echo "Config file:      ${CONFIG_FILE}"
+echo "Output dir:       ${EXP_OUTPUT_DIR}"
+echo "SLURM Job ID:     ${SLURM_JOB_ID}"
+echo "SLURM Job Name:   ${SLURM_JOB_NAME}"
+echo "SLURM Nodes:      ${SLURM_JOB_NUM_NODES}"
+echo "SLURM Node List:  ${SLURM_JOB_NODELIST}"
+echo "Tasks per Node:   ${SLURM_NTASKS_PER_NODE}"
+echo "Total Tasks:      ${SLURM_NTASKS}"
+echo ""
+echo "NSYS Profiling:   $([ ${ENABLE_NSYS} -eq 1 ] && echo 'ENABLED' || echo 'DISABLED')"
+echo "=========================================="
+echo ""
+
+# ============================================================================
+# Environment Variable Setup
+# ============================================================================
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+
+# Get Master address (first node)
+MASTER_ADDR=$(scontrol show hostnames ${SLURM_JOB_NODELIST} | head -n 1)
+MASTER_PORT=${MASTER_PORT:-29500}
+
+export MASTER_ADDR
+export MASTER_PORT
+
+echo "Master Address:   ${MASTER_ADDR}"
+echo "Master Port:      ${MASTER_PORT}"
+echo ""
+
+# ============================================================================
+# Build Training Command
+# ============================================================================
+# Already changed to examples/hstu directory, no need to cd again
+
+# Base Python training command (relative to examples/hstu)
+TRAIN_CMD="training/pretrain_gr_ranking.py --gin-config-file ${CONFIG_FILE}"
+
+# Log file (saved in experiment output directory)
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}.log"
+
+echo "📝 Logging to: ${LOG_FILE}"
+echo "⏰ Started at: $(date)"
+echo ""
+
+# ============================================================================
+# Start Training
+# ============================================================================
+if [ ${ENABLE_NSYS} -eq 1 ]; then
+    # ========================================================================
+    # nsys profile mode enabled
+    # Each rank samples independently, using SLURM environment variables to differentiate
+    # Output file format: {exp_name}_{timestamp}_job{jobid}_node{nodeid}_rank{globalrank}_{hostname}
+    # ========================================================================
+    echo "🔬 Running with NVIDIA Nsight Systems profiling..."
+    echo ""
+    
+    # Get timestamp (generated in main script, ensures all ranks use the same timestamp)
+    NSYS_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    
+    # Create wrapper script to run nsys on each rank
+    WRAPPER_SCRIPT="${EXP_OUTPUT_DIR}/.nsys_wrapper_${SLURM_JOB_ID}.sh"
+    cat > ${WRAPPER_SCRIPT} << 'WRAPPER_EOF'
+#!/bin/bash
+# nsys wrapper script - creates independent profile for each rank
+
+# Get environment variables
+EXP_NAME=$1
+NSYS_OUTPUT_DIR=$2
+SLURM_JOB_ID=$3
+NSYS_TIMESTAMP=$4
+shift 4
+
+# Calculate global rank
+GLOBAL_RANK=${SLURM_PROCID}
+LOCAL_RANK=${SLURM_LOCALID}
+NODE_ID=${SLURM_NODEID}
+HOSTNAME=$(hostname -s)
+
+# Build unique output filename (saved in experiment directory)
+# Format: {exp_name}_{timestamp}_job{jobid}_node{nodeid}_rank{globalrank}_{hostname}
+NSYS_OUTPUT="${NSYS_OUTPUT_DIR}/${EXP_NAME}_${NSYS_TIMESTAMP}_job${SLURM_JOB_ID}_node${NODE_ID}_rank${GLOBAL_RANK}_${HOSTNAME}"
+
+echo "[Rank ${GLOBAL_RANK}] Starting nsys profile, output: ${NSYS_OUTPUT}.nsys-rep"
+
+# Set CUDA visible devices (if needed)
+export CUDA_VISIBLE_DEVICES=${LOCAL_RANK}
+
+# Run nsys profile
+exec nsys profile \
+    -o "${NSYS_OUTPUT}" \
+    -f true \
+    -s none \
+    -t cuda,nvtx \
+    -c cudaProfilerApi \
+    --cpuctxsw none \
+    --cuda-flush-interval 100 \
+    --capture-range-end=stop \
+    --cuda-graph-trace=node \
+    "$@"
+WRAPPER_EOF
+    chmod +x ${WRAPPER_SCRIPT}
+    
+    # Use srun to launch distributed training + nsys profile
+    srun --kill-on-bad-exit=1 \
+        ${WRAPPER_SCRIPT} \
+        ${EXP_NAME} \
+        ${EXP_OUTPUT_DIR} \
+        ${SLURM_JOB_ID} \
+        ${NSYS_TIMESTAMP} \
+        python ${TRAIN_CMD} \
+        2>&1 | tee ${LOG_FILE}
+    
+    EXIT_CODE=${PIPESTATUS[0]}
+    
+    # Clean up wrapper script
+    rm -f ${WRAPPER_SCRIPT}
+    
+    echo ""
+    echo "📊 nsys profile files saved to: ${EXP_OUTPUT_DIR}"
+    echo "   Files pattern: ${EXP_NAME}_${NSYS_TIMESTAMP}_job${SLURM_JOB_ID}_node*_rank*_*.nsys-rep"
+    
+else
+    # ========================================================================
+    # Standard training mode (no nsys profile)
+    # ========================================================================
+    echo "🏃 Running standard training (no profiling)..."
+    echo ""
+    
+    srun --kill-on-bad-exit=1 \
+        python ${TRAIN_CMD} \
+        2>&1 | tee ${LOG_FILE}
+    
+    EXIT_CODE=${PIPESTATUS[0]}
+fi
+
+# ============================================================================
+# Results Summary
+# ============================================================================
+echo ""
+echo "=========================================="
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "✅ Experiment ${EXP_NAME} completed successfully!"
+else
+    echo "❌ Experiment ${EXP_NAME} failed with exit code: ${EXIT_CODE}"
+fi
+echo "⏰ Finished at: $(date)"
+echo "📝 Log saved to: ${LOG_FILE}"
+if [ ${ENABLE_NSYS} -eq 1 ]; then
+    echo "📊 nsys profiles: ${EXP_OUTPUT_DIR}/${EXP_NAME}_*_job${SLURM_JOB_ID}_*.nsys-rep"
+fi
+echo "=========================================="
+
+exit ${EXIT_CODE}
