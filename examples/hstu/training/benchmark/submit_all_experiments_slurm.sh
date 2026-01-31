@@ -16,7 +16,8 @@
 #   --sequential         Sequential execution (use dependencies, start next after previous completes)
 #   --partition=NAME     SLURM partition name (default: batch)
 #   --account=NAME       SLURM account name (optional, passed to sbatch -A)
-#   --job-name=NAME    SLURM job name prefix (optional, passed to sbatch -J)
+#   --job-name=NAME      SLURM job name prefix (optional, passed to sbatch -J)
+#   --container-image=IMAGE  Container image (default: gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest)
 #   --nodes=N            Number of nodes (default: 2)
 #   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
 #   --time=HH:MM:SS      Job time limit (default: 04:00:00)
@@ -60,6 +61,7 @@ SEQUENTIAL=0
 PARTITION="batch"
 ACCOUNT=""
 JOB_PREFIX=""
+CONTAINER_IMAGE="gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest"
 NODES=2
 RANKS_PER_NODE=8
 TIME_LIMIT="04:00:00"
@@ -72,7 +74,7 @@ CUSTOM_HSTU_ROOT=""
 # Help Information
 # ============================================================================
 show_help() {
-    head -51 "$0" | tail -50
+    head -52 "$0" | tail -51
     exit 0
 }
 
@@ -111,6 +113,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --job-name=*|-J=*)
             JOB_PREFIX="${1#*=}"
+            shift
+            ;;
+        --container-image=*)
+            CONTAINER_IMAGE="${1#*=}"
             shift
             ;;
         --nodes=*)
@@ -269,6 +275,7 @@ echo -e "${BLUE}SLURM Configuration:${NC}"
 echo "  Partition:        ${PARTITION}"
 [ -n "$ACCOUNT" ] && echo "  Account:          ${ACCOUNT}"
 [ -n "$JOB_PREFIX" ] && echo "  Job prefix:       ${JOB_PREFIX}"
+echo "  Container:        ${CONTAINER_IMAGE}"
 echo "  Nodes:            ${NODES}"
 echo "  Ranks per node:   ${RANKS_PER_NODE}"
 echo "  Total ranks:      $((NODES * RANKS_PER_NODE))"
@@ -301,8 +308,10 @@ if [ -z "$EXP_FILE" ]; then
     echo "    --time=${TIME_LIMIT} \\"
     echo "    --exclusive \\"
     echo "    --network=sharp \\"
-    echo "    --export=HSTU_ROOT=<HSTU_ROOT>,EXP_NAME=<EXP_NAME>,CONFIG_FILE=<CONFIG_FILE>,EXP_OUTPUT_DIR=<OUTPUT_DIR>,ENABLE_NSYS=${ENABLE_NSYS} \\"
+    echo "    --export=HSTU_ROOT=<HSTU_ROOT>,EXP_NAME=<EXP_NAME>,CONFIG_FILE=<CONFIG_FILE>,EXP_OUTPUT_DIR=<OUTPUT_DIR>,ENABLE_NSYS=${ENABLE_NSYS},CONTAINER_IMAGE=${CONTAINER_IMAGE} \\"
     echo "    ${SCRIPT_DIR}/slurm_job.sub"
+    echo ""
+    echo "Container image: ${CONTAINER_IMAGE}"
     echo ""
     exit 0
 fi
@@ -386,8 +395,8 @@ for i in "${!EXP_NAMES[@]}"; do
         SBATCH_CMD+=" --dependency=afterany:${PREV_JOB_ID}"
     fi
     
-    # Export environment variables (including exp_name, config_file, output_dir and HSTU_ROOT)
-    SBATCH_CMD+=" --export=ALL,EXP_NAME=${exp},CONFIG_FILE=${config},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT}"
+    # Export environment variables (including exp_name, config_file, output_dir, HSTU_ROOT and CONTAINER_IMAGE)
+    SBATCH_CMD+=" --export=ALL,EXP_NAME=${exp},CONFIG_FILE=${config},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
     
     # Specify SLURM job script
     SBATCH_CMD+=" ${SCRIPT_DIR}/slurm_job.sub"
@@ -433,6 +442,7 @@ if [ ${DRY_RUN} -eq 0 ]; then
         echo "  Partition:        ${PARTITION}"
         [ -n "$ACCOUNT" ] && echo "  Account:          ${ACCOUNT}"
         [ -n "$JOB_PREFIX" ] && echo "  Job prefix:       ${JOB_PREFIX}"
+        echo "  Container:        ${CONTAINER_IMAGE}"
         echo "  Nodes:            ${NODES}"
         echo "  Ranks per node:   ${RANKS_PER_NODE}"
         echo "  Time limit:       ${TIME_LIMIT}"
