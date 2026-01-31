@@ -22,7 +22,6 @@ from typing import Dict, Optional
 
 import torch
 from dynamicemb.types import (
-    DEMB_TABLE_ALIGN_SIZE,
     AdmissionStrategy,
     Counter,
     DynamicEmbInitializerArgs,
@@ -148,7 +147,7 @@ class _ContextOptions:
         max_capacity : Optional[int], optional
                 The maximum capacity of the shard of the embedding table on a single GPU. Automatically set in the shared planner.
                 It is not configurable, but it's important for the total memory consumption.
-                It will be automatically inferred from EmbeddingConfig.num_embeddings and the world size, rounded up to a multiple of DEMB_TABLE_ALIGN_SIZE，
+                It will be automatically inferred from EmbeddingConfig.num_embeddings and the world size, rounded up to a power of 2，
                     and minimized to the size of bucket capacity of the hash table.
                 If init_capacity is set, max_capacity will not be smaller than init_capacity.
         evict_strategy : DynamicEmbEvictStrategy
@@ -242,7 +241,7 @@ class DynamicEmbTableOptions(_ContextOptions):
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
         If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
-        If set, it will be rounded up to a multiple of DEMB_TABLE_ALIGN_SIZE.
+        If set, it will be rounded up to the power of 2.
         As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
         Rehash will be done implicitly.
         Note: This is the setting for a single table at each rank.
@@ -522,15 +521,14 @@ def get_constraint_capacity(
         dim + get_optimizer_state_dim(optimizer_type, dim, dtype)
     ) * dtype_to_bytes(dtype)
     bucket_size_in_bytes = bucket_capacity * byte_consume_per_vector
-    # If reserved HBM is less than one bucket, round up to one bucket
     if memory_bytes < bucket_size_in_bytes:
         warnings.warn(
-            f"Reserved HBM ({memory_bytes} bytes) is less than one bucket "
-            f"({bucket_size_in_bytes} bytes). Rounding up to one bucket.",
-            UserWarning,
+            f"reserved HBM bytes {memory_bytes} is less than one bucket {bucket_size_in_bytes}, will use {bucket_size_in_bytes} as the capacity"
         )
         memory_bytes = bucket_size_in_bytes
-    capacity = memory_bytes // byte_consume_per_vector  # at least one bucket
+    capacity = (
+        memory_bytes // byte_consume_per_vector
+    )  # maybe zero, we need at least one bucket
     return (capacity // bucket_capacity) * bucket_capacity
 
 

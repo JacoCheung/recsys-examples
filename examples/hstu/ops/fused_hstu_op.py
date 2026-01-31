@@ -149,6 +149,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.wgrad_event = wgrad_event
         ctx.recompute_input_layernorm = recompute_input_layernorm
         ctx.recompute_input_silu = recompute_input_silu
+        if ctx.attn_backend == KernelBackend.TRITON:
+            assert causal, "causal must be True when kernel backend is triton"
         saved_tensor_map = OrderedDict()
         if num_contextuals is None and attn_backend == KernelBackend.TRITON:
             num_contextuals = 0
@@ -273,11 +275,13 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 k=k,
                 v=v,
                 seq_offsets=seq_offsets,
-                causal=causal,
                 num_targets=num_targets,
                 max_attn_len=0,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
+                enable_tma=False
+                if torch.cuda.get_device_properties(0).major < 9
+                else True,
             ).reshape(-1, num_heads * attention_dim_per_head)
             return jagged_attn_output
 
@@ -743,9 +747,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 scaling_seqlen=scaling_seqlen,
                 alpha=alpha,
                 max_attn_len=0,
-                causal=causal,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
+                enable_tma=False
+                if torch.cuda.get_device_properties(0).major < 9
+                else True,
             )
             return dq, dk, dv
 

@@ -28,12 +28,12 @@ from commons.pipeline.train_pipeline import (
 )
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logger import print_rank_0
+from commons.utils.perf import cal_hstu_flops, cal_mfu
 from commons.utils.stringify import stringify_dict
 from commons.utils.watchdog import watched_iter
 from megatron.core import parallel_state
 from model import RankingGR, RetrievalGR
 from modules.metrics import RetrievalTaskMetricWithSampling
-from trainer.utils import cal_flops
 from utils import TrainerArgs
 
 
@@ -203,14 +203,43 @@ def train_with_pipeline(
             if train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0:
                 gpu_timer.stop()
                 cur_td = gpu_timer.elapsed_time() - last_td
-                flops = cal_flops(
-                    get_unwrapped_module(pipeline._model)._hstu_config,
+                hstu_config = get_unwrapped_module(pipeline._model)._hstu_config
+                (
+                    num_layers,
+                    hidden_size,
+                    num_heads,
+                    dim_per_head,
+                    is_causal,
+                    residual,
+                ) = (
+                    hstu_config.num_layers,
+                    hstu_config.hidden_size,
+                    hstu_config.num_attention_heads,
+                    hstu_config.kv_channels,
+                    hstu_config.is_causal,
+                    hstu_config.residual,
+                )
+                # Get DP process group to gather only from DP ranks (not TP duplicates)
+                dp_pg = parallel_state.get_data_parallel_group()
+
+                flops = cal_hstu_flops(
+                    num_layers,
+                    hidden_size,
+                    num_heads,
+                    dim_per_head,
                     seqlens=ddp_seqlens,
                     num_contextuals=ddp_num_contextuals,
                     num_candidates=ddp_num_candidates,
+                    has_bwd=True,
+                    is_causal=is_causal,
+                    residual=residual,
+                    dp_pg=dp_pg,
+                )
+                mfu = cal_mfu(
+                    flops / cur_td / 1e9, world_size=dist.get_world_size(), dtype="bf16"
                 )
                 print_rank_0(
-                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS, MFU {mfu:.2f}%]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
                 )
                 last_td = cur_td + last_td
                 tokens_logged.zero_()
