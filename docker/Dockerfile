@@ -50,6 +50,11 @@ RUN pip install --no-deps tensordict orjson && \
 
 RUN pip install nvidia-cutlass-dsl==4.3.0
 
+# pre-installed cudnn in 25.06 is buggy
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i cuda-keyring_1.1-1_all.deb
+apt-get update
+apt-get -y install cudnn9-cuda-12
 # for dev
 RUN apt update -y --fix-missing && \
     apt install -y gdb && \
