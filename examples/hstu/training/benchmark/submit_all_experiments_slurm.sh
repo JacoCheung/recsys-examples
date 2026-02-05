@@ -21,6 +21,7 @@
 #   --nodes=N            Number of nodes (default: 2)
 #   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
 #   --time=HH:MM:SS      Job time limit (default: 04:00:00)
+#   -y, --yes            Skip confirmation prompt
 #   --dry-run            Print sbatch commands only, do not submit
 #   --help               Show help information
 # 
@@ -74,6 +75,7 @@ NODES=2
 RANKS_PER_NODE=8
 TIME_LIMIT="04:00:00"
 DRY_RUN=0
+YES_FLAG=0
 EXP_FILE=""
 CUSTOM_RESULTS_DIR=""
 CUSTOM_HSTU_ROOT=""
@@ -82,7 +84,7 @@ CUSTOM_HSTU_ROOT=""
 # Help Information
 # ============================================================================
 show_help() {
-    head -58 "$0" | tail -57
+    head -59 "$0" | tail -58
     exit 0
 }
 
@@ -183,6 +185,10 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=1
             shift
             ;;
+        -y|--yes)
+            YES_FLAG=1
+            shift
+            ;;
         --help|-h)
             show_help
             ;;
@@ -253,7 +259,7 @@ BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 if [ -z "$EXP_FILE" ]; then
     echo "⚠️  Missing experiment list file (--exp-file=<file>)"
     echo ""
-    head -60 "$0" | tail -58
+    head -61 "$0" | tail -59
     exit 0
 fi
 
@@ -353,13 +359,16 @@ echo ""
 # Confirm Submission
 # ============================================================================
 if [ ${DRY_RUN} -eq 0 ]; then
-    echo -e "${YELLOW}Do you want to submit these jobs? (y/n)${NC}"
-    read -r response
-    if [[ ! "$response" =~ ^[Yy]$ ]]; then
-        echo "Cancelled."
-        exit 0
+    # Skip confirmation if -y/--yes flag is set
+    if [ ${YES_FLAG} -eq 0 ]; then
+        echo -e "${YELLOW}Do you want to submit these jobs? (y/n)${NC}"
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        echo ""
     fi
-    echo ""
     
     # Create batch output directory
     mkdir -p ${BATCH_OUTPUT_DIR}
