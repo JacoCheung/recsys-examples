@@ -205,6 +205,7 @@ WRAPPER_EOF
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
         bash -c "
+            nvidia-smi && \
             cd ${HSTU_ROOT} && \
             export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
             ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
@@ -230,7 +231,7 @@ else
     srun --kill-on-bad-exit=1 \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && python ${TRAIN_CMD}" \
+        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && python ${TRAIN_CMD}" \
         2>&1 | tee ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}

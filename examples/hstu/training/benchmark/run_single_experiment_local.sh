@@ -336,6 +336,8 @@ fi
 
 # Start training
 echo "📝 Logging to: ${LOG_FILE}"
+nvidia-smi > ${LOG_FILE}
+
 echo "⏰ Started at: $(date)"
 echo ""
 
