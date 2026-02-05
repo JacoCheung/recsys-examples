@@ -2,7 +2,7 @@
 
 ## 📋 Overview
 
-For the H100 16 GPU benchmark, we have generated a complete set of configuration files, scripts, and documentation, including **9 progressive experiments** (with the new Workload Balancer optimization).
+For the H100 16 GPU benchmark, we have generated a complete set of configuration files, scripts, and documentation, including **9 progressive experiments**.
 
 ---
 
@@ -17,20 +17,20 @@ For the H100 16 GPU benchmark, we have generated a complete set of configuration
 
 ### 2. Experiment Configuration Files (10 files)
 
-All configuration files are located at: `examples/hstu/training/configs/`
+All configuration files are located at: `examples/hstu/training/benchmark/gin_configs/`
 
 | Config File | Experiment | Description |
 |------------|------------|-------------|
-| `h100_16gpu_exp0_baseline.gin` | Exp 0 | Baseline (Triton attention, no optimization) |
-| `h100_16gpu_exp1_cutlass.gin` | Exp 1 | +CUTLASS Attention |
-| `h100_16gpu_exp2_fusion.gin` | Exp 2 | +Kernel Fusion |
-| `h100_16gpu_exp3_recompute.gin` | Exp 3 | +Selective Recompute |
-| `h100_16gpu_exp3.5_workload_balancer.gin` | **Exp 3.5** | **+Workload Balancer** 🔥 |
-| `h100_16gpu_exp4_dynamicemb.gin` | Exp 4 | +DynamicEmb |
-| `h100_16gpu_exp5_lfu.gin` | Exp 5 | +LFU Eviction |
-| `h100_16gpu_exp6_pipeline.gin` | Exp 6 | +Pipeline Prefetch |
-| `h100_16gpu_exp7_tp.gin` | Exp 7 | +Tensor Parallel (TP=2) |
-| `h100_16gpu_exp8_full.gin` | Exp 8 | **Full Optimization** (all optimizations) |
+| `benchmark_exp0_baseline.gin` | Exp 0 | Baseline (Triton attention, no optimization) |
+| `benchmark_exp1_cutlass.gin` | Exp 1 | +CUTLASS Attention |
+| `benchmark_exp2_recompute.gin` | Exp 2 | +Selective Recompute |
+| `benchmark_exp3_workload_balancer.gin` | **Exp 3** | **+Workload Balancer** 🔥 |
+| `benchmark_exp4_dynamicemb_caching.gin` | Exp 4 | +DynamicEmb Caching |
+| `benchmark_exp5_lfu.gin` | Exp 5 | +LFU Eviction |
+| `benchmark_exp6_pipeline.gin` | Exp 6 | +Pipeline Prefetch |
+| `benchmark_exp7_tp.gin` | Exp 7 | +Tensor Parallel (TP=2) |
+| `benchmark_exp8_full.gin` | Exp 8 | **Full Optimization** (all optimizations) |
+| `benchmark_exp999_less_ctx.gin` | Optional | Reduced contextual features for testing |
 
 ### 3. Run Scripts (3 files)
 
@@ -76,26 +76,24 @@ TrainerArgs.enable_balanced_shuffler = True
 Exp 0: Baseline (no optimization)
   ↓ +CUTLASS Attention
 Exp 1: 1.3x speedup
-  ↓ +Kernel Fusion
-Exp 2: 1.56x cumulative speedup
   ↓ +Selective Recompute
-Exp 3: 1.48x cumulative speedup (30% memory savings)
+Exp 2: 1.24x cumulative speedup (30% memory savings)
   ↓ +Workload Balancer 🔥
-Exp 3.5: 2.22x cumulative speedup
-  ↓ +DynamicEmb
-Exp 4: 2.22x cumulative speedup (60% memory savings)
+Exp 3: 1.86x cumulative speedup
+  ↓ +DynamicEmb Caching
+Exp 4: 1.77x cumulative speedup (60% memory savings)
   ↓ +LFU Eviction
-Exp 5: 2.44x cumulative speedup
+Exp 5: 1.95x cumulative speedup
   ↓ +Pipeline Prefetch
-Exp 6: 3.17x cumulative speedup
+Exp 6: 2.53x cumulative speedup
   ↓ +Tensor Parallel
-Exp 7: 3.17x cumulative speedup (75% memory savings)
-  ↓ +Sequence Parallel
-Exp 8: 3.01x final speedup (85% memory savings)
+Exp 7: 2.53x cumulative speedup (75% memory savings)
+  ↓ Full Optimization
+Exp 8: 2.40x final speedup (85% memory savings)
 ```
 
 **Expected Overall Improvement:**
-- 🚀 **3-3.5x end-to-end training speedup**
+- 🚀 **2.4-3.0x end-to-end training speedup**
 - 💾 **80-85% GPU memory savings**
 - 📈 **Support 50M+ embedding table**
 - 📏 **Support 4K+ sequence length**
@@ -173,9 +171,9 @@ Key comparisons to focus on:
 | Comparison | Description | Expected Improvement |
 |------------|-------------|---------------------|
 | Exp 0 vs Exp 1 | CUTLASS advantage | 1.3x |
-| Exp 3 vs Exp 3.5 | **Workload Balancer effect** | **1.5x** 🔥 |
+| Exp 2 vs Exp 3 | **Workload Balancer effect** | **1.5x** 🔥 |
 | Exp 5 vs Exp 6 | Pipeline effect | 1.3x |
-| Exp 0 vs Exp 8 | Overall optimization effect | 3-3.5x |
+| Exp 0 vs Exp 8 | Overall optimization effect | 2.4-3.0x |
 
 ---
 
@@ -216,23 +214,18 @@ Key comparisons to focus on:
 
 ## ❓ FAQ
 
-### Q: Why add Exp 3.5?
-
-A: Workload Balancer is an important but often overlooked optimization:
-- In real recommendation scenarios, user history lengths vary greatly (variable-length sequences)
-- It can bring 1.3-1.8x significant improvement, worth showcasing separately
-- Placed after exp 3 because it doesn't depend on DynamicEmb, can work with static embedding
-
 ### Q: What are the differences between all config files?
 
 A: Each config file is **progressive**, changing only one optimization item at a time:
 - exp0: Baseline (Triton attention)
 - exp1: Switch to CUTLASS
-- exp2: Add fusion
-- exp3: Add recompute
-- **exp3.5: Add workload balancer** 🆕
-- exp4: Switch to DynamicEmb
-- ...
+- exp2: Add recompute
+- **exp3: Add workload balancer** 🔥
+- exp4: Enable DynamicEmb Caching
+- exp5: Switch to LFU eviction
+- exp6: Add pipeline prefetch
+- exp7: Add Tensor Parallel
+- exp8: Full optimization
 
 This allows clearly seeing **each optimization's independent contribution**.
 
@@ -251,7 +244,7 @@ So "full" better represents its meaning.
 
 A: Yes, but recommend running at least:
 - Exp 0 (baseline)
-- Exp 3.5 (workload balancer)
+- Exp 3 (workload balancer)
 - Exp 6 (pipeline)
 - Exp 8 (full optimization)
 
@@ -268,5 +261,5 @@ If you have questions:
 
 ---
 
-**Last Updated**: 2026-01-28  
-**Version**: v1.1 (with Workload Balancer)
+**Last Updated**: 2026-02-05  
+**Version**: v1.2

@@ -8,7 +8,7 @@
 #   HSTU_ROOT            Path to examples/hstu directory (optional, defaults to pwd)
 # 
 # Options:
-#   --exp-file=FILE      Experiment list file (required, format: exp_name,config_path)
+#   --exp-file=FILE      Experiment list file (required, format: exp_name,gin_options)
 #   --hstu-root=PATH     Specify examples/hstu directory path (overrides env var and pwd)
 #   --results-dir=PATH   Output directory (default: training/benchmark/results)
 #   --nproc=N            Number of processes/GPUs (default: 8)
@@ -18,8 +18,10 @@
 # 
 # Experiment List File Format:
 #   # Comment lines start with #
-#   exp_name,config_file_path
-#   exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+#   exp_name,generate_gin_config_options
+#   exp0_baseline,
+#   exp1_cutlass,--kernel_backend cutlass
+#   exp4_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
 # 
 # Notes:
 #   - Executes all experiments in the list sequentially
@@ -31,6 +33,7 @@
 #   └── {batch_timestamp}/           # Timestamp of this batch run
 #       ├── exp0_baseline/           # First experiment
 #       │   ├── exp0_baseline_*.log
+#       │   ├── exp0_baseline_*.gin
 #       │   └── exp0_baseline_*.nsys-rep
 #       ├── exp1_cutlass/            # Second experiment
 #       │   ├── ...
@@ -54,24 +57,40 @@ DRY_RUN=0
 CUSTOM_HSTU_ROOT=""
 CUSTOM_RESULTS_DIR=""
 
-# Parse command line arguments
+# Parse command line arguments (support both --arg value and --arg=value)
 while [[ $# -gt 0 ]]; do
     case $1 in
         --exp-file=*)
             EXP_FILE="${1#*=}"
             shift
             ;;
+        --exp-file)
+            EXP_FILE="$2"
+            shift 2
+            ;;
         --hstu-root=*)
             CUSTOM_HSTU_ROOT="${1#*=}"
             shift
+            ;;
+        --hstu-root)
+            CUSTOM_HSTU_ROOT="$2"
+            shift 2
             ;;
         --results-dir=*)
             CUSTOM_RESULTS_DIR="${1#*=}"
             shift
             ;;
+        --results-dir)
+            CUSTOM_RESULTS_DIR="$2"
+            shift 2
+            ;;
         --nproc=*)
             NPROC="${1#*=}"
             shift
+            ;;
+        --nproc)
+            NPROC="$2"
+            shift 2
             ;;
         --nsys)
             ENABLE_NSYS=1
@@ -82,7 +101,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            head -46 "$0" | tail -43
+            head -50 "$0" | tail -47
             exit 0
             ;;
         *)
@@ -139,9 +158,10 @@ BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 
 # Check experiment list file
 if [ -z "$EXP_FILE" ]; then
-    echo "❌ Error: Missing experiment list file (--exp-file=<file>)"
-    echo "Use --help for usage information"
-    exit 1
+    echo "⚠️  Missing experiment list file (--exp-file=<file>)"
+    echo ""
+    head -48 "$0" | tail -46
+    exit 0
 fi
 
 # If relative path, make it relative to examples/hstu
@@ -151,7 +171,7 @@ fi
 
 # Read experiment list
 declare -a EXP_NAMES
-declare -a CONFIG_FILES
+declare -a GIN_OPTIONS
 
 if [ ! -f "$EXP_FILE" ]; then
     if [ ${DRY_RUN} -eq 1 ]; then
@@ -164,14 +184,14 @@ if [ ! -f "$EXP_FILE" ]; then
     fi
 fi
 
-while IFS=',' read -r exp_name config_path || [ -n "$exp_name" ]; do
+while IFS=',' read -r exp_name gin_opts || [ -n "$exp_name" ]; do
     # Skip empty lines and comments
     [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
     # Trim leading/trailing whitespace
     exp_name=$(echo "$exp_name" | xargs)
-    config_path=$(echo "$config_path" | xargs)
+    gin_opts=$(echo "$gin_opts" | xargs)
     EXP_NAMES+=("$exp_name")
-    CONFIG_FILES+=("$config_path")
+    GIN_OPTIONS+=("$gin_opts")
 done < "$EXP_FILE"
 
 if [ ${#EXP_NAMES[@]} -eq 0 ]; then
@@ -207,7 +227,7 @@ if [ ${DRY_RUN} -eq 1 ]; then
 fi
 echo "Experiments to run (${#EXP_NAMES[@]} total):"
 for i in "${!EXP_NAMES[@]}"; do
-    echo "  - ${EXP_NAMES[$i]}: ${CONFIG_FILES[$i]}"
+    echo "  - ${EXP_NAMES[$i]}: ${GIN_OPTIONS[$i]:-'(defaults)'}"
 done
 echo ""
 echo "Output directory:  ${BATCH_OUTPUT_DIR}"
@@ -224,24 +244,24 @@ if [ ${DRY_RUN} -eq 1 ]; then
     
     for i in "${!EXP_NAMES[@]}"; do
         exp="${EXP_NAMES[$i]}"
-        config="${CONFIG_FILES[$i]}"
+        gin_opts="${GIN_OPTIONS[$i]}"
         exp_num=$((i + 1))
         EXP_OUTPUT_DIR="${BATCH_OUTPUT_DIR}/${exp}"
         
         echo -e "[${exp_num}/${#EXP_NAMES[@]}] ${YELLOW}${exp}${NC}"
-        echo "  Config:     ${config}"
+        echo "  Options:    ${gin_opts:-'(defaults)'}"
         echo "  Output dir: ${EXP_OUTPUT_DIR}"
         echo "  Command:"
         if [ ${ENABLE_NSYS} -eq 1 ]; then
             echo "    ${SCRIPT_DIR}/run_single_experiment_local.sh ${exp} \\"
-            echo "        --config=${config} \\"
+            echo "        ${gin_opts} \\"
             echo "        --nproc=${NPROC} \\"
             echo "        --output-dir=${EXP_OUTPUT_DIR} \\"
             echo "        --hstu-root=${HSTU_ROOT} \\"
             echo "        --nsys"
         else
             echo "    ${SCRIPT_DIR}/run_single_experiment_local.sh ${exp} \\"
-            echo "        --config=${config} \\"
+            echo "        ${gin_opts} \\"
             echo "        --nproc=${NPROC} \\"
             echo "        --output-dir=${EXP_OUTPUT_DIR} \\"
             echo "        --hstu-root=${HSTU_ROOT}"
@@ -280,7 +300,7 @@ NSYS Profiling:  $([ ${ENABLE_NSYS} -eq 1 ] && echo 'ENABLED' || echo 'DISABLED'
 Experiment File: ${EXP_FILE}
 
 Experiments (${#EXP_NAMES[@]} total):
-$(for i in "${!EXP_NAMES[@]}"; do echo "  $((i+1)). ${EXP_NAMES[$i]} -> ${CONFIG_FILES[$i]}"; done)
+$(for i in "${!EXP_NAMES[@]}"; do echo "  $((i+1)). ${EXP_NAMES[$i]} -> ${GIN_OPTIONS[$i]:-'(defaults)'}"; done)
 
 --------------------------------------------------------------------------------
 Results:
@@ -294,7 +314,7 @@ FAILED_EXPS=()
 
 for i in "${!EXP_NAMES[@]}"; do
     exp="${EXP_NAMES[$i]}"
-    config="${CONFIG_FILES[$i]}"
+    gin_opts="${GIN_OPTIONS[$i]}"
     exp_num=$((i + 1))
     
     # Output directory for each experiment
@@ -304,7 +324,7 @@ for i in "${!EXP_NAMES[@]}"; do
     echo ""
     echo "=========================================="
     echo -e "${YELLOW}[${exp_num}/${#EXP_NAMES[@]}] Running ${exp}...${NC}"
-    echo "  Config:     ${config}"
+    echo "  Options:    ${gin_opts:-'(defaults)'}"
     echo "  Output dir: ${EXP_OUTPUT_DIR}"
     if [ ${ENABLE_NSYS} -eq 1 ]; then
         echo "  NSYS:       ENABLED"
@@ -315,7 +335,7 @@ for i in "${!EXP_NAMES[@]}"; do
     EXP_START_DATE=$(date)
     
     # Build run command, pass output directory and HSTU_ROOT
-    RUN_CMD="${SCRIPT_DIR}/run_single_experiment_local.sh ${exp} --config=${config} --nproc=${NPROC} --output-dir=${EXP_OUTPUT_DIR} --hstu-root=${HSTU_ROOT}"
+    RUN_CMD="${SCRIPT_DIR}/run_single_experiment_local.sh ${exp} ${gin_opts} --nproc=${NPROC} --output-dir=${EXP_OUTPUT_DIR} --hstu-root=${HSTU_ROOT}"
     if [ ${ENABLE_NSYS} -eq 1 ]; then
         RUN_CMD="${RUN_CMD} --nsys"
     fi
@@ -423,6 +443,7 @@ echo "  ${BATCH_OUTPUT_DIR}/"
 for exp in "${EXP_NAMES[@]}"; do
     echo "  ├── ${exp}/"
     echo "  │   ├── ${exp}_*.log"
+    echo "  │   ├── ${exp}_*.gin"
     if [ ${ENABLE_NSYS} -eq 1 ]; then
         echo "  │   └── ${exp}_*.nsys-rep"
     fi
