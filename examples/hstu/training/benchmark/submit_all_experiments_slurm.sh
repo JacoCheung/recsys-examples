@@ -9,7 +9,7 @@
 #   HSTU_ROOT            Path to examples/hstu directory (optional, defaults to pwd)
 # 
 # Options:
-#   --exp-file=FILE      Experiment list file (required, format: exp_name,config_path)
+#   --exp-file=FILE      Experiment list file (required, format: exp_name,gin_options)
 #   --hstu-root=PATH     Specify examples/hstu directory path (overrides env var and pwd)
 #   --results-dir=PATH   Output directory (default: training/benchmark/results)
 #   --nsys               Enable nsys profile sampling
@@ -24,12 +24,20 @@
 #   --dry-run            Print sbatch commands only, do not submit
 #   --help               Show help information
 # 
+# Experiment List File Format:
+#   # Comment lines start with #
+#   exp_name,generate_gin_config_options
+#   exp0_baseline,
+#   exp1_cutlass,--kernel_backend cutlass
+#   exp4_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
+# 
 # Output Directory Structure:
 #   {results_dir}/
 #   └── {batch_timestamp}/           # Timestamp of this batch submission
 #       ├── exp0_baseline/           # First experiment
 #       │   ├── exp0_baseline_*.log
-#       │   ├── {job_name}_*.out         # SLURM stdout/stderr
+#       │   ├── exp0_baseline_*.gin  # Generated config
+#       │   ├── {job_name}_*.out     # SLURM stdout/stderr
 #       │   └── exp0_baseline_*.nsys-rep  (if nsys enabled)
 #       ├── exp1_cutlass/            # Second experiment
 #       │   ├── ...
@@ -74,7 +82,7 @@ CUSTOM_HSTU_ROOT=""
 # Help Information
 # ============================================================================
 show_help() {
-    head -52 "$0" | tail -51
+    head -58 "$0" | tail -57
     exit 0
 }
 
@@ -201,18 +209,17 @@ BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 # ============================================================================
 # Check Experiment List File
 # ============================================================================
-# In dry-run mode, --exp-file is optional (will show command template)
+# If --exp-file is not provided, show help
 if [ -z "$EXP_FILE" ]; then
-    if [ ${DRY_RUN} -eq 0 ]; then
-        echo "❌ Error: Missing experiment list file (--exp-file=<file>)"
-        echo "Use --help for usage information"
-        exit 1
-    fi
+    echo "⚠️  Missing experiment list file (--exp-file=<file>)"
+    echo ""
+    head -60 "$0" | tail -58
+    exit 0
 fi
 
 # Read experiment list if provided
 declare -a EXP_NAMES
-declare -a CONFIG_FILES
+declare -a GIN_OPTIONS
 
 if [ -n "$EXP_FILE" ]; then
     # If relative path, make it relative to examples/hstu
@@ -232,14 +239,14 @@ if [ -n "$EXP_FILE" ]; then
     fi
 
     # Read experiment list (skip comments and empty lines)
-    while IFS=',' read -r exp_name config_path || [ -n "$exp_name" ]; do
+    while IFS=',' read -r exp_name gin_opts || [ -n "$exp_name" ]; do
         # Skip empty lines and comments
         [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
         # Trim leading/trailing whitespace
         exp_name=$(echo "$exp_name" | xargs)
-        config_path=$(echo "$config_path" | xargs)
+        gin_opts=$(echo "$gin_opts" | xargs)
         EXP_NAMES+=("$exp_name")
-        CONFIG_FILES+=("$config_path")
+        GIN_OPTIONS+=("$gin_opts")
     done < "$EXP_FILE"
 
     if [ ${#EXP_NAMES[@]} -eq 0 ]; then
@@ -291,31 +298,6 @@ if [ ${DRY_RUN} -eq 1 ]; then
     echo ""
 fi
 
-# If no experiment file provided (dry-run only), show command template and exit
-if [ -z "$EXP_FILE" ]; then
-    echo -e "${YELLOW}No experiment file provided. Showing sbatch command template:${NC}"
-    echo ""
-    echo "sbatch \\"
-    echo "    --job-name=hstu_<EXP_NAME> \\"
-    echo "    --output=<OUTPUT_DIR>/hstu_<EXP_NAME>_%j.out \\"
-    echo "    --partition=${PARTITION} \\"
-    [ -n "$ACCOUNT" ] && echo "    --account=${ACCOUNT} \\"
-    [ -n "$JOB_PREFIX" ] && echo "    # (job-prefix applied to job-name) \\"
-    echo "    --nodes=${NODES} \\"
-    echo "    --ntasks-per-node=${RANKS_PER_NODE} \\"
-    echo "    --cpus-per-task=8 \\"
-    echo "    --mem=0 \\"
-    echo "    --time=${TIME_LIMIT} \\"
-    echo "    --exclusive \\"
-    echo "    --network=sharp \\"
-    echo "    --export=HSTU_ROOT=<HSTU_ROOT>,EXP_NAME=<EXP_NAME>,CONFIG_FILE=<CONFIG_FILE>,EXP_OUTPUT_DIR=<OUTPUT_DIR>,ENABLE_NSYS=${ENABLE_NSYS},CONTAINER_IMAGE=${CONTAINER_IMAGE} \\"
-    echo "    ${SCRIPT_DIR}/slurm_job.sub"
-    echo ""
-    echo "Container image: ${CONTAINER_IMAGE}"
-    echo ""
-    exit 0
-fi
-
 echo -e "${BLUE}Batch timestamp:   ${BATCH_TIMESTAMP}${NC}"
 echo -e "${BLUE}Output directory:  ${BATCH_OUTPUT_DIR}${NC}"
 echo ""
@@ -323,7 +305,7 @@ echo -e "${BLUE}Experiment file: ${EXP_FILE}${NC}"
 echo ""
 echo -e "${BLUE}Experiments to run (${#EXP_NAMES[@]} total):${NC}"
 for i in "${!EXP_NAMES[@]}"; do
-    echo "  - ${EXP_NAMES[$i]}: ${CONFIG_FILES[$i]}"
+    echo "  - ${EXP_NAMES[$i]}: ${GIN_OPTIONS[$i]:-'(defaults)'}"
 done
 echo ""
 
@@ -354,7 +336,7 @@ echo ""
 
 for i in "${!EXP_NAMES[@]}"; do
     exp="${EXP_NAMES[$i]}"
-    config="${CONFIG_FILES[$i]}"
+    gin_opts="${GIN_OPTIONS[$i]}"
     exp_num=$((i + 1))
     
     # Output directory for each experiment
@@ -395,14 +377,15 @@ for i in "${!EXP_NAMES[@]}"; do
         SBATCH_CMD+=" --dependency=afterany:${PREV_JOB_ID}"
     fi
     
-    # Export environment variables (including exp_name, config_file, output_dir, HSTU_ROOT and CONTAINER_IMAGE)
-    SBATCH_CMD+=" --export=ALL,EXP_NAME=${exp},CONFIG_FILE=${config},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
+    # Export environment variables (including exp_name, gin_options, output_dir, HSTU_ROOT and CONTAINER_IMAGE)
+    # Use single quotes around GIN_OPTIONS to preserve spaces
+    SBATCH_CMD+=" --export=ALL,EXP_NAME=${exp},GIN_OPTIONS='${gin_opts}',EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
     
     # Specify SLURM job script
     SBATCH_CMD+=" ${SCRIPT_DIR}/slurm_job.sub"
     
     echo -e "[${exp_num}/${#EXP_NAMES[@]}] ${YELLOW}${exp}${NC}"
-    echo "  Config:     ${config}"
+    echo "  Options:    ${gin_opts:-'(defaults)'}"
     echo "  Output dir: ${EXP_OUTPUT_DIR}"
     
     if [ ${DRY_RUN} -eq 1 ]; then
@@ -497,6 +480,7 @@ else
         fi
         echo "  ├── ${exp}/"
         echo "  │   ├── ${exp}_*.log"
+        echo "  │   ├── ${exp}_*.gin"
         if [ ${ENABLE_NSYS} -eq 1 ]; then
             echo "  │   ├── ${JOB_NAME_PATTERN}_*.out"
             echo "  │   └── ${exp}_*.nsys-rep"

@@ -2,13 +2,22 @@
 # ============================================================================
 # Single Experiment Runner (Single Node)
 # 
-# Usage: ./training/benchmark/run_single_experiment_local.sh <exp_name> --config=<config_file> [options]
+# Usage: ./training/benchmark/run_single_experiment_local.sh <exp_name> [options]
 # 
 # Environment Variables:
 #   HSTU_ROOT         Path to examples/hstu directory (optional, defaults to pwd)
 # 
-# Options:
-#   --config=PATH     Config file path (relative to examples/hstu or absolute)
+# Optimization Switches (same as generate_gin_config.py):
+#   --kernel_backend [triton|cutlass]   Attention kernel backend (default: triton)
+#   --recompute_layernorm               Enable LayerNorm recompute (default: False)
+#   --balanced_shuffler                 Enable workload balancer (default: False)
+#   --caching                           Enable DynamicEmb caching (default: False)
+#   --ratio FLOAT                       GPU cache ratio (default: 0, auto 0.1 if caching)
+#   --evict [lru|lfu]                   Eviction strategy (default: lru)
+#   --pipeline_type [none|prefetch]     Pipeline type (default: none)
+#   --tp_size INT                       Tensor Parallel size (default: 1)
+# 
+# Other Options:
 #   --hstu-root=PATH  Specify examples/hstu directory path (overrides env var and pwd)
 #   --nproc=N         Number of processes/GPUs (default: 8)
 #   --nsys            Enable nsys profile sampling (traces all child processes/ranks)
@@ -18,33 +27,79 @@
 # Output Directory Structure:
 #   {output_dir}/
 #   ├── {exp_name}_{timestamp}.log
+#   ├── {exp_name}_{timestamp}.gin          (generated config)
 #   └── {exp_name}_{timestamp}_{hostname}.nsys-rep  (if --nsys enabled)
 # 
 # Examples:
-#   ./training/benchmark/run_single_experiment_local.sh exp0_baseline --config=training/benchmark/gin_configs/benchmark_exp0_baseline.gin
-#   ./training/benchmark/run_single_experiment_local.sh exp0_baseline --config=training/benchmark/gin_configs/benchmark_exp0_baseline.gin --nproc=8
-#   ./training/benchmark/run_single_experiment_local.sh exp0_baseline --config=training/benchmark/gin_configs/benchmark_exp0_baseline.gin --nsys
-#   ./training/benchmark/run_single_experiment_local.sh --hstu-root=/path/to/examples/hstu exp0_baseline --config=training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+#   # Baseline (all defaults)
+#   ./training/benchmark/run_single_experiment_local.sh exp0_baseline
+#   
+#   # CUTLASS attention
+#   ./training/benchmark/run_single_experiment_local.sh exp1_cutlass --kernel_backend cutlass
+#   
+#   # Full optimization
+#   ./training/benchmark/run_single_experiment_local.sh exp8_full \
+#       --kernel_backend cutlass --recompute_layernorm --balanced_shuffler \
+#       --caching --evict lfu --pipeline_type prefetch --tp_size 2
 # ============================================================================
 
 set -e
 
 # Default values
 NPROC=${NPROC:-8}
-CONFIG_FILE=""
 ENABLE_NSYS=0
 CUSTOM_OUTPUT_DIR=""
 DRY_RUN=0
 CUSTOM_HSTU_ROOT=""
 
+# Optimization switch defaults (same as generate_gin_config.py)
+KERNEL_BACKEND="triton"
+RECOMPUTE_LAYERNORM=0
+BALANCED_SHUFFLER=0
+CACHING=0
+RATIO=0
+EVICT="lru"
+PIPELINE_TYPE="none"
+TP_SIZE=1
+
 # Parse arguments
 EXP_NAME=""
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --config=*)
-            CONFIG_FILE="${1#*=}"
+        # Optimization switches
+        --kernel_backend)
+            KERNEL_BACKEND="$2"
+            shift 2
+            ;;
+        --recompute_layernorm)
+            RECOMPUTE_LAYERNORM=1
             shift
             ;;
+        --balanced_shuffler)
+            BALANCED_SHUFFLER=1
+            shift
+            ;;
+        --caching)
+            CACHING=1
+            shift
+            ;;
+        --ratio)
+            RATIO="$2"
+            shift 2
+            ;;
+        --evict)
+            EVICT="$2"
+            shift 2
+            ;;
+        --pipeline_type)
+            PIPELINE_TYPE="$2"
+            shift 2
+            ;;
+        --tp_size)
+            TP_SIZE="$2"
+            shift 2
+            ;;
+        # Other options
         --hstu-root=*)
             CUSTOM_HSTU_ROOT="${1#*=}"
             shift
@@ -66,7 +121,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            head -29 "$0" | tail -26
+            head -47 "$0" | tail -44
             exit 0
             ;;
         -*)
@@ -85,20 +140,24 @@ done
 # Argument validation
 if [ -z "$EXP_NAME" ]; then
     echo "❌ Error: Missing experiment name"
-    echo "Usage: $0 <exp_name> --config=<config_file> [options]"
+    echo "Usage: $0 <exp_name> [optimization switches] [options]"
     echo ""
-    echo "Options:"
-    echo "  --config=PATH     Config file path (required)"
+    echo "Optimization Switches:"
+    echo "  --kernel_backend [triton|cutlass]   (default: triton)"
+    echo "  --recompute_layernorm               (default: False)"
+    echo "  --balanced_shuffler                 (default: False)"
+    echo "  --caching                           (default: False)"
+    echo "  --ratio FLOAT                       (default: 0)"
+    echo "  --evict [lru|lfu]                   (default: lru)"
+    echo "  --pipeline_type [none|prefetch]     (default: none)"
+    echo "  --tp_size INT                       (default: 1)"
+    echo ""
+    echo "Other Options:"
     echo "  --hstu-root=PATH  Specify examples/hstu directory path"
     echo "  --nproc=N         Number of processes/GPUs (default: 8)"
-    echo "  --nsys            Enable nsys profile sampling (traces all processes)"
-    echo "  --output-dir=PATH Output directory (default: results/{timestamp}/{exp_name}/)"
-    echo "  --dry-run         Print commands only, do not execute"
-    exit 1
-fi
-
-if [ -z "$CONFIG_FILE" ]; then
-    echo "❌ Error: Missing config file (--config=<path>)"
+    echo "  --nsys            Enable nsys profile sampling"
+    echo "  --output-dir=PATH Output directory"
+    echo "  --dry-run         Print commands only"
     exit 1
 fi
 
@@ -131,6 +190,7 @@ fi
 # Path configuration
 SCRIPT_DIR="${HSTU_ROOT}/training/benchmark"
 RESULTS_BASE="${SCRIPT_DIR}/results"
+GIN_GENERATOR="${SCRIPT_DIR}/generate_gin_config.py"
 
 # Timestamp
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -154,18 +214,21 @@ if [ ${DRY_RUN} -eq 0 ]; then
     mkdir -p ${OUTPUT_DIR}
 fi
 
-# If config file is a relative path, make it relative to examples/hstu
-if [[ ! "$CONFIG_FILE" = /* ]]; then
-    CONFIG_FILE="${HSTU_ROOT}/${CONFIG_FILE}"
-fi
+# ============================================================================
+# Build generate_gin_config.py arguments
+# ============================================================================
+GIN_GEN_ARGS=""
+GIN_GEN_ARGS="${GIN_GEN_ARGS} --kernel_backend ${KERNEL_BACKEND}"
+[ ${RECOMPUTE_LAYERNORM} -eq 1 ] && GIN_GEN_ARGS="${GIN_GEN_ARGS} --recompute_layernorm"
+[ ${BALANCED_SHUFFLER} -eq 1 ] && GIN_GEN_ARGS="${GIN_GEN_ARGS} --balanced_shuffler"
+[ ${CACHING} -eq 1 ] && GIN_GEN_ARGS="${GIN_GEN_ARGS} --caching"
+GIN_GEN_ARGS="${GIN_GEN_ARGS} --ratio ${RATIO}"
+GIN_GEN_ARGS="${GIN_GEN_ARGS} --evict ${EVICT}"
+GIN_GEN_ARGS="${GIN_GEN_ARGS} --pipeline_type ${PIPELINE_TYPE}"
+GIN_GEN_ARGS="${GIN_GEN_ARGS} --tp_size ${TP_SIZE}"
 
-# Check config file (skip in dry-run mode)
-if [ ${DRY_RUN} -eq 0 ]; then
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "❌ Error: Config file not found: $CONFIG_FILE"
-        exit 1
-    fi
-fi
+# Generated config file path
+CONFIG_FILE="${OUTPUT_DIR}/${EXP_NAME}_${TIMESTAMP}.gin"
 
 # Color output
 YELLOW='\033[1;33m'
@@ -176,7 +239,17 @@ NC='\033[0m' # No Color
 echo "=========================================="
 echo "🚀 Running Experiment: ${EXP_NAME}"
 echo "=========================================="
-echo "Config file: ${CONFIG_FILE}"
+echo ""
+echo "Optimization Switches:"
+echo "  kernel_backend:      ${KERNEL_BACKEND}"
+echo "  recompute_layernorm: $([ ${RECOMPUTE_LAYERNORM} -eq 1 ] && echo 'True' || echo 'False')"
+echo "  balanced_shuffler:   $([ ${BALANCED_SHUFFLER} -eq 1 ] && echo 'True' || echo 'False')"
+echo "  caching:             $([ ${CACHING} -eq 1 ] && echo 'True' || echo 'False')"
+echo "  ratio:               ${RATIO}"
+echo "  evict:               ${EVICT}"
+echo "  pipeline_type:       ${PIPELINE_TYPE}"
+echo "  tp_size:             ${TP_SIZE}"
+echo ""
 echo "Output dir:  ${OUTPUT_DIR}"
 echo "GPUs:        ${NPROC}"
 echo ""
@@ -185,6 +258,28 @@ if [ ${DRY_RUN} -eq 1 ]; then
     echo -e "${YELLOW}⚠️  DRY RUN MODE - Commands will be printed but not executed${NC}"
 fi
 echo "=========================================="
+echo ""
+
+# ============================================================================
+# Generate gin config file
+# ============================================================================
+echo "📝 Generating gin config file..."
+echo "   Command: python ${GIN_GENERATOR} ${GIN_GEN_ARGS} -o ${CONFIG_FILE}"
+echo ""
+
+if [ ${DRY_RUN} -eq 0 ]; then
+    # Generate config and also print to terminal
+    python ${GIN_GENERATOR} ${GIN_GEN_ARGS} | tee ${CONFIG_FILE}
+    echo ""
+    echo -e "${GREEN}✅ Config saved to: ${CONFIG_FILE}${NC}"
+else
+    # In dry-run mode, generate and print config to terminal (not saved to file)
+    echo -e "${CYAN}Generated config (not saved):${NC}"
+    echo ""
+    python ${GIN_GENERATOR} ${GIN_GEN_ARGS}
+    echo ""
+    echo -e "${CYAN}Would save to: ${CONFIG_FILE}${NC}"
+fi
 echo ""
 
 # Environment variable setup (add HSTU_ROOT's parent directory to PYTHONPATH)
@@ -309,6 +404,7 @@ else
 fi
 echo "⏰ Finished at: $(date)"
 echo "📝 Log saved to: ${LOG_FILE}"
+echo "📄 Config file: ${CONFIG_FILE}"
 if [ ${ENABLE_NSYS} -eq 1 ]; then
     echo "📊 nsys profile: ${NSYS_OUTPUT}.nsys-rep"
 fi

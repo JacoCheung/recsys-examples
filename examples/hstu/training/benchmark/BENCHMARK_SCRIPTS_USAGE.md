@@ -9,12 +9,13 @@ This document provides detailed instructions for using HSTU Benchmark related sc
 1. [Working Directory Requirements](#working-directory-requirements)
 2. [File Structure](#file-structure)
 3. [Script Dependencies](#script-dependencies)
-4. [Experiment List File](#experiment-list-file)
-5. [Single Node Local Execution](#single-node-local-execution)
-6. [SLURM Cluster Submission](#slurm-cluster-submission)
-7. [nsys Profile Sampling](#nsys-profile-sampling)
-8. [Common Command Examples](#common-command-examples)
-9. [Output File Description](#output-file-description)
+4. [Optimization Switches](#optimization-switches)
+5. [Experiment List File](#experiment-list-file)
+6. [Single Node Local Execution](#single-node-local-execution)
+7. [SLURM Cluster Submission](#slurm-cluster-submission)
+8. [nsys Profile Sampling](#nsys-profile-sampling)
+9. [Common Command Examples](#common-command-examples)
+10. [Output File Description](#output-file-description)
 
 ---
 
@@ -41,14 +42,17 @@ examples/hstu/
 ├── training/
 │   ├── benchmark/
 │   │   ├── experiments.txt                    # Experiment list file
+│   │   ├── generate_gin_config.py             # Gin config generator script
 │   │   ├── run_single_experiment_local.sh     # Single node single experiment run script
 │   │   ├── run_all_experiments_local.sh       # Single node batch run script
 │   │   ├── submit_all_experiments_slurm.sh    # SLURM batch submission script
 │   │   ├── slurm_job.sub                      # SLURM job script
 │   │   └── results/                           # Output directory
-│   │       ├── *.log                          # Training logs
-│   │       └── nsys_profiles/                 # nsys sample files
-│   ├── configs/                               # Configuration file directory
+│   │       └── {batch_timestamp}/
+│   │           └── {exp_name}/
+│   │               ├── {exp_name}_*.log       # Training logs
+│   │               ├── {exp_name}_*.gin       # Generated config
+│   │               └── *.nsys-rep             # nsys profiles (if enabled)
 │   └── pretrain_gr_ranking.py                 # Training main program
 ```
 
@@ -62,15 +66,13 @@ examples/hstu/
 graph TD
     subgraph InputFiles[Input Files]
         EXP[experiments.txt]
-        CFG[config.gin]
+        GIN_GEN[generate_gin_config.py]
     end
     
     subgraph LocalRun[Single Node Local Run]
         RUN_ALL_LOCAL[run_all_experiments_local.sh]
         RUN_SINGLE_LOCAL[run_single_experiment_local.sh]
         TORCHRUN[torchrun]
-        NSYS_WRAPPER_LOCAL[nsys_wrapper_local.sh]
-        NSYS_LOCAL[nsys profile]
     end
     
     subgraph SlurmRun[SLURM Cluster Run]
@@ -78,40 +80,35 @@ graph TD
         SBATCH[sbatch]
         SLURM_JOB[slurm_job.sub]
         SRUN[srun]
-        NSYS_WRAPPER[nsys_wrapper.sh]
-        NSYS[nsys profile]
     end
     
     subgraph Training[Training Program]
+        CFG[Generated .gin config]
         TRAIN[pretrain_gr_ranking.py]
     end
     
     subgraph OutputFiles[Output Files]
         LOG[results/*.log]
-        NSYS_OUT[nsys_profiles/*.nsys-rep]
+        GIN_OUT[results/*.gin]
+        NSYS_OUT[results/*.nsys-rep]
     end
     
     EXP --> RUN_ALL_LOCAL
     RUN_ALL_LOCAL --> RUN_SINGLE_LOCAL
-    RUN_SINGLE_LOCAL --> CFG
+    RUN_SINGLE_LOCAL --> GIN_GEN
+    GIN_GEN --> CFG
     RUN_SINGLE_LOCAL --> TORCHRUN
-    RUN_SINGLE_LOCAL --> NSYS_WRAPPER_LOCAL
-    NSYS_WRAPPER_LOCAL --> NSYS_LOCAL
-    NSYS_LOCAL --> TRAIN
     TORCHRUN --> TRAIN
+    CFG --> TRAIN
     TRAIN --> LOG
-    NSYS_LOCAL --> NSYS_OUT
     
     EXP --> SUBMIT
     SUBMIT --> SBATCH
     SBATCH --> SLURM_JOB
-    SLURM_JOB --> CFG
+    SLURM_JOB --> GIN_GEN
+    GIN_GEN --> CFG
     SLURM_JOB --> SRUN
-    SLURM_JOB --> NSYS_WRAPPER
-    NSYS_WRAPPER --> NSYS
-    NSYS --> TRAIN
     SRUN --> TRAIN
-    NSYS --> NSYS_OUT
 ```
 
 ### Script Call Relationship Description
@@ -119,76 +116,43 @@ graph TD
 | Script | Caller | Called Scripts/Programs | Description |
 |--------|--------|------------------------|-------------|
 | `run_all_experiments_local.sh` | User | `run_single_experiment_local.sh` | Loops through experiment list, calls each one |
-| `run_single_experiment_local.sh` | User/Parent Script | `torchrun` or `nsys_wrapper` | Single node distributed training launcher |
+| `run_single_experiment_local.sh` | User/Parent Script | `generate_gin_config.py`, `torchrun` | Generates config, launches distributed training |
 | `submit_all_experiments_slurm.sh` | User | `sbatch` → `slurm_job.sub` | Loop submits SLURM jobs |
-| `slurm_job.sub` | SLURM Scheduler | `srun` or `nsys_wrapper` | Chooses execution method based on nsys enablement |
-| `.nsys_wrapper.sh` | `slurm_job.sub` | `nsys profile` | Temporarily generated, independent sampling per rank |
-| `.nsys_wrapper_local.sh` | `run_single_experiment_local.sh` | `nsys profile` | Temporarily generated, only specified ranks sample |
+| `slurm_job.sub` | SLURM Scheduler | `generate_gin_config.py`, `srun` | Generates config, runs training |
+| `generate_gin_config.py` | All scripts | - | Generates gin config based on optimization switches |
 
 ---
 
-## nsys Profile Sampling
+## Optimization Switches
 
-### Overview
+All scripts use the same set of optimization switches to configure experiments. These switches are passed to `generate_gin_config.py` to generate the appropriate gin config file.
 
-All scripts (local and SLURM) support NVIDIA Nsight Systems (nsys) performance sampling for analyzing GPU/CUDA performance bottlenecks.
+### Available Switches
 
-### nsys Parameter Description
+| Switch | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--kernel_backend` | `triton`/`cutlass` | `triton` | Attention kernel backend |
+| `--recompute_layernorm` | flag | `False` | Enable LayerNorm selective recompute |
+| `--balanced_shuffler` | flag | `False` | Enable workload balancer for variable-length sequences |
+| `--caching` | flag | `False` | Enable DynamicEmb GPU caching |
+| `--ratio` | float | `0` | GPU cache ratio (0.0-1.0), auto-set to 0.1 if caching enabled |
+| `--evict` | `lru`/`lfu` | `lru` | Cache eviction strategy |
+| `--pipeline_type` | `none`/`prefetch` | `none` | Pipeline type for I/O hiding |
+| `--tp_size` | int | `1` | Tensor Parallel size |
 
-When `--nsys` is enabled, the following fixed parameters are used (consistent between local and SLURM scripts):
+### Switch Combinations for Standard Experiments
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `-o` | `{output_path}` | Output file path (without extension) |
-| `-f true` | - | Force overwrite existing files |
-| `-s none` | - | No CPU sampling |
-| `-t cuda,nvtx` | - | Trace CUDA API and NVTX markers |
-| `-c cudaProfilerApi` | - | Use CUDA Profiler API to control sampling scope |
-| `--cpuctxsw none` | - | No CPU context switch tracing |
-| `--cuda-flush-interval 100` | - | CUDA event flush interval 100ms |
-| `--capture-range-end=stop` | - | Stop when sampling range ends |
-| `--cuda-graph-trace=node` | - | Trace CUDA Graph at node level |
-
-### Local Script nsys Options
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--nsys` | Enable nsys profile sampling | Disabled |
-| `--nsys-ranks=LIST` | Specify which ranks to sample | `0` (rank 0 only) |
-
-`--nsys-ranks` supported formats:
-- `0` - Sample rank 0 only
-- `0,1,2` - Sample multiple specified ranks
-- `all` - Sample all ranks
-
-### Examples
-
-```bash
-# Single node local run, sample rank 0 only
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nsys
-
-# Single node local run, sample rank 0 and 1
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nsys --nsys-ranks=0,1
-
-# Single node local run, sample all ranks
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nsys --nsys-ranks=all
-
-# Batch run all experiments, enable nsys
-./training/benchmark/run_all_experiments_local.sh \
-    --exp-file=training/benchmark/experiments.txt \
-    --nsys
-
-# Batch run all experiments, sample multiple ranks
-./training/benchmark/run_all_experiments_local.sh \
-    --exp-file=training/benchmark/experiments.txt \
-    --nsys --nsys-ranks=0,1
-```
+| Experiment | Switches |
+|------------|----------|
+| exp0_baseline | *(all defaults)* |
+| exp1_cutlass | `--kernel_backend cutlass` |
+| exp2_recompute | `--kernel_backend cutlass --recompute_layernorm` |
+| exp3_workload_balancer | `--kernel_backend cutlass --recompute_layernorm --balanced_shuffler` |
+| exp4_dynamicemb_caching | `--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching` |
+| exp5_lfu | `--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu` |
+| exp6_pipeline | `--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch` |
+| exp7_tp | `--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2` |
+| exp8_full | `--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2` |
 
 ---
 
@@ -199,30 +163,38 @@ When `--nsys` is enabled, the following fixed parameters are used (consistent be
 The experiment list file (`experiments.txt`) is in CSV format with two columns:
 
 ```
-exp_name,config_file_path
+exp_name,gin_options
 ```
 
 - `exp_name`: Experiment name, used for log and output file naming
-- `config_file_path`: Configuration file relative path (**relative to `examples/hstu` directory**)
+- `gin_options`: Options passed to `generate_gin_config.py` (can be empty for baseline)
 
 ### Example Content
 
 ```
 # HSTU Benchmark Experiment List
-# Format: exp_name,config_file_path
+# Format: exp_name,generate_gin_config_options
 # Comment lines start with #
 #
-# Important: Paths are relative to examples/hstu directory
+# Available options:
+#   --kernel_backend [triton|cutlass]   (default: triton)
+#   --recompute_layernorm               (default: False)
+#   --balanced_shuffler                 (default: False)
+#   --caching                           (default: False)
+#   --ratio FLOAT                       (default: 0, auto-set to 0.1 when caching enabled)
+#   --evict [lru|lfu]                   (default: lru)
+#   --pipeline_type [none|prefetch]     (default: none)
+#   --tp_size INT                       (default: 1)
 
-exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
-exp1_cutlass,training/benchmark/gin_configs/benchmark_exp1_cutlass.gin
-exp2_recompute,training/benchmark/gin_configs/benchmark_exp2_recompute.gin
-exp3_workload_balancer,training/benchmark/gin_configs/benchmark_exp3_workload_balancer.gin
-exp4_dynamicemb_caching,training/benchmark/gin_configs/benchmark_exp4_dynamicemb_caching.gin
-exp5_lfu,training/benchmark/gin_configs/benchmark_exp5_lfu.gin
-exp6_pipeline,training/benchmark/gin_configs/benchmark_exp6_pipeline.gin
-exp7_tp,training/benchmark/gin_configs/benchmark_exp7_tp.gin
-exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
+exp0_baseline,
+exp1_cutlass,--kernel_backend cutlass
+exp2_recompute,--kernel_backend cutlass --recompute_layernorm
+exp3_workload_balancer,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler
+exp4_dynamicemb_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
+exp5_lfu,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu
+exp6_pipeline,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch
+exp7_tp,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
+exp8_full,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
 ```
 
 ### Custom Experiment List
@@ -233,8 +205,9 @@ You can create a custom experiment list file to run only some experiments:
 # Create in examples/hstu directory
 cat > my_experiments.txt << EOF
 # My custom experiments
-exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
-exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
+exp0_baseline,
+exp4_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
+exp8_full,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
 EOF
 ```
 
@@ -251,7 +224,7 @@ Run a single experiment (single node multi-GPU).
 ```bash
 # Must execute in examples/hstu directory
 cd /path/to/recsys-examples/examples/hstu
-./training/benchmark/run_single_experiment_local.sh <exp_name> --config=<config_file> [options]
+./training/benchmark/run_single_experiment_local.sh <exp_name> [optimization switches] [options]
 ```
 
 #### Parameters
@@ -259,10 +232,18 @@ cd /path/to/recsys-examples/examples/hstu
 | Parameter | Description | Required | Default |
 |-----------|-------------|----------|---------|
 | `exp_name` | Experiment name | ✅ | - |
-| `--config=PATH` | Configuration file path (relative to examples/hstu) | ✅ | - |
+| `--kernel_backend` | Attention backend (triton/cutlass) | ❌ | triton |
+| `--recompute_layernorm` | Enable LayerNorm recompute | ❌ | False |
+| `--balanced_shuffler` | Enable workload balancer | ❌ | False |
+| `--caching` | Enable DynamicEmb caching | ❌ | False |
+| `--ratio` | GPU cache ratio | ❌ | 0 (auto 0.1 if caching) |
+| `--evict` | Eviction strategy (lru/lfu) | ❌ | lru |
+| `--pipeline_type` | Pipeline type (none/prefetch) | ❌ | none |
+| `--tp_size` | Tensor Parallel size | ❌ | 1 |
 | `--nproc=N` | Number of processes/GPUs | ❌ | 8 |
+| `--output-dir=PATH` | Output directory | ❌ | results/{timestamp}/{exp_name}/ |
 | `--nsys` | Enable nsys profile sampling | ❌ | Disabled |
-| `--nsys-ranks=LIST` | Specify sampling ranks | ❌ | 0 |
+| `--dry-run` | Print commands only, show generated config | ❌ | - |
 | `--help` | Show help | ❌ | - |
 
 #### Examples
@@ -271,29 +252,32 @@ cd /path/to/recsys-examples/examples/hstu
 # First switch to correct directory
 cd /path/to/recsys-examples/examples/hstu
 
-# Basic usage
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin
+# Baseline (all defaults)
+./training/benchmark/run_single_experiment_local.sh exp0_baseline
+
+# CUTLASS attention
+./training/benchmark/run_single_experiment_local.sh exp1_cutlass \
+    --kernel_backend cutlass
+
+# With recompute
+./training/benchmark/run_single_experiment_local.sh exp2_recompute \
+    --kernel_backend cutlass --recompute_layernorm
+
+# Full optimization
+./training/benchmark/run_single_experiment_local.sh exp8_full \
+    --kernel_backend cutlass --recompute_layernorm --balanced_shuffler \
+    --caching --evict lfu --pipeline_type prefetch --tp_size 2
 
 # Specify GPU count
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nproc=4
+./training/benchmark/run_single_experiment_local.sh exp0_baseline --nproc=4
 
-# Enable nsys profile (rank 0 only)
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nsys
+# Enable nsys profile
+./training/benchmark/run_single_experiment_local.sh exp0_baseline --nsys
 
-# Enable nsys profile (sample rank 0 and 1)
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nsys --nsys-ranks=0,1
-
-# Use absolute path
-./training/benchmark/run_single_experiment_local.sh my_exp \
-    --config=/path/to/my_config.gin \
-    --nproc=8
+# Dry run (show generated config without running)
+./training/benchmark/run_single_experiment_local.sh exp4_caching \
+    --kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching \
+    --dry-run
 ```
 
 ---
@@ -316,8 +300,9 @@ cd /path/to/recsys-examples/examples/hstu
 |-----------|-------------|----------|---------|
 | `--exp-file=FILE` | Experiment list file (relative to examples/hstu) | ✅ | - |
 | `--nproc=N` | Number of processes/GPUs | ❌ | 8 |
+| `--results-dir=PATH` | Output directory | ❌ | training/benchmark/results |
 | `--nsys` | Enable nsys profile sampling | ❌ | Disabled |
-| `--nsys-ranks=LIST` | Specify sampling ranks | ❌ | 0 |
+| `--dry-run` | Print commands only | ❌ | - |
 | `--help` | Show help | ❌ | - |
 
 #### Examples
@@ -332,12 +317,11 @@ cd /path/to/recsys-examples/examples/hstu
 # Specify GPU count
 ./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --nproc=4
 
-# Enable nsys profile (all experiments sample rank 0)
+# Enable nsys profile
 ./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --nsys
 
-# Enable nsys profile (sample multiple ranks)
-./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt \
-    --nsys --nsys-ranks=0,1
+# Dry run
+./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --dry-run
 
 # Use custom experiment list
 ./training/benchmark/run_all_experiments_local.sh --exp-file=my_experiments.txt --nproc=8 --nsys
@@ -366,10 +350,12 @@ cd /path/to/recsys-examples/examples/hstu
 | `--exp-file=FILE` | Experiment list file (relative to examples/hstu) | ✅ | - |
 | `--nsys` | Enable nsys profile sampling | ❌ | Disabled |
 | `--sequential` | Sequential execution (job dependency) | ❌ | Parallel |
-| `--partition=NAME` | SLURM partition name | ❌ | gpu |
+| `--partition=NAME` | SLURM partition name | ❌ | batch |
+| `--account=NAME` | SLURM account name | ❌ | - |
+| `--job-name=NAME` | Job name prefix | ❌ | - |
+| `--container-image=IMAGE` | Container image | ❌ | gitlab-master... |
 | `--nodes=N` | Number of nodes | ❌ | 2 |
 | `--ranks-per-node=N` | Ranks per node | ❌ | 8 |
-| `--gpus-per-node=N` | GPUs per node | ❌ | 8 |
 | `--time=HH:MM:SS` | Job time limit | ❌ | 04:00:00 |
 | `--dry-run` | Print commands only, don't submit | ❌ | - |
 | `--help` | Show help | ❌ | - |
@@ -393,7 +379,6 @@ cd /path/to/recsys-examples/examples/hstu
 ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt \
     --nodes=4 \
     --ranks-per-node=8 \
-    --gpus-per-node=8 \
     --partition=h100 \
     --time=08:00:00 \
     --nsys
@@ -419,44 +404,33 @@ The script receives parameters through the following environment variables:
 |----------|-------------|----------|---------|
 | `HSTU_ROOT` | Absolute path to `examples/hstu` directory | ✅ | - |
 | `EXP_NAME` | Experiment name | ❌ | `exp0_baseline` |
-| `CONFIG_FILE` | Configuration file path (relative to `examples/hstu` or absolute) | ✅ | - |
+| `GIN_OPTIONS` | Options for generate_gin_config.py | ❌ | *(empty = baseline)* |
 | `EXP_OUTPUT_DIR` | Output directory for logs and nsys profiles | ✅ | - |
 | `ENABLE_NSYS` | Enable nsys profiling (0/1) | ❌ | `0` |
+| `CONTAINER_IMAGE` | Container image | ❌ | gitlab-master... |
 
 #### Standalone Usage
 
-You can use `slurm_job.sub` directly with `sbatch` without going through `submit_all_experiments_slurm.sh`:
+You can use `slurm_job.sub` directly with `sbatch`:
 
 ```bash
-# Basic usage - submit a single experiment
+# Basic usage - submit a single experiment (baseline)
 sbatch \
-    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=/path/to/output \
+    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,GIN_OPTIONS='',EXP_OUTPUT_DIR=/path/to/output \
+    /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
+
+# With optimization switches
+sbatch \
+    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp4_caching,GIN_OPTIONS='--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching',EXP_OUTPUT_DIR=/path/to/output \
     /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
 
 # With nsys profiling enabled
 sbatch \
-    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=/path/to/output,ENABLE_NSYS=1 \
-    /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
-
-# Override SLURM parameters (nodes, partition, time limit, etc.)
-sbatch \
-    --nodes=4 \
-    --partition=h100 \
-    --time=08:00:00 \
-    --job-name=my_custom_job \
-    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp8_full,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp8_full.gin,EXP_OUTPUT_DIR=/path/to/output,ENABLE_NSYS=1 \
-    /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
-
-# Redirect stdout/stderr to custom files
-sbatch \
-    --output=/path/to/output/my_job_%j.out \
-    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp0_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=/path/to/output \
+    --export=HSTU_ROOT=/path/to/recsys-examples/examples/hstu,EXP_NAME=exp8_full,GIN_OPTIONS='--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2',EXP_OUTPUT_DIR=/path/to/output,ENABLE_NSYS=1 \
     /path/to/recsys-examples/examples/hstu/training/benchmark/slurm_job.sub
 ```
 
 #### Default SLURM Resource Configuration
-
-The script has the following default SLURM resource settings (can be overridden via `sbatch` command line):
 
 | Parameter | Default Value | Description |
 |-----------|---------------|-------------|
@@ -466,41 +440,46 @@ The script has the following default SLURM resource settings (can be overridden 
 | `--time` | 04:00:00 | Time limit |
 | `--mem` | 0 | Use all available memory |
 | `--exclusive` | - | Exclusive node access |
-| `--container-image` | `gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest` | Container image |
-| `--container-mounts` | /lustre:/lustre | Mount host filesystem into container |
-| `--output` | hstu-e2e-benchmark-%j.out | SLURM stdout/stderr file (%j = job ID) |
 
-#### Output Structure
+---
 
-```
-{EXP_OUTPUT_DIR}/
-├── {exp_name}_{jobid}_{timestamp}.log           # Training log
-└── {exp_name}_{timestamp}_job{jobid}_node{N}_rank{R}_{hostname}.nsys-rep  # nsys profiles (if enabled)
-```
+## nsys Profile Sampling
 
-#### Practical Examples
+### Overview
+
+All scripts support NVIDIA Nsight Systems (nsys) performance sampling for analyzing GPU/CUDA performance bottlenecks.
+
+### nsys Parameter Description
+
+When `--nsys` is enabled, the following fixed parameters are used:
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `-o` | `{output_path}` | Output file path (without extension) |
+| `-f true` | - | Force overwrite existing files |
+| `-s none` | - | No CPU sampling |
+| `-t cuda,nvtx` | - | Trace CUDA API and NVTX markers |
+| `-c cudaProfilerApi` | - | Use CUDA Profiler API to control sampling scope |
+| `--cpuctxsw none` | - | No CPU context switch tracing |
+| `--cuda-flush-interval 100` | - | CUDA event flush interval 100ms |
+| `--capture-range-end=stop` | - | Stop when sampling range ends |
+| `--cuda-graph-trace=node` | - | Trace CUDA Graph at node level |
+
+### Examples
 
 ```bash
-# Example 1: Quick test with baseline config
-sbatch \
-    --nodes=1 \
-    --time=01:00:00 \
-    --export=HSTU_ROOT=$(pwd),EXP_NAME=test_baseline,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp0_baseline.gin,EXP_OUTPUT_DIR=$(pwd)/training/benchmark/results/test \
-    training/benchmark/slurm_job.sub
+# Single node local run with nsys
+./training/benchmark/run_single_experiment_local.sh exp0_baseline --nsys
 
-# Example 2: Full optimization experiment with profiling
-sbatch \
-    --nodes=2 \
-    --partition=gpu \
-    --export=HSTU_ROOT=$(pwd),EXP_NAME=exp8_full,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp8_full.gin,EXP_OUTPUT_DIR=$(pwd)/training/benchmark/results/exp8,ENABLE_NSYS=1 \
-    training/benchmark/slurm_job.sub
+# Batch run all experiments with nsys
+./training/benchmark/run_all_experiments_local.sh \
+    --exp-file=training/benchmark/experiments.txt \
+    --nsys
 
-# Example 3: Using absolute paths
-HSTU_ROOT=/home/user/recsys-examples/examples/hstu
-OUTPUT_DIR=/scratch/user/benchmark_results
-sbatch \
-    --export=HSTU_ROOT=${HSTU_ROOT},EXP_NAME=exp2_fusion,CONFIG_FILE=training/benchmark/gin_configs/benchmark_exp2_fusion.gin,EXP_OUTPUT_DIR=${OUTPUT_DIR},ENABLE_NSYS=1 \
-    ${HSTU_ROOT}/training/benchmark/slurm_job.sub
+# SLURM submission with nsys
+./training/benchmark/submit_all_experiments_slurm.sh \
+    --exp-file=training/benchmark/experiments.txt \
+    --nsys
 ```
 
 ---
@@ -517,20 +496,23 @@ cd /path/to/recsys-examples/examples/hstu
 ### Single Node Development Testing
 
 ```bash
-# Quick test single experiment (1 GPU)
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nproc=1
+# Quick test single experiment (baseline, 1 GPU)
+./training/benchmark/run_single_experiment_local.sh exp0_baseline --nproc=1
 
-# 4 GPU test
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
-    --nproc=4
+# Test CUTLASS with 4 GPUs
+./training/benchmark/run_single_experiment_local.sh exp1_cutlass \
+    --kernel_backend cutlass --nproc=4
 
-# Enable nsys sampling test
-./training/benchmark/run_single_experiment_local.sh exp0_baseline \
-    --config=training/configs/h100_16gpu_exp0_baseline.gin \
+# Test full optimization with nsys
+./training/benchmark/run_single_experiment_local.sh exp8_full \
+    --kernel_backend cutlass --recompute_layernorm --balanced_shuffler \
+    --caching --evict lfu --pipeline_type prefetch --tp_size 2 \
     --nproc=4 --nsys
+
+# Dry run to see generated config
+./training/benchmark/run_single_experiment_local.sh exp4_caching \
+    --kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching \
+    --dry-run
 ```
 
 ### Full Benchmark (Single Node)
@@ -541,10 +523,15 @@ cd /path/to/recsys-examples/examples/hstu
     --exp-file=training/benchmark/experiments.txt \
     --nproc=8
 
-# Run all experiments with 8 GPUs, enable nsys
+# Run all experiments with nsys
 ./training/benchmark/run_all_experiments_local.sh \
     --exp-file=training/benchmark/experiments.txt \
     --nproc=8 --nsys
+
+# Dry run to see all commands
+./training/benchmark/run_all_experiments_local.sh \
+    --exp-file=training/benchmark/experiments.txt \
+    --dry-run
 ```
 
 ### SLURM Cluster Submission
@@ -577,15 +564,13 @@ cd /path/to/recsys-examples/examples/hstu
 ```bash
 # Create custom experiment list (in examples/hstu directory)
 cat > quick_test.txt << EOF
-exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
-exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
+exp0_baseline,
+exp4_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
+exp8_full,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
 EOF
 
 # Local run
 ./training/benchmark/run_all_experiments_local.sh --exp-file=quick_test.txt --nproc=8
-
-# Local run + nsys
-./training/benchmark/run_all_experiments_local.sh --exp-file=quick_test.txt --nproc=8 --nsys
 
 # Or submit to SLURM
 ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=quick_test.txt --nsys
@@ -595,53 +580,55 @@ EOF
 
 ## Output File Description
 
-### Log Files
+### Directory Structure
 
-All logs are saved in the `results/` directory, filenames include experiment name:
+All outputs are organized by timestamp and experiment name:
 
 ```
 results/
-├── {exp_name}_{timestamp}.log                    # Local run log
-├── {exp_name}_{jobid}_{timestamp}.log            # SLURM job log
-├── {exp_name}_{jobid}.out                        # SLURM stdout/stderr
-└── submission_{timestamp}.log                    # Submission record
+└── {batch_timestamp}/           # Timestamp of this batch run
+    ├── exp0_baseline/           # First experiment
+    │   ├── exp0_baseline_{timestamp}.log     # Training log
+    │   ├── exp0_baseline_{timestamp}.gin     # Generated config
+    │   └── exp0_baseline_*.nsys-rep          # nsys profiles (if enabled)
+    ├── exp1_cutlass/            # Second experiment
+    │   ├── ...
+    └── summary.txt              # Batch experiment summary
 ```
+
+### Log Files
+
+- `{exp_name}_{timestamp}.log` - Training log (local run)
+- `{exp_name}_{jobid}_{timestamp}.log` - Training log (SLURM)
+- `{job_name}_{jobid}.out` - SLURM stdout/stderr
+
+### Generated Config Files
+
+- `{exp_name}_{timestamp}.gin` - Generated gin config file
 
 ### nsys Profile Files
 
-When nsys is enabled, profile files are saved in `results/nsys_profiles/`:
-
 **Local run format:**
 ```
-results/nsys_profiles/
-└── {exp_name}_{timestamp}_rank{R}_{hostname}.nsys-rep
+{exp_name}_{timestamp}_{hostname}.nsys-rep
 ```
 
 **SLURM run format:**
 ```
-results/nsys_profiles/
-└── {exp_name}_{timestamp}_job{jobid}_node{N}_rank{R}_{hostname}.nsys-rep
+{exp_name}_{timestamp}_job{jobid}_node{N}_rank{R}_{hostname}.nsys-rep
 ```
-
-Filename format description:
-- `exp_name`: Experiment name
-- `timestamp`: Timestamp (YYYYMMDD_HHMMSS)
-- `jobid`: SLURM job ID (SLURM only)
-- `N`: Node number (0, 1, ...) (SLURM only)
-- `R`: Rank number (local rank for local, global rank for SLURM)
-- `hostname`: Hostname
 
 ### Analyzing nsys Files
 
 ```bash
 # Command line statistics
-nsys stats results/nsys_profiles/exp0_baseline_*.nsys-rep
+nsys stats results/{batch_timestamp}/{exp_name}/*.nsys-rep
 
 # GUI analysis
-nsys-ui results/nsys_profiles/exp0_baseline_*.nsys-rep
+nsys-ui results/{batch_timestamp}/{exp_name}/*.nsys-rep
 
 # Export to JSON
-nsys export -o output.json results/nsys_profiles/exp0_baseline_*.nsys-rep
+nsys export -o output.json results/{batch_timestamp}/{exp_name}/*.nsys-rep
 ```
 
 ---
@@ -673,35 +660,41 @@ sacct -u $USER --starttime=today
 
 ### Common Issues
 
-1. **Experiment list file not found**
+1. **Missing experiment list file**
+   ```
+   ⚠️  Missing experiment list file (--exp-file=<file>)
+   ```
+   Solution: Provide `--exp-file` parameter or check path
+
+2. **Experiment list file not found**
    ```
    ❌ Error: Experiment list file not found
    ```
    Solution: Check if `--exp-file` path is correct
 
-2. **Configuration file not found**
-   ```
-   ❌ Error: Config file not found
-   ```
-   Solution: Check configuration file paths in experiments.txt
-
 3. **Insufficient GPUs**
    Solution: Reduce `--nproc` or `--ranks-per-node` parameter
 
 4. **Out of Memory (OOM)**
-   Solution: Reduce batch size or enable recompute configuration
+   Solution: Reduce batch size or enable recompute (`--recompute_layernorm`)
 
 5. **nsys profile file empty or sampling range is 0**
    Solution: Ensure training code correctly uses `torch.cuda.cudart().cudaProfilerStart()` and `cudaProfilerStop()`
 
-6. **nsys permission issue**
-   Solution: Ensure permission to execute `nsys` command, may need root privileges or configure perf_event_paranoid
+6. **Caching enabled but ratio is 0**
+   ```
+   Warning: caching enabled but ratio=0, auto-setting ratio to 0.1 (10%)
+   ```
+   This is expected behavior - the script automatically sets ratio to 0.1 when caching is enabled.
 
 ---
 
 ## Version Information
 
-- **Document Version**: v1.2
+- **Document Version**: v2.0
 - **Last Updated**: 2026-02-05
 - **Applicable Script Version**: All benchmark scripts
-- **Updates**: Updated gin config paths to `training/benchmark/gin_configs/`
+- **Major Changes**: 
+  - Removed static gin config files, now uses `generate_gin_config.py` to generate configs dynamically
+  - `experiments.txt` format changed from `exp_name,config_path` to `exp_name,gin_options`
+  - `run_single_experiment_local.sh` now accepts optimization switches directly instead of `--config`
