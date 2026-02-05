@@ -87,7 +87,7 @@ show_help() {
 }
 
 # ============================================================================
-# Parse Command Line Arguments
+# Parse Command Line Arguments (support both --arg value and --arg=value)
 # ============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -95,13 +95,25 @@ while [[ $# -gt 0 ]]; do
             EXP_FILE="${1#*=}"
             shift
             ;;
+        --exp-file)
+            EXP_FILE="$2"
+            shift 2
+            ;;
         --hstu-root=*)
             CUSTOM_HSTU_ROOT="${1#*=}"
             shift
             ;;
+        --hstu-root)
+            CUSTOM_HSTU_ROOT="$2"
+            shift 2
+            ;;
         --results-dir=*)
             CUSTOM_RESULTS_DIR="${1#*=}"
             shift
+            ;;
+        --results-dir)
+            CUSTOM_RESULTS_DIR="$2"
+            shift 2
             ;;
         --nsys)
             ENABLE_NSYS=1
@@ -115,29 +127,57 @@ while [[ $# -gt 0 ]]; do
             PARTITION="${1#*=}"
             shift
             ;;
+        --partition)
+            PARTITION="$2"
+            shift 2
+            ;;
         --account=*|-A=*)
             ACCOUNT="${1#*=}"
             shift
+            ;;
+        --account|-A)
+            ACCOUNT="$2"
+            shift 2
             ;;
         --job-name=*|-J=*)
             JOB_PREFIX="${1#*=}"
             shift
             ;;
+        --job-name|-J)
+            JOB_PREFIX="$2"
+            shift 2
+            ;;
         --container-image=*)
             CONTAINER_IMAGE="${1#*=}"
             shift
+            ;;
+        --container-image)
+            CONTAINER_IMAGE="$2"
+            shift 2
             ;;
         --nodes=*)
             NODES="${1#*=}"
             shift
             ;;
+        --nodes)
+            NODES="$2"
+            shift 2
+            ;;
         --ranks-per-node=*)
             RANKS_PER_NODE="${1#*=}"
             shift
             ;;
+        --ranks-per-node)
+            RANKS_PER_NODE="$2"
+            shift 2
+            ;;
         --time=*)
             TIME_LIMIT="${1#*=}"
             shift
+            ;;
+        --time)
+            TIME_LIMIT="$2"
+            shift 2
             ;;
         --dry-run)
             DRY_RUN=1

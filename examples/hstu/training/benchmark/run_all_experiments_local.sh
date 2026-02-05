@@ -57,24 +57,40 @@ DRY_RUN=0
 CUSTOM_HSTU_ROOT=""
 CUSTOM_RESULTS_DIR=""
 
-# Parse command line arguments
+# Parse command line arguments (support both --arg value and --arg=value)
 while [[ $# -gt 0 ]]; do
     case $1 in
         --exp-file=*)
             EXP_FILE="${1#*=}"
             shift
             ;;
+        --exp-file)
+            EXP_FILE="$2"
+            shift 2
+            ;;
         --hstu-root=*)
             CUSTOM_HSTU_ROOT="${1#*=}"
             shift
+            ;;
+        --hstu-root)
+            CUSTOM_HSTU_ROOT="$2"
+            shift 2
             ;;
         --results-dir=*)
             CUSTOM_RESULTS_DIR="${1#*=}"
             shift
             ;;
+        --results-dir)
+            CUSTOM_RESULTS_DIR="$2"
+            shift 2
+            ;;
         --nproc=*)
             NPROC="${1#*=}"
             shift
+            ;;
+        --nproc)
+            NPROC="$2"
+            shift 2
             ;;
         --nsys)
             ENABLE_NSYS=1

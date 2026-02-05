@@ -66,7 +66,11 @@ TP_SIZE=1
 EXP_NAME=""
 while [[ $# -gt 0 ]]; do
     case $1 in
-        # Optimization switches
+        # Optimization switches (support both --arg value and --arg=value)
+        --kernel_backend=*)
+            KERNEL_BACKEND="${1#*=}"
+            shift
+            ;;
         --kernel_backend)
             KERNEL_BACKEND="$2"
             shift 2
@@ -83,30 +87,54 @@ while [[ $# -gt 0 ]]; do
             CACHING=1
             shift
             ;;
+        --ratio=*)
+            RATIO="${1#*=}"
+            shift
+            ;;
         --ratio)
             RATIO="$2"
             shift 2
+            ;;
+        --evict=*)
+            EVICT="${1#*=}"
+            shift
             ;;
         --evict)
             EVICT="$2"
             shift 2
             ;;
+        --pipeline_type=*)
+            PIPELINE_TYPE="${1#*=}"
+            shift
+            ;;
         --pipeline_type)
             PIPELINE_TYPE="$2"
             shift 2
+            ;;
+        --tp_size=*)
+            TP_SIZE="${1#*=}"
+            shift
             ;;
         --tp_size)
             TP_SIZE="$2"
             shift 2
             ;;
-        # Other options
+        # Other options (support both --arg value and --arg=value)
         --hstu-root=*)
             CUSTOM_HSTU_ROOT="${1#*=}"
             shift
             ;;
+        --hstu-root)
+            CUSTOM_HSTU_ROOT="$2"
+            shift 2
+            ;;
         --nproc=*)
             NPROC="${1#*=}"
             shift
+            ;;
+        --nproc)
+            NPROC="$2"
+            shift 2
             ;;
         --nsys)
             ENABLE_NSYS=1
@@ -115,6 +143,10 @@ while [[ $# -gt 0 ]]; do
         --output-dir=*)
             CUSTOM_OUTPUT_DIR="${1#*=}"
             shift
+            ;;
+        --output-dir)
+            CUSTOM_OUTPUT_DIR="$2"
+            shift 2
             ;;
         --dry-run)
             DRY_RUN=1
@@ -142,22 +174,22 @@ if [ -z "$EXP_NAME" ]; then
     echo "❌ Error: Missing experiment name"
     echo "Usage: $0 <exp_name> [optimization switches] [options]"
     echo ""
-    echo "Optimization Switches:"
-    echo "  --kernel_backend [triton|cutlass]   (default: triton)"
-    echo "  --recompute_layernorm               (default: False)"
-    echo "  --balanced_shuffler                 (default: False)"
-    echo "  --caching                           (default: False)"
-    echo "  --ratio FLOAT                       (default: 0)"
-    echo "  --evict [lru|lfu]                   (default: lru)"
-    echo "  --pipeline_type [none|prefetch]     (default: none)"
-    echo "  --tp_size INT                       (default: 1)"
+    echo "Optimization Switches (support --arg VALUE or --arg=VALUE):"
+    echo "  --kernel_backend VALUE   triton|cutlass (default: triton)"
+    echo "  --recompute_layernorm    Enable LayerNorm recomputation (default: off)"
+    echo "  --balanced_shuffler      Enable workload balancer (default: off)"
+    echo "  --caching                Enable DynamicEmb caching (default: off)"
+    echo "  --ratio VALUE            GPU cache ratio 0.0-1.0 (default: 0)"
+    echo "  --evict VALUE            lru|lfu (default: lru)"
+    echo "  --pipeline_type VALUE    none|prefetch (default: none)"
+    echo "  --tp_size VALUE          Tensor Parallel degree (default: 1)"
     echo ""
-    echo "Other Options:"
-    echo "  --hstu-root=PATH  Specify examples/hstu directory path"
-    echo "  --nproc=N         Number of processes/GPUs (default: 8)"
-    echo "  --nsys            Enable nsys profile sampling"
-    echo "  --output-dir=PATH Output directory"
-    echo "  --dry-run         Print commands only"
+    echo "Other Options (support --arg VALUE or --arg=VALUE):"
+    echo "  --hstu-root PATH    Specify examples/hstu directory path"
+    echo "  --nproc N           Number of processes/GPUs (default: 8)"
+    echo "  --nsys              Enable nsys profile sampling"
+    echo "  --output-dir PATH   Output directory"
+    echo "  --dry-run           Print commands only"
     exit 1
 fi
 
@@ -315,14 +347,14 @@ if [ ${DRY_RUN} -eq 1 ]; then
         echo "        --nproc_per_node=${NPROC} \\"
         echo "        training/pretrain_gr_ranking.py \\"
         echo "        --gin-config-file ${CONFIG_FILE} \\"
-        echo "    2>&1 | tee ${LOG_FILE}"
+        echo "    2>&1 | tee -a ${LOG_FILE}"
     else
         echo "torchrun \\"
         echo "    --standalone \\"
         echo "    --nproc_per_node=${NPROC} \\"
         echo "    training/pretrain_gr_ranking.py \\"
         echo "    --gin-config-file ${CONFIG_FILE} \\"
-        echo "    2>&1 | tee ${LOG_FILE}"
+        echo "    2>&1 | tee -a ${LOG_FILE}"
     fi
     
     echo ""
@@ -376,7 +408,7 @@ if [ ${ENABLE_NSYS} -eq 1 ]; then
             --nproc_per_node=${NPROC} \
             training/pretrain_gr_ranking.py \
             --gin-config-file ${CONFIG_FILE} \
-        2>&1 | tee ${LOG_FILE}
+        2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
     
@@ -392,7 +424,7 @@ else
         --nproc_per_node=${NPROC} \
         training/pretrain_gr_ranking.py \
         --gin-config-file ${CONFIG_FILE} \
-        2>&1 | tee ${LOG_FILE}
+        2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
 fi
