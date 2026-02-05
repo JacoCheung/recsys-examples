@@ -36,3 +36,5 @@ pcie_lookup_poc/*
 **/results/*
 *.nsys-rep
 *.log
+*-zh*.md
+*.pdf

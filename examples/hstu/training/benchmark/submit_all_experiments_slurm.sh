@@ -9,7 +9,7 @@
 #   HSTU_ROOT            Path to examples/hstu directory (optional, defaults to pwd)
 # 
 # Options:
-#   --exp-file=FILE      Experiment list file (required, format: exp_name,config_path)
+#   --exp-file=FILE      Experiment list file (required, format: exp_name,gin_options)
 #   --hstu-root=PATH     Specify examples/hstu directory path (overrides env var and pwd)
 #   --results-dir=PATH   Output directory (default: training/benchmark/results)
 #   --nsys               Enable nsys profile sampling
@@ -21,15 +21,24 @@
 #   --nodes=N            Number of nodes (default: 2)
 #   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
 #   --time=HH:MM:SS      Job time limit (default: 04:00:00)
+#   -y, --yes            Skip confirmation prompt
 #   --dry-run            Print sbatch commands only, do not submit
 #   --help               Show help information
+# 
+# Experiment List File Format:
+#   # Comment lines start with #
+#   exp_name,generate_gin_config_options
+#   exp0_baseline,
+#   exp1_cutlass,--kernel_backend cutlass
+#   exp4_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
 # 
 # Output Directory Structure:
 #   {results_dir}/
 #   └── {batch_timestamp}/           # Timestamp of this batch submission
 #       ├── exp0_baseline/           # First experiment
 #       │   ├── exp0_baseline_*.log
-#       │   ├── {job_name}_*.out         # SLURM stdout/stderr
+#       │   ├── exp0_baseline_*.gin  # Generated config
+#       │   ├── {job_name}_*.out     # SLURM stdout/stderr
 #       │   └── exp0_baseline_*.nsys-rep  (if nsys enabled)
 #       ├── exp1_cutlass/            # Second experiment
 #       │   ├── ...
@@ -66,6 +75,7 @@ NODES=2
 RANKS_PER_NODE=8
 TIME_LIMIT="04:00:00"
 DRY_RUN=0
+YES_FLAG=0
 EXP_FILE=""
 CUSTOM_RESULTS_DIR=""
 CUSTOM_HSTU_ROOT=""
@@ -74,12 +84,12 @@ CUSTOM_HSTU_ROOT=""
 # Help Information
 # ============================================================================
 show_help() {
-    head -52 "$0" | tail -51
+    head -59 "$0" | tail -58
     exit 0
 }
 
 # ============================================================================
-# Parse Command Line Arguments
+# Parse Command Line Arguments (support both --arg value and --arg=value)
 # ============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -87,13 +97,25 @@ while [[ $# -gt 0 ]]; do
             EXP_FILE="${1#*=}"
             shift
             ;;
+        --exp-file)
+            EXP_FILE="$2"
+            shift 2
+            ;;
         --hstu-root=*)
             CUSTOM_HSTU_ROOT="${1#*=}"
             shift
             ;;
+        --hstu-root)
+            CUSTOM_HSTU_ROOT="$2"
+            shift 2
+            ;;
         --results-dir=*)
             CUSTOM_RESULTS_DIR="${1#*=}"
             shift
+            ;;
+        --results-dir)
+            CUSTOM_RESULTS_DIR="$2"
+            shift 2
             ;;
         --nsys)
             ENABLE_NSYS=1
@@ -107,32 +129,64 @@ while [[ $# -gt 0 ]]; do
             PARTITION="${1#*=}"
             shift
             ;;
+        --partition)
+            PARTITION="$2"
+            shift 2
+            ;;
         --account=*|-A=*)
             ACCOUNT="${1#*=}"
             shift
+            ;;
+        --account|-A)
+            ACCOUNT="$2"
+            shift 2
             ;;
         --job-name=*|-J=*)
             JOB_PREFIX="${1#*=}"
             shift
             ;;
+        --job-name|-J)
+            JOB_PREFIX="$2"
+            shift 2
+            ;;
         --container-image=*)
             CONTAINER_IMAGE="${1#*=}"
             shift
+            ;;
+        --container-image)
+            CONTAINER_IMAGE="$2"
+            shift 2
             ;;
         --nodes=*)
             NODES="${1#*=}"
             shift
             ;;
+        --nodes)
+            NODES="$2"
+            shift 2
+            ;;
         --ranks-per-node=*)
             RANKS_PER_NODE="${1#*=}"
             shift
+            ;;
+        --ranks-per-node)
+            RANKS_PER_NODE="$2"
+            shift 2
             ;;
         --time=*)
             TIME_LIMIT="${1#*=}"
             shift
             ;;
+        --time)
+            TIME_LIMIT="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=1
+            shift
+            ;;
+        -y|--yes)
+            YES_FLAG=1
             shift
             ;;
         --help|-h)
@@ -201,18 +255,17 @@ BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 # ============================================================================
 # Check Experiment List File
 # ============================================================================
-# In dry-run mode, --exp-file is optional (will show command template)
+# If --exp-file is not provided, show help
 if [ -z "$EXP_FILE" ]; then
-    if [ ${DRY_RUN} -eq 0 ]; then
-        echo "❌ Error: Missing experiment list file (--exp-file=<file>)"
-        echo "Use --help for usage information"
-        exit 1
-    fi
+    echo "⚠️  Missing experiment list file (--exp-file=<file>)"
+    echo ""
+    head -61 "$0" | tail -59
+    exit 0
 fi
 
 # Read experiment list if provided
 declare -a EXP_NAMES
-declare -a CONFIG_FILES
+declare -a GIN_OPTIONS
 
 if [ -n "$EXP_FILE" ]; then
     # If relative path, make it relative to examples/hstu
@@ -232,14 +285,14 @@ if [ -n "$EXP_FILE" ]; then
     fi
 
     # Read experiment list (skip comments and empty lines)
-    while IFS=',' read -r exp_name config_path || [ -n "$exp_name" ]; do
+    while IFS=',' read -r exp_name gin_opts || [ -n "$exp_name" ]; do
         # Skip empty lines and comments
         [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
         # Trim leading/trailing whitespace
         exp_name=$(echo "$exp_name" | xargs)
-        config_path=$(echo "$config_path" | xargs)
+        gin_opts=$(echo "$gin_opts" | xargs)
         EXP_NAMES+=("$exp_name")
-        CONFIG_FILES+=("$config_path")
+        GIN_OPTIONS+=("$gin_opts")
     done < "$EXP_FILE"
 
     if [ ${#EXP_NAMES[@]} -eq 0 ]; then
@@ -291,31 +344,6 @@ if [ ${DRY_RUN} -eq 1 ]; then
     echo ""
 fi
 
-# If no experiment file provided (dry-run only), show command template and exit
-if [ -z "$EXP_FILE" ]; then
-    echo -e "${YELLOW}No experiment file provided. Showing sbatch command template:${NC}"
-    echo ""
-    echo "sbatch \\"
-    echo "    --job-name=hstu_<EXP_NAME> \\"
-    echo "    --output=<OUTPUT_DIR>/hstu_<EXP_NAME>_%j.out \\"
-    echo "    --partition=${PARTITION} \\"
-    [ -n "$ACCOUNT" ] && echo "    --account=${ACCOUNT} \\"
-    [ -n "$JOB_PREFIX" ] && echo "    # (job-prefix applied to job-name) \\"
-    echo "    --nodes=${NODES} \\"
-    echo "    --ntasks-per-node=${RANKS_PER_NODE} \\"
-    echo "    --cpus-per-task=8 \\"
-    echo "    --mem=0 \\"
-    echo "    --time=${TIME_LIMIT} \\"
-    echo "    --exclusive \\"
-    echo "    --network=sharp \\"
-    echo "    --export=HSTU_ROOT=<HSTU_ROOT>,EXP_NAME=<EXP_NAME>,CONFIG_FILE=<CONFIG_FILE>,EXP_OUTPUT_DIR=<OUTPUT_DIR>,ENABLE_NSYS=${ENABLE_NSYS},CONTAINER_IMAGE=${CONTAINER_IMAGE} \\"
-    echo "    ${SCRIPT_DIR}/slurm_job.sub"
-    echo ""
-    echo "Container image: ${CONTAINER_IMAGE}"
-    echo ""
-    exit 0
-fi
-
 echo -e "${BLUE}Batch timestamp:   ${BATCH_TIMESTAMP}${NC}"
 echo -e "${BLUE}Output directory:  ${BATCH_OUTPUT_DIR}${NC}"
 echo ""
@@ -323,7 +351,7 @@ echo -e "${BLUE}Experiment file: ${EXP_FILE}${NC}"
 echo ""
 echo -e "${BLUE}Experiments to run (${#EXP_NAMES[@]} total):${NC}"
 for i in "${!EXP_NAMES[@]}"; do
-    echo "  - ${EXP_NAMES[$i]}: ${CONFIG_FILES[$i]}"
+    echo "  - ${EXP_NAMES[$i]}: ${GIN_OPTIONS[$i]:-'(defaults)'}"
 done
 echo ""
 
@@ -331,13 +359,16 @@ echo ""
 # Confirm Submission
 # ============================================================================
 if [ ${DRY_RUN} -eq 0 ]; then
-    echo -e "${YELLOW}Do you want to submit these jobs? (y/n)${NC}"
-    read -r response
-    if [[ ! "$response" =~ ^[Yy]$ ]]; then
-        echo "Cancelled."
-        exit 0
+    # Skip confirmation if -y/--yes flag is set
+    if [ ${YES_FLAG} -eq 0 ]; then
+        echo -e "${YELLOW}Do you want to submit these jobs? (y/n)${NC}"
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        echo ""
     fi
-    echo ""
     
     # Create batch output directory
     mkdir -p ${BATCH_OUTPUT_DIR}
@@ -354,7 +385,7 @@ echo ""
 
 for i in "${!EXP_NAMES[@]}"; do
     exp="${EXP_NAMES[$i]}"
-    config="${CONFIG_FILES[$i]}"
+    gin_opts="${GIN_OPTIONS[$i]}"
     exp_num=$((i + 1))
     
     # Output directory for each experiment
@@ -364,7 +395,7 @@ for i in "${!EXP_NAMES[@]}"; do
         mkdir -p ${EXP_OUTPUT_DIR}
     fi
     
-    # Build sbatch command
+    # Build sbatch command using array (to properly handle arguments with spaces)
     # Determine job name (with optional prefix)
     if [ -n "$JOB_PREFIX" ]; then
         FULL_JOB_NAME="${JOB_PREFIX}-hstu.${exp}"
@@ -372,45 +403,46 @@ for i in "${!EXP_NAMES[@]}"; do
         FULL_JOB_NAME="hstu_${exp}"
     fi
     
-    SBATCH_CMD="sbatch"
-    SBATCH_CMD+=" --job-name=${FULL_JOB_NAME}"
-    SBATCH_CMD+=" --output=${EXP_OUTPUT_DIR}/${FULL_JOB_NAME}_%j.out"
-    SBATCH_CMD+=" --partition=${PARTITION}"
+    # Use array to build sbatch arguments (preserves spaces in values)
+    SBATCH_ARGS=()
+    SBATCH_ARGS+=(--job-name="${FULL_JOB_NAME}")
+    SBATCH_ARGS+=(--output="${EXP_OUTPUT_DIR}/${FULL_JOB_NAME}_%j.out")
+    SBATCH_ARGS+=(--partition="${PARTITION}")
     
     # Add account if specified
     if [ -n "$ACCOUNT" ]; then
-        SBATCH_CMD+=" --account=${ACCOUNT}"
+        SBATCH_ARGS+=(--account="${ACCOUNT}")
     fi
     
-    SBATCH_CMD+=" --nodes=${NODES}"
-    SBATCH_CMD+=" --ntasks-per-node=${RANKS_PER_NODE}"
-    SBATCH_CMD+=" --cpus-per-task=8"
-    SBATCH_CMD+=" --mem=0"
-    SBATCH_CMD+=" --time=${TIME_LIMIT}"
-    SBATCH_CMD+=" --exclusive"
-    SBATCH_CMD+=" --network=sharp"
+    SBATCH_ARGS+=(--nodes="${NODES}")
+    SBATCH_ARGS+=(--ntasks-per-node="${RANKS_PER_NODE}")
+    SBATCH_ARGS+=(--cpus-per-task=8)
+    SBATCH_ARGS+=(--mem=0)
+    SBATCH_ARGS+=(--time="${TIME_LIMIT}")
+    SBATCH_ARGS+=(--exclusive)
+    SBATCH_ARGS+=(--network=sharp)
     
     # Sequential execution mode: add dependency
     if [ ${SEQUENTIAL} -eq 1 ] && [ -n "$PREV_JOB_ID" ]; then
-        SBATCH_CMD+=" --dependency=afterany:${PREV_JOB_ID}"
+        SBATCH_ARGS+=(--dependency="afterany:${PREV_JOB_ID}")
     fi
     
-    # Export environment variables (including exp_name, config_file, output_dir, HSTU_ROOT and CONTAINER_IMAGE)
-    SBATCH_CMD+=" --export=ALL,EXP_NAME=${exp},CONFIG_FILE=${config},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
+    # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
+    SBATCH_ARGS+=(--export="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}")
     
     # Specify SLURM job script
-    SBATCH_CMD+=" ${SCRIPT_DIR}/slurm_job.sub"
+    SBATCH_ARGS+=("${SCRIPT_DIR}/slurm_job.sub")
     
     echo -e "[${exp_num}/${#EXP_NAMES[@]}] ${YELLOW}${exp}${NC}"
-    echo "  Config:     ${config}"
+    echo "  Options:    ${gin_opts:-'(defaults)'}"
     echo "  Output dir: ${EXP_OUTPUT_DIR}"
     
     if [ ${DRY_RUN} -eq 1 ]; then
-        echo "  Command: ${SBATCH_CMD}"
+        echo "  Command: sbatch ${SBATCH_ARGS[*]}"
         echo ""
     else
-        # Submit job and get job ID
-        JOB_OUTPUT=$(${SBATCH_CMD})
+        # Submit job and get job ID (using array expansion to preserve spaces)
+        JOB_OUTPUT=$(sbatch "${SBATCH_ARGS[@]}")
         JOB_ID=$(echo ${JOB_OUTPUT} | grep -oP '\d+$')
         
         if [ -n "$JOB_ID" ]; then
@@ -497,6 +529,7 @@ else
         fi
         echo "  ├── ${exp}/"
         echo "  │   ├── ${exp}_*.log"
+        echo "  │   ├── ${exp}_*.gin"
         if [ ${ENABLE_NSYS} -eq 1 ]; then
             echo "  │   ├── ${JOB_NAME_PATTERN}_*.out"
             echo "  │   └── ${exp}_*.nsys-rep"

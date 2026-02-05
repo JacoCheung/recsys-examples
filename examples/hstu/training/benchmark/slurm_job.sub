@@ -8,6 +8,7 @@
 # Output Directory Structure (new version):
 #   {EXP_OUTPUT_DIR}/
 #   ├── {exp_name}_{jobid}_{timestamp}.log
+#   ├── {exp_name}_{jobid}_{timestamp}.gin    (generated config)
 #   └── {exp_name}_*_job{jobid}_*.nsys-rep  (if nsys enabled)
 # ============================================================================
 
@@ -31,7 +32,7 @@ CONTAINER_MOUNTS="/lustre:/lustre"
 # Parameter Description:
 #   HSTU_ROOT       - Absolute path to examples/hstu directory (required)
 #   EXP_NAME        - Experiment name (required)
-#   CONFIG_FILE     - Config file path (relative to examples/hstu)
+#   GIN_OPTIONS     - Options for generate_gin_config.py (optional)
 #   EXP_OUTPUT_DIR  - Experiment output directory (required, passed by submit script)
 #   ENABLE_NSYS     - Whether to enable nsys profile (0/1, default 0)
 #   CONTAINER_IMAGE - Container image to use (optional, has default)
@@ -42,7 +43,7 @@ set -e
 # Get parameters
 HSTU_ROOT=${HSTU_ROOT:-""}
 EXP_NAME=${EXP_NAME:-"exp0_baseline"}
-CONFIG_FILE=${CONFIG_FILE:-""}
+GIN_OPTIONS=${GIN_OPTIONS:-""}
 EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR:-""}
 ENABLE_NSYS=${ENABLE_NSYS:-0}
 
@@ -64,21 +65,14 @@ cd ${HSTU_ROOT}
 # Create output directory
 mkdir -p ${EXP_OUTPUT_DIR}
 
-# If config file is a relative path, make it relative to examples/hstu
-if [ -n "$CONFIG_FILE" ] && [[ ! "$CONFIG_FILE" = /* ]]; then
-    CONFIG_FILE="${HSTU_ROOT}/${CONFIG_FILE}"
-fi
+# Path to generate_gin_config.py
+GIN_GENERATOR="${HSTU_ROOT}/training/benchmark/generate_gin_config.py"
 
-# Check config file
-if [ -z "$CONFIG_FILE" ]; then
-    echo "❌ Error: CONFIG_FILE environment variable not set"
-    exit 1
-fi
+# Generate timestamp for this job
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "❌ Error: Config file not found: $CONFIG_FILE"
-    exit 1
-fi
+# Generated config file path
+CONFIG_FILE="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}.gin"
 
 # ============================================================================
 # SLURM Environment Information
@@ -87,7 +81,7 @@ echo "=========================================="
 echo "🚀 HSTU Benchmark - SLURM Job"
 echo "=========================================="
 echo "Experiment:       ${EXP_NAME}"
-echo "Config file:      ${CONFIG_FILE}"
+echo "GIN Options:      ${GIN_OPTIONS:-'(defaults)'}"
 echo "Output dir:       ${EXP_OUTPUT_DIR}"
 echo "SLURM Job ID:     ${SLURM_JOB_ID}"
 echo "SLURM Job Name:   ${SLURM_JOB_NAME}"
@@ -102,9 +96,32 @@ echo "=========================================="
 echo ""
 
 # ============================================================================
+# Generate gin config file
+# ============================================================================
+echo "📝 Generating gin config file..."
+
+# Build gin config command (avoid passing empty string when GIN_OPTIONS is empty)
+if [ -n "${GIN_OPTIONS}" ]; then
+    GIN_CMD="python ${GIN_GENERATOR} ${GIN_OPTIONS}"
+else
+    GIN_CMD="python ${GIN_GENERATOR}"
+fi
+
+echo "   Command: ${GIN_CMD} -o ${CONFIG_FILE}"
+echo ""
+
+# Generate config and also print to terminal
+${GIN_CMD} | tee ${CONFIG_FILE}
+echo ""
+echo "✅ Config saved to: ${CONFIG_FILE}"
+echo ""
+
+# ============================================================================
 # Environment Variable Setup (add HSTU_ROOT's parent directory to PYTHONPATH)
 # ============================================================================
 export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
+export PYTHONWARNINGS="ignore"
+export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 
@@ -128,7 +145,6 @@ echo ""
 TRAIN_CMD="training/pretrain_gr_ranking.py --gin-config-file ${CONFIG_FILE}"
 
 # Log file (saved in experiment output directory)
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}.log"
 
 echo "📝 Logging to: ${LOG_FILE}"
@@ -175,8 +191,10 @@ NSYS_OUTPUT="${NSYS_OUTPUT_DIR}/${EXP_NAME}_${NSYS_TIMESTAMP}_job${SLURM_JOB_ID}
 
 echo "[Rank ${GLOBAL_RANK}] Starting nsys profile, output: ${NSYS_OUTPUT}.nsys-rep"
 
-# Set CUDA visible devices (if needed)
-export CUDA_VISIBLE_DEVICES=${LOCAL_RANK}
+# Note: Do NOT set CUDA_VISIBLE_DEVICES here, as the training script
+# handles device assignment based on LOCAL_RANK. Setting it here would
+# cause device index mismatch (e.g., CUDA_VISIBLE_DEVICES=3 makes GPU 3
+# appear as device 0, but training code tries to use device 3).
 
 # Run nsys profile
 exec nsys profile \
@@ -195,14 +213,17 @@ WRAPPER_EOF
     
     # Use srun to launch distributed training + nsys profile (in container)
     srun --kill-on-bad-exit=1 \
+        --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
         bash -c "
+            nvidia-smi && \
             cd ${HSTU_ROOT} && \
             export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
+            export PYTHONUNBUFFERED=1 && \
             ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
-            python ${TRAIN_CMD}
-        " 2>&1 | tee ${LOG_FILE}
+            python -u ${TRAIN_CMD}
+        " 2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
     
@@ -221,10 +242,11 @@ else
     echo ""
     
     srun --kill-on-bad-exit=1 \
+        --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && python ${TRAIN_CMD}" \
-        2>&1 | tee ${LOG_FILE}
+        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && python -u ${TRAIN_CMD}" \
+        2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
 fi
@@ -241,6 +263,7 @@ else
 fi
 echo "⏰ Finished at: $(date)"
 echo "📝 Log saved to: ${LOG_FILE}"
+echo "📄 Config file: ${CONFIG_FILE}"
 if [ ${ENABLE_NSYS} -eq 1 ]; then
     echo "📊 nsys profiles: ${EXP_OUTPUT_DIR}/${EXP_NAME}_*_job${SLURM_JOB_ID}_*.nsys-rep"
 fi
