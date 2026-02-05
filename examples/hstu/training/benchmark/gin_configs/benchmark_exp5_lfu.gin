@@ -14,12 +14,13 @@
 # ===== Trainer Configuration =====
 TrainerArgs.train_batch_size = 32
 TrainerArgs.eval_batch_size = 32
-TrainerArgs.log_interval = 10
+TrainerArgs.log_interval = 100
 TrainerArgs.eval_interval = 400
 TrainerArgs.max_train_iters = 1000
 TrainerArgs.max_eval_iters = 50
 TrainerArgs.seed = 1234
 TrainerArgs.pipeline_type = 'none'
+TrainerArgs.enable_balanced_shuffler = True  # 🔥 Enable workload balancer
 
 # Profiling
 TrainerArgs.profile = True
@@ -58,10 +59,10 @@ BenchmarkDatasetArgs.max_num_candidates = 0
 # 🔥 Using DynamicEmb + LFU eviction strategy
 item_embedding/DynamicEmbeddingArgs.feature_names = ['item']
 item_embedding/DynamicEmbeddingArgs.table_name = 'item'
-item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000  # 50K
-item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
 item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lfu'  # 🔥 LFU (Least Frequently Used)
-item_embedding/DynamicEmbeddingArgs.caching = False
+item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1
+item_embedding/DynamicEmbeddingArgs.caching = True
 
 action_embedding/EmbeddingArgs.feature_names = ['action']
 action_embedding/EmbeddingArgs.table_name = 'action'
@@ -71,23 +72,24 @@ action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
 user_id_emb/DynamicEmbeddingArgs.feature_names = ['user_id']
 user_id_emb/DynamicEmbeddingArgs.table_name = 'user_id'
 user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 10000  # 10K
-user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1  # 🔥 GPU cache 10%
 user_id_emb/DynamicEmbeddingArgs.evict_strategy = 'lfu'
-user_id_emb/DynamicEmbeddingArgs.caching = False
+user_id_emb/DynamicEmbeddingArgs.caching = True  # 🔥 Enable caching for LFU
 
+# Small tables: keep in GPU entirely (no caching needed)
 user_age_emb/DynamicEmbeddingArgs.feature_names = ['user_age']
 user_age_emb/DynamicEmbeddingArgs.table_name = 'user_age'
 user_age_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 100
-user_age_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+user_age_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 1  # 100% in GPU
 user_age_emb/DynamicEmbeddingArgs.evict_strategy = 'lfu'
-user_age_emb/DynamicEmbeddingArgs.caching = False
+user_age_emb/DynamicEmbeddingArgs.caching = False  # Small table, no need for caching
 
 item_cat_l1_emb/DynamicEmbeddingArgs.feature_names = ['item_category_l1']
 item_cat_l1_emb/DynamicEmbeddingArgs.table_name = 'item_category_l1'
 item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50
-item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 1  # 100% in GPU
 item_cat_l1_emb/DynamicEmbeddingArgs.evict_strategy = 'lfu'
-item_cat_l1_emb/DynamicEmbeddingArgs.caching = False
+item_cat_l1_emb/DynamicEmbeddingArgs.caching = False  # Small table, no need for caching
 
 BenchmarkDatasetArgs.embedding_args = [
     @item_embedding/DynamicEmbeddingArgs(),

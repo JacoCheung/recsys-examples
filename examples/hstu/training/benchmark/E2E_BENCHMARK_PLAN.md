@@ -117,21 +117,20 @@ Baseline → +Opt1 → +Opt2 → ... → Full Optimized
 
 ```mermaid
 graph TD
-    A[Start: Prepare Environment] --> B[Exp 0: Baseline<br/>DynamicEmb + Kernel Fusion]
+    A[Start: Prepare Environment] --> B[Exp 0: Baseline<br/>DynamicEmb + Triton Attention]
     B --> C[Exp 1: +CUTLASS Attention]
-    C --> D[Exp 2: CUTLASS Benefit Validation]
-    D --> E[Exp 3: +Selective Recompute]
-    E --> F[Exp 3.5: +Workload Balancer 🔥]
-    F --> G[Exp 4: +DynamicEmb Caching 🔥]
-    G --> H[Exp 5: +LFU Eviction]
-    H --> I[Exp 6: +Pipeline Prefetch]
-    I --> J[Exp 7: +Tensor Parallel]
-    J --> K[Exp 8: +Sequence Parallel]
-    K --> L[Result Summary and Visualization]
+    C --> D[Exp 2: +Selective Recompute]
+    D --> E[Exp 3: +Workload Balancer 🔥]
+    E --> F[Exp 4: +DynamicEmb Caching 🔥]
+    F --> G[Exp 5: +LFU Eviction]
+    G --> H[Exp 6: +Pipeline Prefetch]
+    H --> I[Exp 7: +Tensor Parallel]
+    I --> J[Exp 8: Full Optimization]
+    J --> K[Result Summary and Visualization]
     
     style B fill:#ffcccc
-    style F fill:#ffffcc
-    style K fill:#ccffcc
+    style E fill:#ffffcc
+    style J fill:#ccffcc
 ```
 
 ### 2.3 Hardware and Software Environment
@@ -189,12 +188,13 @@ Establish performance baseline as comparison reference for all subsequent optimi
 **Key Design**:
 - ✅ Use **DynamicEmb** (production environment requirement)
 - ❌ **No caching** (caching as independent optimization point)
+- ❌ **Triton attention** (baseline kernel backend)
 
 #### How?
 ```yaml
 Configuration:
-- HSTU Attention: Triton (PyTorch fallback)
-- Kernel Fusion: Enabled (fuse_norm_mul_dropout is Baseline standard)
+- HSTU Attention: Triton (baseline)
+- Kernel Fusion: Disabled
 - Recompute: Disabled
 - Embedding: DynamicEmb WITHOUT caching  # 🔥 Key
 - Pipeline: None
@@ -204,20 +204,18 @@ Configuration:
 #### Key Configuration
 ```python
 # Baseline configuration
-NetworkArgs.kernel_backend = 'triton'  # or pytorch
-# fuse_norm_mul_dropout enabled by default (Baseline standard)
+NetworkArgs.kernel_backend = 'triton'  # baseline
 NetworkArgs.recompute_input_layernorm = False
 NetworkArgs.recompute_input_silu = False
 
 # 🔥 Use DynamicEmb, but without caching
-item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000
-item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 1.0  # Maximize GPU
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
+item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
 item_embedding/DynamicEmbeddingArgs.caching = False  # No caching
 item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
 
 # No pipeline
 TrainerArgs.pipeline_type = 'none'
-TrainerArgs.enable_balanced_shuffler = False
 
 # No TP/SP
 TensorModelParallelArgs.tensor_model_parallel_size = 1
@@ -251,27 +249,7 @@ NetworkArgs.kernel_backend = 'cutlass'
 
 ---
 
-### Exp 2: CUTLASS + Larger Batch (Validate CUTLASS Benefits)
-
-#### Why?
-Validate CUTLASS attention performance benefits by increasing batch size to leverage CUTLASS's efficient implementation.
-
-**Note**: `fuse_norm_mul_dropout` is **baseline default enabled** feature, not a separate optimization point.
-
-#### How?
-```python
-NetworkArgs.kernel_backend = 'cutlass'
-# fuse_norm_mul_dropout enabled by default (Baseline standard)
-```
-
-#### Expected Results
-- Throughput improvement: **1.15-1.2x** (vs Exp 1)
-- Cumulative improvement: **1.38-1.68x** (vs Exp 0)
-- Forward/backward computation time reduced 10-15% each
-
----
-
-### Exp 3: +Selective Recompute
+### Exp 2: +Selective Recompute
 
 #### Why?
 With long sequence lengths, activations consume significant memory:
@@ -281,7 +259,6 @@ With long sequence lengths, activations consume significant memory:
 #### How?
 ```python
 NetworkArgs.kernel_backend = 'cutlass'
-# fuse_norm_mul_dropout enabled by default
 NetworkArgs.recompute_input_layernorm = True  # Selective recompute
 NetworkArgs.recompute_input_silu = False      # Adjust as needed
 ```
@@ -297,7 +274,7 @@ NetworkArgs.recompute_input_silu = False      # Adjust as needed
 
 ---
 
-### Exp 3.5: +Workload Balancer (🆕 Important Optimization)
+### Exp 3: +Workload Balancer (🔥 Important Optimization)
 
 #### Why?
 In **variable-length sequence** scenarios, computation workload varies greatly between samples:
@@ -366,7 +343,7 @@ GPU 3: 100% | ██████████████████████
 
 #### Why?
 Baseline already uses DynamicEmb, but **without caching**:
-- Exp 0-3.5: DynamicEmb without caching (GPU-only or CPU-only)
+- Exp 0-3: DynamicEmb without caching (GPU-only or CPU-only)
 - Problem: Either limited by GPU memory or slow CPU access
 
 **DynamicEmb Caching Advantages**:
@@ -379,12 +356,12 @@ This is **critical for production environments**!
 #### How?
 ```python
 # Enable DynamicEmb Caching (vs Baseline's caching=False)
-item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
 item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1  # 10% in GPU cache
 item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
 item_embedding/DynamicEmbeddingArgs.caching = True  # 🔥 Enable caching!
 
-# Keep other configs same as Exp 3.5
+# Keep other configs same as Exp 3
 TrainerArgs.enable_balanced_shuffler = True  # Keep workload balancer
 ```
 
@@ -515,27 +492,54 @@ TensorModelParallelArgs.tensor_model_parallel_size = 2  # SP available with TP=2
 
 ---
 
-### Experiment Summary Table
+### Experiment Configuration Comparison Table
 
-| Exp | Configuration | Relative Throughput | Cumulative Speedup | GPU Memory | Key Optimization |
-|-----|--------------|--------------------|--------------------|-----------|------------------|
-| 0 | Baseline (DynamicEmb no cache + Kernel Fusion) | 1.0x | 1.0x | 100% | Baseline (built-in Kernel Fusion) |
-| 1 | +CUTLASS | 1.3x | 1.3x | 100% | Attention optimization |
-| 2 | CUTLASS benefit validation | 1.2x | 1.56x | 100% | Confirm CUTLASS effect |
-| 3 | +Recompute | 0.95x | 1.48x | 70% | Memory optimization |
-| 3.5 | +Workload Balancer | 1.5x | **2.22x** | 70% | **Load balancing** 🔥 |
-| 4 | +DynamicEmb **Caching** | 0.95x | **2.11x** | **30%** | **CPU+GPU hybrid** 🔥 |
-| 5 | +LFU | 1.1x | 2.32x | 30% | Cache optimization |
-| 6 | +Pipeline | 1.3x | 3.02x | 30% | I/O hiding |
-| 7 | +TP | 1.0x | 3.02x | 20% | Model parallel |
-| 8 | +SP | 0.95x | 2.87x | 15% | Sequence parallel |
+| Exp | kernel_backend | recompute_layernorm | balanced_shuffler | caching | ratio | evict | pipeline_type | TP size | New Optimization 🔥 |
+|------|----------------|---------------------|-------------------|---------|-------|-------|---------------|---------|---------------------|
+| **Exp0** | triton | ❌ | ❌ | ❌ | 0 | lru | none | 1 | Baseline |
+| **Exp1** | **cutlass** 🔥 | ❌ | ❌ | ❌ | 0 | lru | none | 1 | CUTLASS Attention |
+| **Exp2** | cutlass | **✅** 🔥 | ❌ | ❌ | 0 | lru | none | 1 | Selective Recompute |
+| **Exp3** | cutlass | ✅ | **✅** 🔥 | ❌ | 0 | lru | none | 1 | Workload Balancer |
+| **Exp4** | cutlass | ✅ | ✅ | **✅** 🔥 | **0.1** 🔥 | lru | none | 1 | DynamicEmb Caching |
+| **Exp5** | cutlass | ✅ | ✅ | ✅ | 0.1 | **lfu** 🔥 | none | 1 | LFU Eviction |
+| **Exp6** | cutlass | ✅ | ✅ | ✅ | 0.1 | lfu | **prefetch** 🔥 | 1 | Pipeline Prefetch |
+| **Exp7** | cutlass | ✅ | ✅ | ✅ | 0.1 | lfu | prefetch | **2** 🔥 | Tensor Parallel |
+| **Exp8** | cutlass | ✅ | ✅ | ✅ | 0.1 | lfu | prefetch | 2 | Full Optimization |
 
-**Expected Overall Improvement**: **2.9-3.2x end-to-end training speedup** + **85% memory savings**
+**Column Descriptions**:
+| Column | Gin Parameter | Description |
+|--------|---------------|-------------|
+| kernel_backend | `NetworkArgs.kernel_backend` | triton/cutlass |
+| recompute_layernorm | `NetworkArgs.recompute_input_layernorm` | Recompute LayerNorm activations |
+| balanced_shuffler | `TrainerArgs.enable_balanced_shuffler` | Workload balancer |
+| caching | `DynamicEmbeddingArgs.caching` | GPU cache switch |
+| ratio | `DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio` | GPU cache ratio (0.1=10%) |
+| evict | `DynamicEmbeddingArgs.evict_strategy` | Eviction strategy lru/lfu |
+| pipeline_type | `TrainerArgs.pipeline_type` | none/prefetch |
+| TP size | `TensorModelParallelArgs.tensor_model_parallel_size` | Tensor Parallel degree |
+
+---
+
+### Experiment Performance Summary Table
+
+| Exp | Configuration | Caching | Ratio | Evict | Relative Throughput | Cumulative Speedup | GPU Memory | Key Optimization |
+|-----|--------------|---------|-------|-------|--------------------|--------------------|-----------|------------------|
+| 0 | Baseline (Triton) | ❌ | 0 | LRU | 1.0x | 1.0x | 100% | Baseline |
+| 1 | +CUTLASS | ❌ | 0 | LRU | 1.3x | 1.3x | 100% | Attention optimization |
+| 2 | +Recompute | ❌ | 0 | LRU | 0.95x | 1.24x | 70% | Memory optimization |
+| 3 | +Workload Balancer | ❌ | 0 | LRU | 1.5x | **1.86x** | 70% | **Load balancing** 🔥 |
+| 4 | +DynamicEmb **Caching** | ✅ | **0.1** | LRU | 0.95x | **1.77x** | **30%** | **CPU+GPU hybrid** 🔥 |
+| 5 | +LFU | ✅ | **0.1** | **LFU** | 1.1x | 1.95x | 30% | Cache optimization |
+| 6 | +Pipeline | ✅ | **0.1** | LFU | 1.3x | 2.53x | 30% | I/O hiding |
+| 7 | +TP | ✅ | **0.1** | LFU | 1.0x | 2.53x | 20% | Model parallel |
+| 8 | Full Optimization | ✅ | **0.1** | LFU | 0.95x | 2.40x | 15% | All optimizations |
+
+**Expected Overall Improvement**: **2.4-3.0x end-to-end training speedup** + **85% memory savings**
 
 **Key Notes**:
-- **Baseline includes Kernel Fusion** (`fuse_norm_mul_dropout`), this is default feature
-- **Workload Balancer** (Exp 3.5): **1.5x** improvement, most significant single optimization
-- **DynamicEmb Caching** (Exp 4): 5% throughput decrease, but **40% memory savings**, supports ultra-large-scale embedding
+- **Workload Balancer** (Exp 3): **1.5x** improvement, most significant single optimization
+- **DynamicEmb Caching** (Exp 4-8): 10% GPU cache ratio + CPU storage, supports ultra-large-scale embedding
+- **LFU Eviction** (Exp 5+): Better cache hit rate than LRU for frequency-based access patterns
 
 ---
 
@@ -543,20 +547,21 @@ TensorModelParallelArgs.tensor_model_parallel_size = 2  # SP available with TP=2
 
 ### 4.1 Benchmark Configuration Files
 
-8 gin configuration files will be created, each corresponding to one experiment.
+9 gin configuration files will be created, each corresponding to one experiment.
 
 #### File Structure
 ```
-examples/hstu/training/configs/
-├── h100_16gpu_exp0_baseline.gin
-├── h100_16gpu_exp1_cutlass.gin
-├── h100_16gpu_exp2_fusion.gin
-├── h100_16gpu_exp3_recompute.gin
-├── h100_16gpu_exp4_dynamicemb.gin
-├── h100_16gpu_exp5_lfu.gin
-├── h100_16gpu_exp6_pipeline.gin
-├── h100_16gpu_exp7_tp.gin
-└── h100_16gpu_exp8_sp.gin
+examples/hstu/training/benchmark/gin_configs/
+├── benchmark_exp0_baseline.gin
+├── benchmark_exp1_cutlass.gin
+├── benchmark_exp2_recompute.gin
+├── benchmark_exp3_workload_balancer.gin
+├── benchmark_exp4_dynamicemb_caching.gin
+├── benchmark_exp5_lfu.gin
+├── benchmark_exp6_pipeline.gin
+├── benchmark_exp7_tp.gin
+├── benchmark_exp8_full.gin
+└── benchmark_exp999_less_ctx.gin  # Optional: reduced contextual features for testing
 ```
 
 #### Base Configuration Template
@@ -632,15 +637,15 @@ examples/hstu/training/benchmark/
 
 ```
 # Format: exp_name,config_file_path
-exp0_baseline,examples/hstu/training/configs/h100_16gpu_exp0_baseline.gin
-exp1_cutlass,examples/hstu/training/configs/h100_16gpu_exp1_cutlass.gin
-exp2_fusion,examples/hstu/training/configs/h100_16gpu_exp2_fusion.gin
-exp3_recompute,examples/hstu/training/configs/h100_16gpu_exp3_recompute.gin
-exp4_dynamicemb,examples/hstu/training/configs/h100_16gpu_exp4_dynamicemb.gin
-exp5_lfu,examples/hstu/training/configs/h100_16gpu_exp5_lfu.gin
-exp6_pipeline,examples/hstu/training/configs/h100_16gpu_exp6_pipeline.gin
-exp7_tp,examples/hstu/training/configs/h100_16gpu_exp7_tp.gin
-exp8_full,examples/hstu/training/configs/h100_16gpu_exp8_full.gin
+exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+exp1_cutlass,training/benchmark/gin_configs/benchmark_exp1_cutlass.gin
+exp2_recompute,training/benchmark/gin_configs/benchmark_exp2_recompute.gin
+exp3_workload_balancer,training/benchmark/gin_configs/benchmark_exp3_workload_balancer.gin
+exp4_dynamicemb_caching,training/benchmark/gin_configs/benchmark_exp4_dynamicemb_caching.gin
+exp5_lfu,training/benchmark/gin_configs/benchmark_exp5_lfu.gin
+exp6_pipeline,training/benchmark/gin_configs/benchmark_exp6_pipeline.gin
+exp7_tp,training/benchmark/gin_configs/benchmark_exp7_tp.gin
+exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
 ```
 
 #### Single Node Local Run
@@ -648,11 +653,11 @@ exp8_full,examples/hstu/training/configs/h100_16gpu_exp8_full.gin
 ```bash
 # Run single experiment
 ./run_single_experiment_local.sh exp0_baseline \
-    --config=examples/hstu/training/configs/h100_16gpu_exp0_baseline.gin \
+    --config=training/benchmark/gin_configs/benchmark_exp0_baseline.gin \
     --nproc=8
 
 # Batch run all experiments
-./run_all_experiments_local.sh --exp-file=experiments.txt --nproc=8
+./run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --nproc=8
 ```
 
 #### SLURM Cluster Submission
@@ -691,8 +696,8 @@ exp8_full,examples/hstu/training/configs/h100_16gpu_exp8_full.gin
 ```bash
 # Create custom experiment list
 cat > quick_test.txt << EOF
-exp0_baseline,examples/hstu/training/configs/h100_16gpu_exp0_baseline.gin
-exp8_full,examples/hstu/training/configs/h100_16gpu_exp8_full.gin
+exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
 EOF
 
 # Local run
@@ -813,7 +818,7 @@ python generate_benchmark_data.py \
 ```bash
 # Single GPU run to verify configuration correctness
 python examples/hstu/training/pretrain_gr_ranking.py \
-    --gin-config-file examples/hstu/training/configs/h100_16gpu_exp0_baseline.gin
+    --gin-config-file examples/hstu/training/benchmark/gin_configs/benchmark_exp0_baseline.gin
 ```
 
 ### 5.2 Experiment Execution (2-3 days)
@@ -823,7 +828,7 @@ python examples/hstu/training/pretrain_gr_ranking.py \
 | Phase | Time | Description |
 |-------|------|-------------|
 | Single experiment | 1-2 hours | 1000 iters + evaluation |
-| 9 experiments | 9-18 hours | Sequential execution (including exp 3.5) |
+| 9 experiments | 9-18 hours | Sequential execution |
 | Result analysis | 4 hours | Data processing and visualization |
 | Total | ~1.5 days | Excluding reruns |
 
@@ -851,23 +856,23 @@ python examples/hstu/training/pretrain_gr_ranking.py \
 # Create batch experiment lists
 # First batch: Baseline + Kernel optimizations
 cat > batch1.txt << EOF
-exp0_baseline,examples/hstu/training/configs/h100_16gpu_exp0_baseline.gin
-exp1_cutlass,examples/hstu/training/configs/h100_16gpu_exp1_cutlass.gin
-exp2_fusion,examples/hstu/training/configs/h100_16gpu_exp2_fusion.gin
-exp3_recompute,examples/hstu/training/configs/h100_16gpu_exp3_recompute.gin
+exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+exp1_cutlass,training/benchmark/gin_configs/benchmark_exp1_cutlass.gin
+exp2_recompute,training/benchmark/gin_configs/benchmark_exp2_recompute.gin
+exp3_workload_balancer,training/benchmark/gin_configs/benchmark_exp3_workload_balancer.gin
 EOF
 
 # Second batch: Embedding + Pipeline optimizations
 cat > batch2.txt << EOF
-exp4_dynamicemb,examples/hstu/training/configs/h100_16gpu_exp4_dynamicemb.gin
-exp5_lfu,examples/hstu/training/configs/h100_16gpu_exp5_lfu.gin
-exp6_pipeline,examples/hstu/training/configs/h100_16gpu_exp6_pipeline.gin
+exp4_dynamicemb_caching,training/benchmark/gin_configs/benchmark_exp4_dynamicemb_caching.gin
+exp5_lfu,training/benchmark/gin_configs/benchmark_exp5_lfu.gin
+exp6_pipeline,training/benchmark/gin_configs/benchmark_exp6_pipeline.gin
 EOF
 
 # Third batch: Parallelism optimizations
 cat > batch3.txt << EOF
-exp7_tp,examples/hstu/training/configs/h100_16gpu_exp7_tp.gin
-exp8_full,examples/hstu/training/configs/h100_16gpu_exp8_full.gin
+exp7_tp,training/benchmark/gin_configs/benchmark_exp7_tp.gin
+exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
 EOF
 
 # Submit batches
@@ -1192,10 +1197,13 @@ Pipeline optimization significantly reduces Embedding time
    ```
    Explain each optimization's contribution one by one
    ```
-   - Exp 1-2: **Kernel Optimization** → 1.5x speedup
-     > "Custom CUTLASS attention kernel and operator fusion provide 50% compute speedup"
+   - Exp 1: **CUTLASS Attention** → 1.3x speedup
+     > "Custom CUTLASS attention kernel provides 30% compute speedup"
    
-   - Exp 3.5: **Workload Balancer** → 1.5x speedup 🔥
+   - Exp 2: **Selective Recompute** → Memory optimization
+     > "Trade compute for memory, enabling larger batch sizes"
+   
+   - Exp 3: **Workload Balancer** → 1.5x speedup 🔥
      > "In variable-length sequence scenarios, intelligent load balancing fully utilizes all GPUs, eliminating wait time"
    
    - Exp 4-5: **Embedding Optimization** → 80% memory savings
@@ -1300,7 +1308,7 @@ Prepare extra slides for deep-dive questions:
 
 #### Code Preparation
 - [ ] Latest code pulled
-- [ ] 8 configuration files created
+- [ ] 9 configuration files created
 - [ ] Run scripts tested
 - [ ] Monitoring scripts working
 
@@ -1318,7 +1326,7 @@ Prepare extra slides for deep-dive questions:
 ### Post-Execution Checklist
 
 #### Result Validation
-- [ ] All 8 experiments completed successfully
+- [ ] All 9 experiments completed successfully
 - [ ] Log files complete
 - [ ] Performance metrics reasonable
 - [ ] No abnormal errors
@@ -1386,6 +1394,6 @@ With this benchmark, we believe we can fully demonstrate NVIDIA recsys-examples'
 
 ---
 
-**Document Version**: v1.0  
-**Last Updated**: 2026-01-28  
+**Document Version**: v1.1  
+**Last Updated**: 2026-02-05  
 **Author**: NVIDIA RecSys Team

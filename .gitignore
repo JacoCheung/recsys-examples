@@ -34,3 +34,5 @@ pcie_lookup_poc/*
 **/triton/**/[0-9]*
 **/.triton/**/[0-9]*
 results/
+*-zh*.md
+*.pdf

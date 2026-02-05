@@ -214,15 +214,15 @@ exp_name,config_file_path
 #
 # Important: Paths are relative to examples/hstu directory
 
-exp0_baseline,training/configs/h100_16gpu_exp0_baseline.gin
-exp1_cutlass,training/configs/h100_16gpu_exp1_cutlass.gin
-exp2_fusion,training/configs/h100_16gpu_exp2_fusion.gin
-exp3_recompute,training/configs/h100_16gpu_exp3_recompute.gin
-exp4_dynamicemb,training/configs/h100_16gpu_exp4_dynamicemb.gin
-exp5_lfu,training/configs/h100_16gpu_exp5_lfu.gin
-exp6_pipeline,training/configs/h100_16gpu_exp6_pipeline.gin
-exp7_tp,training/configs/h100_16gpu_exp7_tp.gin
-exp8_full,training/configs/h100_16gpu_exp8_full.gin
+exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+exp1_cutlass,training/benchmark/gin_configs/benchmark_exp1_cutlass.gin
+exp2_recompute,training/benchmark/gin_configs/benchmark_exp2_recompute.gin
+exp3_workload_balancer,training/benchmark/gin_configs/benchmark_exp3_workload_balancer.gin
+exp4_dynamicemb_caching,training/benchmark/gin_configs/benchmark_exp4_dynamicemb_caching.gin
+exp5_lfu,training/benchmark/gin_configs/benchmark_exp5_lfu.gin
+exp6_pipeline,training/benchmark/gin_configs/benchmark_exp6_pipeline.gin
+exp7_tp,training/benchmark/gin_configs/benchmark_exp7_tp.gin
+exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
 ```
 
 ### Custom Experiment List
@@ -233,8 +233,8 @@ You can create a custom experiment list file to run only some experiments:
 # Create in examples/hstu directory
 cat > my_experiments.txt << EOF
 # My custom experiments
-exp0_baseline,training/configs/h100_16gpu_exp0_baseline.gin
-exp8_full,training/configs/h100_16gpu_exp8_full.gin
+exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
 EOF
 ```
 
@@ -577,8 +577,8 @@ cd /path/to/recsys-examples/examples/hstu
 ```bash
 # Create custom experiment list (in examples/hstu directory)
 cat > quick_test.txt << EOF
-exp0_baseline,training/configs/h100_16gpu_exp0_baseline.gin
-exp8_full,training/configs/h100_16gpu_exp8_full.gin
+exp0_baseline,training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+exp8_full,training/benchmark/gin_configs/benchmark_exp8_full.gin
 EOF
 
 # Local run
@@ -701,7 +701,7 @@ sacct -u $USER --starttime=today
 
 ## Version Information
 
-- **Document Version**: v1.1
-- **Last Updated**: 2026-01-30
+- **Document Version**: v1.2
+- **Last Updated**: 2026-02-05
 - **Applicable Script Version**: All benchmark scripts
-- **Updates**: Added local script nsys profile support documentation
+- **Updates**: Updated gin config paths to `training/benchmark/gin_configs/`

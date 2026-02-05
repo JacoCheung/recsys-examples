@@ -18,7 +18,7 @@
 # ===== Trainer Configuration =====
 TrainerArgs.train_batch_size = 32
 TrainerArgs.eval_batch_size = 32
-TrainerArgs.log_interval = 10
+TrainerArgs.log_interval = 100
 TrainerArgs.eval_interval = 400
 TrainerArgs.max_train_iters = 1000
 TrainerArgs.max_eval_iters = 50
