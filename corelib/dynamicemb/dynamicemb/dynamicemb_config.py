@@ -509,9 +509,11 @@ def get_constraint_capacity(
         dim + get_optimizer_state_dim(optimizer_type, dim, dtype)
     ) * dtype_to_bytes(dtype)
     bucket_size_in_bytes = bucket_capacity * byte_consume_per_vector
-    assert (
-        memory_bytes >= bucket_size_in_bytes
-    ), f"reserved HBM bytes {memory_bytes} on rank {torch.distributed.get_rank()} is less than one bucket {bucket_size_in_bytes}"
+    if memory_bytes < bucket_size_in_bytes:
+        warnings.warn(
+            f"reserved HBM bytes {memory_bytes} is less than one bucket {bucket_size_in_bytes}, will use {bucket_size_in_bytes} as the capacity"
+        )
+        memory_bytes = bucket_size_in_bytes
     capacity = (
         memory_bytes // byte_consume_per_vector
     )  # maybe zero, we need at least one bucket
