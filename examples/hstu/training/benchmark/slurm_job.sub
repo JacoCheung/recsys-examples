@@ -112,6 +112,7 @@ echo ""
 # Environment Variable Setup (add HSTU_ROOT's parent directory to PYTHONPATH)
 # ============================================================================
 export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
+export PYTHONWARNINGS="ignore"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 

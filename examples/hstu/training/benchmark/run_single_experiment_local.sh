@@ -44,7 +44,7 @@
 # ============================================================================
 
 set -e
-
+export PYTHONWARNINGS="ignore"
 # Default values
 NPROC=${NPROC:-8}
 ENABLE_NSYS=0
