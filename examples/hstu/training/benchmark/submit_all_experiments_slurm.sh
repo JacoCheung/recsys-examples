@@ -386,7 +386,7 @@ for i in "${!EXP_NAMES[@]}"; do
         mkdir -p ${EXP_OUTPUT_DIR}
     fi
     
-    # Build sbatch command
+    # Build sbatch command using array (to properly handle arguments with spaces)
     # Determine job name (with optional prefix)
     if [ -n "$JOB_PREFIX" ]; then
         FULL_JOB_NAME="${JOB_PREFIX}-hstu.${exp}"
@@ -394,46 +394,46 @@ for i in "${!EXP_NAMES[@]}"; do
         FULL_JOB_NAME="hstu_${exp}"
     fi
     
-    SBATCH_CMD="sbatch"
-    SBATCH_CMD+=" --job-name=${FULL_JOB_NAME}"
-    SBATCH_CMD+=" --output=${EXP_OUTPUT_DIR}/${FULL_JOB_NAME}_%j.out"
-    SBATCH_CMD+=" --partition=${PARTITION}"
+    # Use array to build sbatch arguments (preserves spaces in values)
+    SBATCH_ARGS=()
+    SBATCH_ARGS+=(--job-name="${FULL_JOB_NAME}")
+    SBATCH_ARGS+=(--output="${EXP_OUTPUT_DIR}/${FULL_JOB_NAME}_%j.out")
+    SBATCH_ARGS+=(--partition="${PARTITION}")
     
     # Add account if specified
     if [ -n "$ACCOUNT" ]; then
-        SBATCH_CMD+=" --account=${ACCOUNT}"
+        SBATCH_ARGS+=(--account="${ACCOUNT}")
     fi
     
-    SBATCH_CMD+=" --nodes=${NODES}"
-    SBATCH_CMD+=" --ntasks-per-node=${RANKS_PER_NODE}"
-    SBATCH_CMD+=" --cpus-per-task=8"
-    SBATCH_CMD+=" --mem=0"
-    SBATCH_CMD+=" --time=${TIME_LIMIT}"
-    SBATCH_CMD+=" --exclusive"
-    SBATCH_CMD+=" --network=sharp"
+    SBATCH_ARGS+=(--nodes="${NODES}")
+    SBATCH_ARGS+=(--ntasks-per-node="${RANKS_PER_NODE}")
+    SBATCH_ARGS+=(--cpus-per-task=8)
+    SBATCH_ARGS+=(--mem=0)
+    SBATCH_ARGS+=(--time="${TIME_LIMIT}")
+    SBATCH_ARGS+=(--exclusive)
+    SBATCH_ARGS+=(--network=sharp)
     
     # Sequential execution mode: add dependency
     if [ ${SEQUENTIAL} -eq 1 ] && [ -n "$PREV_JOB_ID" ]; then
-        SBATCH_CMD+=" --dependency=afterany:${PREV_JOB_ID}"
+        SBATCH_ARGS+=(--dependency="afterany:${PREV_JOB_ID}")
     fi
     
-    # Export environment variables (including exp_name, gin_options, output_dir, HSTU_ROOT and CONTAINER_IMAGE)
-    # Use single quotes around GIN_OPTIONS to preserve spaces
-    SBATCH_CMD+=" --export=ALL,EXP_NAME=${exp},GIN_OPTIONS='${gin_opts}',EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
+    # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
+    SBATCH_ARGS+=(--export="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}")
     
     # Specify SLURM job script
-    SBATCH_CMD+=" ${SCRIPT_DIR}/slurm_job.sub"
+    SBATCH_ARGS+=("${SCRIPT_DIR}/slurm_job.sub")
     
     echo -e "[${exp_num}/${#EXP_NAMES[@]}] ${YELLOW}${exp}${NC}"
     echo "  Options:    ${gin_opts:-'(defaults)'}"
     echo "  Output dir: ${EXP_OUTPUT_DIR}"
     
     if [ ${DRY_RUN} -eq 1 ]; then
-        echo "  Command: ${SBATCH_CMD}"
+        echo "  Command: sbatch ${SBATCH_ARGS[*]}"
         echo ""
     else
-        # Submit job and get job ID
-        JOB_OUTPUT=$(${SBATCH_CMD})
+        # Submit job and get job ID (using array expansion to preserve spaces)
+        JOB_OUTPUT=$(sbatch "${SBATCH_ARGS[@]}")
         JOB_ID=$(echo ${JOB_OUTPUT} | grep -oP '\d+$')
         
         if [ -n "$JOB_ID" ]; then

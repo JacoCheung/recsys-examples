@@ -99,11 +99,19 @@ echo ""
 # Generate gin config file
 # ============================================================================
 echo "📝 Generating gin config file..."
-echo "   Command: python ${GIN_GENERATOR} ${GIN_OPTIONS} -o ${CONFIG_FILE}"
+
+# Build gin config command (avoid passing empty string when GIN_OPTIONS is empty)
+if [ -n "${GIN_OPTIONS}" ]; then
+    GIN_CMD="python ${GIN_GENERATOR} ${GIN_OPTIONS}"
+else
+    GIN_CMD="python ${GIN_GENERATOR}"
+fi
+
+echo "   Command: ${GIN_CMD} -o ${CONFIG_FILE}"
 echo ""
 
 # Generate config and also print to terminal
-python ${GIN_GENERATOR} ${GIN_OPTIONS} | tee ${CONFIG_FILE}
+${GIN_CMD} | tee ${CONFIG_FILE}
 echo ""
 echo "✅ Config saved to: ${CONFIG_FILE}"
 echo ""
