@@ -190,8 +190,10 @@ NSYS_OUTPUT="${NSYS_OUTPUT_DIR}/${EXP_NAME}_${NSYS_TIMESTAMP}_job${SLURM_JOB_ID}
 
 echo "[Rank ${GLOBAL_RANK}] Starting nsys profile, output: ${NSYS_OUTPUT}.nsys-rep"
 
-# Set CUDA visible devices (if needed)
-export CUDA_VISIBLE_DEVICES=${LOCAL_RANK}
+# Note: Do NOT set CUDA_VISIBLE_DEVICES here, as the training script
+# handles device assignment based on LOCAL_RANK. Setting it here would
+# cause device index mismatch (e.g., CUDA_VISIBLE_DEVICES=3 makes GPU 3
+# appear as device 0, but training code tries to use device 3).
 
 # Run nsys profile
 exec nsys profile \
