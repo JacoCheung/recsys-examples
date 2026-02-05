@@ -19,12 +19,13 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 # Set up logger with RichHandler if not already configured
+# Use a large width to prevent automatic line wrapping when redirecting to file
 
-console = Console()
+console = Console(width=500, soft_wrap=True)
 _logger = logging.getLogger("rich_rank0")
 
 handler = RichHandler(
-    console=console, show_time=True, show_path=False, rich_tracebacks=True
+    console=console, show_time=True, show_path=False, rich_tracebacks=True, markup=False
 )
 _logger.addHandler(handler)
 _logger.propagate = False
