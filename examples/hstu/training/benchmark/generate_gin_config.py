@@ -113,7 +113,7 @@ action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
 # Contextual Feature Embeddings (3 total)
 user_id_emb/DynamicEmbeddingArgs.feature_names = ['user_id']
 user_id_emb/DynamicEmbeddingArgs.table_name = 'user_id'
-user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 10000  # 10K (smaller than item)
+user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
 user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 user_id_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
 user_id_emb/DynamicEmbeddingArgs.caching = {caching}
@@ -123,14 +123,14 @@ user_age_emb/DynamicEmbeddingArgs.table_name = 'user_age'
 user_age_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 100
 user_age_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio_small}
 user_age_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
-user_age_emb/DynamicEmbeddingArgs.caching = {caching_small}
+user_age_emb/DynamicEmbeddingArgs.caching = False
 
 item_cat_l1_emb/DynamicEmbeddingArgs.feature_names = ['item_category_l1']
 item_cat_l1_emb/DynamicEmbeddingArgs.table_name = 'item_category_l1'
 item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50
 item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio_small}
 item_cat_l1_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
-item_cat_l1_emb/DynamicEmbeddingArgs.caching = {caching_small}
+item_cat_l1_emb/DynamicEmbeddingArgs.caching = False
 
 # Aggregate all embedding configs (5 embedding tables total)
 BenchmarkDatasetArgs.embedding_args = [
@@ -276,7 +276,7 @@ def generate_config(args):
     # This keeps small tables fully in GPU
     if args.caching:
         ratio_small = 1
-        caching_small = "False"
+        caching_small = "True"
     else:
         ratio_small = 0
         caching_small = "False"
