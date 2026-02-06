@@ -23,6 +23,8 @@
 #   --time=HH:MM:SS      Job time limit (default: 04:00:00)
 #   -y, --yes            Skip confirmation prompt
 #   --dry-run            Print sbatch commands only, do not submit
+#   --wait-and-analyze   Wait for all jobs to complete and auto-analyze results
+#   --poll-interval=SEC  Polling interval for job status check (default: 60)
 #   --help               Show help information
 # 
 # Experiment List File Format:
@@ -42,7 +44,11 @@
 #       │   └── exp0_baseline_*.nsys-rep  (if nsys enabled)
 #       ├── exp1_cutlass/            # Second experiment
 #       │   ├── ...
-#       └── summary.txt              # Batch experiment summary
+#       ├── summary.txt              # Batch experiment summary
+#       ├── comparison.png           # Performance comparison chart (if --wait-and-analyze)
+#       ├── monitor.log              # Job monitor log (if --wait-and-analyze)
+#       └── monitor.pid              # Monitor process ID (if --wait-and-analyze)
+#   └── {batch_timestamp}.tar.gz     # Archive of all results (if --wait-and-analyze)
 # 
 # Examples:
 #   # Run in examples/hstu directory
@@ -58,6 +64,10 @@
 #   # Other options
 #   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --nsys
 #   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --results-dir=/data/benchmark_results
+#   
+#   # Wait for all jobs and auto-analyze
+#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze
+#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze --poll-interval=120
 # ============================================================================
 
 set -e
@@ -76,6 +86,8 @@ RANKS_PER_NODE=8
 TIME_LIMIT="04:00:00"
 DRY_RUN=0
 YES_FLAG=0
+WAIT_AND_ANALYZE=0
+POLL_INTERVAL=30
 EXP_FILE=""
 CUSTOM_RESULTS_DIR=""
 CUSTOM_HSTU_ROOT=""
@@ -84,7 +96,7 @@ CUSTOM_HSTU_ROOT=""
 # Help Information
 # ============================================================================
 show_help() {
-    head -59 "$0" | tail -58
+    head -71 "$0" | tail -70
     exit 0
 }
 
@@ -189,6 +201,18 @@ while [[ $# -gt 0 ]]; do
             YES_FLAG=1
             shift
             ;;
+        --wait-and-analyze)
+            WAIT_AND_ANALYZE=1
+            shift
+            ;;
+        --poll-interval=*)
+            POLL_INTERVAL="${1#*=}"
+            shift
+            ;;
+        --poll-interval)
+            POLL_INTERVAL="$2"
+            shift 2
+            ;;
         --help|-h)
             show_help
             ;;
@@ -259,7 +283,7 @@ BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 if [ -z "$EXP_FILE" ]; then
     echo "⚠️  Missing experiment list file (--exp-file=<file>)"
     echo ""
-    head -61 "$0" | tail -59
+    head -71 "$0" | tail -69
     exit 0
 fi
 
@@ -336,7 +360,13 @@ echo "  Time limit:       ${TIME_LIMIT}"
 echo "  Sequential mode:  $([ ${SEQUENTIAL} -eq 1 ] && echo 'YES' || echo 'NO')"
 echo ""
 echo -e "${BLUE}NSYS Profiling:${NC}"
-echo "  Enabled:          $([ ${ENABLE_NSYS} -eq 1 ] && echo -e '${GREEN}YES${NC}' || echo 'NO')"
+echo -e "  Enabled:          $([ ${ENABLE_NSYS} -eq 1 ] && echo "${GREEN}YES${NC}" || echo 'NO')"
+echo ""
+echo -e "${BLUE}Auto Analysis:${NC}"
+echo -e "  Wait and analyze: $([ ${WAIT_AND_ANALYZE} -eq 1 ] && echo "${GREEN}YES${NC}" || echo 'NO')"
+if [ ${WAIT_AND_ANALYZE} -eq 1 ]; then
+    echo "  Poll interval:    ${POLL_INTERVAL}s"
+fi
 echo ""
 
 if [ ${DRY_RUN} -eq 1 ]; then
@@ -537,7 +567,17 @@ else
             echo "  │   └── ${JOB_NAME_PATTERN}_*.out"
         fi
     done
-    echo "  └── summary.txt"
+    if [ ${WAIT_AND_ANALYZE} -eq 1 ]; then
+        echo "  ├── summary.txt"
+        echo "  ├── comparison.png         (auto-generated after all jobs complete)"
+        echo "  ├── monitor.log            (job monitor log)"
+        echo "  └── monitor.pid            (monitor process ID)"
+        echo ""
+        echo "  📦 Archive (in parent dir):"
+        echo "  └── ${BATCH_TIMESTAMP}.tar.gz  (created after analysis)"
+    else
+        echo "  └── summary.txt"
+    fi
     echo ""
     
     echo "📝 Summary saved to: ${SUMMARY_FILE}"
@@ -556,6 +596,219 @@ else
         echo "  nsys stats ${BATCH_OUTPUT_DIR}/{exp_name}/*.nsys-rep"
         echo "  nsys-ui ${BATCH_OUTPUT_DIR}/{exp_name}/*.nsys-rep"
         echo ""
+    fi
+    
+    # ============================================================================
+    # Background Monitoring and Auto-Analysis
+    # ============================================================================
+    if [ ${WAIT_AND_ANALYZE} -eq 1 ] && [ ${#SUBMITTED_JOBS[@]} -gt 0 ]; then
+        echo -e "${BLUE}🔄 Starting background job monitor...${NC}"
+        echo "   Polling interval: ${POLL_INTERVAL} seconds"
+        echo ""
+        
+        # Extract job IDs
+        JOB_IDS=""
+        for job_info in "${SUBMITTED_JOBS[@]}"; do
+            job_id=$(echo ${job_info} | cut -d: -f2)
+            if [ -n "$JOB_IDS" ]; then
+                JOB_IDS="${JOB_IDS},${job_id}"
+            else
+                JOB_IDS="${job_id}"
+            fi
+        done
+        
+        # Create monitor script in the batch output directory
+        MONITOR_SCRIPT="${BATCH_OUTPUT_DIR}/monitor_jobs.sh"
+        MONITOR_LOG="${BATCH_OUTPUT_DIR}/monitor.log"
+        ANALYZE_SCRIPT="${SCRIPT_DIR}/analyze_results.py"
+        
+        cat > "${MONITOR_SCRIPT}" << 'MONITOR_EOF'
+#!/bin/bash
+# Auto-generated job monitor script
+
+JOB_IDS="$1"
+BATCH_OUTPUT_DIR="$2"
+POLL_INTERVAL="$3"
+ANALYZE_SCRIPT="$4"
+MONITOR_LOG="$5"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${MONITOR_LOG}"
+}
+
+log "Job monitor started"
+log "Monitoring jobs: ${JOB_IDS}"
+log "Results directory: ${BATCH_OUTPUT_DIR}"
+log "Poll interval: ${POLL_INTERVAL}s"
+
+# Function to check if all jobs are complete
+check_jobs_complete() {
+    # Use sacct to check job states
+    # States: COMPLETED, FAILED, CANCELLED, TIMEOUT, NODE_FAIL, PREEMPTED, OUT_OF_MEMORY
+    local pending_count=0
+    
+    IFS=',' read -ra JOB_ARRAY <<< "$JOB_IDS"
+    for job_id in "${JOB_ARRAY[@]}"; do
+        # Get job state using sacct (more reliable than squeue for completed jobs)
+        state=$(sacct -j "$job_id" -n -o State -X 2>/dev/null | head -1 | xargs)
+        
+        # If sacct doesn't return anything, try squeue
+        if [ -z "$state" ]; then
+            state=$(squeue -j "$job_id" -h -o "%T" 2>/dev/null)
+        fi
+        
+        # Check if job is still running or pending
+        case "$state" in
+            PENDING|RUNNING|CONFIGURING|COMPLETING|RESIZING|SUSPENDED)
+                ((pending_count++))
+                ;;
+        esac
+    done
+    
+    echo $pending_count
+}
+
+# Function to get job status summary
+get_status_summary() {
+    local completed=0 failed=0 running=0 pending=0 other=0
+    
+    IFS=',' read -ra JOB_ARRAY <<< "$JOB_IDS"
+    for job_id in "${JOB_ARRAY[@]}"; do
+        state=$(sacct -j "$job_id" -n -o State -X 2>/dev/null | head -1 | xargs)
+        if [ -z "$state" ]; then
+            state=$(squeue -j "$job_id" -h -o "%T" 2>/dev/null)
+        fi
+        
+        case "$state" in
+            COMPLETED) ((completed++)) ;;
+            FAILED|CANCELLED|TIMEOUT|NODE_FAIL|PREEMPTED|OUT_OF_MEMORY) ((failed++)) ;;
+            RUNNING|COMPLETING) ((running++)) ;;
+            PENDING|CONFIGURING) ((pending++)) ;;
+            *) ((other++)) ;;
+        esac
+    done
+    
+    echo "Completed: $completed, Running: $running, Pending: $pending, Failed: $failed"
+}
+
+# Main monitoring loop
+while true; do
+    pending=$(check_jobs_complete)
+    status=$(get_status_summary)
+    
+    log "Status: ${status}"
+    
+    if [ "$pending" -eq 0 ]; then
+        log "All jobs have completed!"
+        break
+    fi
+    
+    log "Waiting ${POLL_INTERVAL}s before next check..."
+    sleep "${POLL_INTERVAL}"
+done
+
+# Run analysis
+log ""
+log "=========================================="
+log "Running performance analysis..."
+log "=========================================="
+
+if [ -f "${ANALYZE_SCRIPT}" ]; then
+    PLOT_OUTPUT="${BATCH_OUTPUT_DIR}/comparison.png"
+    
+    log "Analyzing results in: ${BATCH_OUTPUT_DIR}"
+    log "Plot will be saved to: ${PLOT_OUTPUT}"
+    
+    python3 "${ANALYZE_SCRIPT}" "${BATCH_OUTPUT_DIR}" \
+        --output "${PLOT_OUTPUT}" \
+        --title "HSTU Benchmark Results - $(basename ${BATCH_OUTPUT_DIR})" \
+        2>&1 | tee -a "${MONITOR_LOG}"
+    
+    # Use PIPESTATUS to get the exit code of python3, not tee
+    ANALYZE_EXIT_CODE=${PIPESTATUS[0]}
+    
+    if [ ${ANALYZE_EXIT_CODE} -eq 0 ]; then
+        log ""
+        log "✅ Analysis complete!"
+        log "   Plot saved to: ${PLOT_OUTPUT}"
+        log "   Results directory: ${BATCH_OUTPUT_DIR}"
+        
+        # Send notification to terminal (if possible)
+        echo ""
+        echo "=================================================="
+        echo "🎉 HSTU Benchmark Analysis Complete!"
+        echo "=================================================="
+        echo "Results: ${BATCH_OUTPUT_DIR}"
+        echo "Plot:    ${PLOT_OUTPUT}"
+        echo "=================================================="
+    else
+        log ""
+        log "❌ Analysis failed. Check logs for details."
+    fi
+else
+    log "❌ Analysis script not found: ${ANALYZE_SCRIPT}"
+fi
+
+# Create tar.gz archive of all results
+log ""
+log "=========================================="
+log "Creating results archive..."
+log "=========================================="
+
+ARCHIVE_NAME="$(basename ${BATCH_OUTPUT_DIR}).tar.gz"
+ARCHIVE_PATH="$(dirname ${BATCH_OUTPUT_DIR})/${ARCHIVE_NAME}"
+
+log "Archive name: ${ARCHIVE_NAME}"
+log "Archive path: ${ARCHIVE_PATH}"
+
+# Create tar.gz archive with batch_timestamp as root directory
+# Use -C option to ensure clean directory structure (batch_timestamp/ as root)
+tar -czvf "${ARCHIVE_PATH}" -C "$(dirname ${BATCH_OUTPUT_DIR})" "$(basename ${BATCH_OUTPUT_DIR})" 2>&1 | tail -5 | while read line; do log "  $line"; done
+
+if [ -f "${ARCHIVE_PATH}" ]; then
+    ARCHIVE_SIZE=$(du -h "${ARCHIVE_PATH}" | cut -f1)
+    log ""
+    log "✅ Archive created successfully!"
+    log "   Archive: ${ARCHIVE_PATH}"
+    log "   Size: ${ARCHIVE_SIZE}"
+    
+    # Send notification to terminal
+    echo ""
+    echo "=================================================="
+    echo "📦 Results Archive Created!"
+    echo "=================================================="
+    echo "Archive: ${ARCHIVE_PATH}"
+    echo "Size:    ${ARCHIVE_SIZE}"
+    echo "=================================================="
+else
+    log ""
+    log "❌ Failed to create archive."
+fi
+
+log ""
+log "Monitor script finished."
+MONITOR_EOF
+
+        chmod +x "${MONITOR_SCRIPT}" 2>/dev/null || true
+        
+        # Start monitor in background
+        nohup bash "${MONITOR_SCRIPT}" "${JOB_IDS}" "${BATCH_OUTPUT_DIR}" "${POLL_INTERVAL}" "${ANALYZE_SCRIPT}" "${MONITOR_LOG}" > "${MONITOR_LOG}" 2>&1 &
+        MONITOR_PID=$!
+        
+        echo -e "${GREEN}✅ Background monitor started (PID: ${MONITOR_PID})${NC}"
+        echo ""
+        echo "Monitor log: ${MONITOR_LOG}"
+        echo ""
+        echo -e "${BLUE}To check monitor status:${NC}"
+        echo "  tail -f ${MONITOR_LOG}"
+        echo "  ps -p ${MONITOR_PID}"
+        echo ""
+        echo -e "${BLUE}To stop monitoring:${NC}"
+        echo "  kill ${MONITOR_PID}"
+        echo ""
+        
+        # Save monitor PID to file for reference
+        echo "${MONITOR_PID}" > "${BATCH_OUTPUT_DIR}/monitor.pid"
     fi
 fi
 

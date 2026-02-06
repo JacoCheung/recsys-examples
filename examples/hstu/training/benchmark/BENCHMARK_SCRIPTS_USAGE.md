@@ -357,7 +357,10 @@ cd /path/to/recsys-examples/examples/hstu
 | `--nodes=N` | Number of nodes | ❌ | 2 |
 | `--ranks-per-node=N` | Ranks per node | ❌ | 8 |
 | `--time=HH:MM:SS` | Job time limit | ❌ | 04:00:00 |
+| `-y, --yes` | Skip confirmation prompt | ❌ | - |
 | `--dry-run` | Print commands only, don't submit | ❌ | - |
+| `--wait-and-analyze` | Wait for all jobs to complete and auto-analyze results | ❌ | Disabled |
+| `--poll-interval=SEC` | Polling interval for job status check | ❌ | 30 |
 | `--help` | Show help | ❌ | - |
 
 #### Examples
@@ -388,6 +391,15 @@ cd /path/to/recsys-examples/examples/hstu
 
 # Use custom experiment list
 ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=my_experiments.txt --nsys
+
+# Wait for all jobs to complete and auto-analyze results
+./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze
+
+# Wait and analyze with custom polling interval (120 seconds)
+./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze --poll-interval=120
+
+# Skip confirmation prompt
+./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt -y
 ```
 
 ---
@@ -586,14 +598,18 @@ All outputs are organized by timestamp and experiment name:
 
 ```
 results/
-└── {batch_timestamp}/           # Timestamp of this batch run
-    ├── exp0_baseline/           # First experiment
-    │   ├── exp0_baseline_{timestamp}.log     # Training log
-    │   ├── exp0_baseline_{timestamp}.gin     # Generated config
-    │   └── exp0_baseline_*.nsys-rep          # nsys profiles (if enabled)
-    ├── exp1_cutlass/            # Second experiment
-    │   ├── ...
-    └── summary.txt              # Batch experiment summary
+├── {batch_timestamp}/           # Timestamp of this batch run
+│   ├── exp0_baseline/           # First experiment
+│   │   ├── exp0_baseline_{timestamp}.log     # Training log
+│   │   ├── exp0_baseline_{timestamp}.gin     # Generated config
+│   │   └── exp0_baseline_*.nsys-rep          # nsys profiles (if enabled)
+│   ├── exp1_cutlass/            # Second experiment
+│   │   ├── ...
+│   ├── summary.txt              # Batch experiment summary
+│   ├── comparison.png           # Performance comparison chart (if --wait-and-analyze)
+│   ├── monitor.log              # Job monitor log (if --wait-and-analyze)
+│   └── monitor.pid              # Monitor process ID (if --wait-and-analyze)
+└── {batch_timestamp}.tar.gz     # Archive of all results (if --wait-and-analyze)
 ```
 
 ### Log Files
@@ -691,10 +707,14 @@ sacct -u $USER --starttime=today
 
 ## Version Information
 
-- **Document Version**: v2.0
-- **Last Updated**: 2026-02-05
+- **Document Version**: v2.1
+- **Last Updated**: 2026-02-06
 - **Applicable Script Version**: All benchmark scripts
 - **Major Changes**: 
   - Removed static gin config files, now uses `generate_gin_config.py` to generate configs dynamically
   - `experiments.txt` format changed from `exp_name,config_path` to `exp_name,gin_options`
   - `run_single_experiment_local.sh` now accepts optimization switches directly instead of `--config`
+  - Added `--wait-and-analyze` option to `submit_all_experiments_slurm.sh` for automatic result analysis after all jobs complete
+  - Added `--poll-interval` option to configure job status polling frequency
+  - Added `-y/--yes` option to skip confirmation prompt
+  - Auto-creates tar.gz archive of results when using `--wait-and-analyze`
