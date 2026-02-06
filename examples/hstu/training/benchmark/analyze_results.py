@@ -26,7 +26,6 @@ Examples:
 """
 
 import argparse
-import os
 import re
 import sys
 from pathlib import Path
@@ -35,11 +34,12 @@ from typing import Any, Dict, Optional, Tuple
 # Try to import matplotlib, provide helpful message if not available
 try:
     import matplotlib
-    import matplotlib.pyplot as plt
 
-    # Use non-interactive backend if no display
-    if os.environ.get("DISPLAY") is None:
-        matplotlib.use("Agg")
+    # IMPORTANT: Must set backend BEFORE importing pyplot
+    # Use non-interactive backend for headless servers (no display)
+    matplotlib.use("Agg")
+
+    import matplotlib.pyplot as plt
 except ImportError:
     print("Error: matplotlib is required. Install with: pip install matplotlib")
     sys.exit(1)
