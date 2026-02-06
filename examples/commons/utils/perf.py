@@ -570,31 +570,55 @@ def cal_hstu_flops(
     has_bwd: bool = True,
     is_causal: bool = True,
     residual: bool = True,
+    dp_pg: Optional[torch.distributed.ProcessGroup] = None,
 ) -> int:
+    """
+    Calculate total FLOPS for HSTU model across all data parallel ranks.
+
+    Args:
+        dp_pg: Data Parallel process group. When using TP, pass the DP process
+               group to gather only from DP ranks (avoiding duplicate data from
+               TP ranks that process the same batch). If None, uses the default
+               world process group.
+    """
     seqlens_tensor = torch.cat(seqlens)
-    world_size = torch.distributed.get_world_size()
-    gathered_seqlens = (
-        [torch.empty_like(seqlens_tensor) for _ in range(world_size)]
-        if torch.distributed.get_rank() == 0
-        else None
-    )
     num_contextuals_tensor = torch.cat(num_contextuals)
     num_candidates_tensor = torch.cat(num_candidates)
 
+    # Use DP process group if provided, otherwise use default world group
+    if dp_pg is not None:
+        dp_world_size = torch.distributed.get_world_size(group=dp_pg)
+        dp_rank = torch.distributed.get_rank(group=dp_pg)
+    else:
+        dp_world_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+
+    # Gather to rank 0 in the DP group
+    gathered_seqlens = (
+        [torch.empty_like(seqlens_tensor) for _ in range(dp_world_size)]
+        if dp_rank == 0
+        else None
+    )
     gathered_num_contextuals = (
-        [torch.empty_like(num_contextuals_tensor) for _ in range(world_size)]
-        if torch.distributed.get_rank() == 0
+        [torch.empty_like(num_contextuals_tensor) for _ in range(dp_world_size)]
+        if dp_rank == 0
         else None
     )
     gathered_num_candidates = (
-        [torch.empty_like(num_candidates_tensor) for _ in range(world_size)]
-        if torch.distributed.get_rank() == 0
+        [torch.empty_like(num_candidates_tensor) for _ in range(dp_world_size)]
+        if dp_rank == 0
         else None
     )
-    torch.distributed.gather(seqlens_tensor, gathered_seqlens, dst=0)
-    torch.distributed.gather(num_contextuals_tensor, gathered_num_contextuals, dst=0)
-    torch.distributed.gather(num_candidates_tensor, gathered_num_candidates, dst=0)
-    if torch.distributed.get_rank() == 0:
+
+    torch.distributed.gather(seqlens_tensor, gathered_seqlens, dst=0, group=dp_pg)
+    torch.distributed.gather(
+        num_contextuals_tensor, gathered_num_contextuals, dst=0, group=dp_pg
+    )
+    torch.distributed.gather(
+        num_candidates_tensor, gathered_num_candidates, dst=0, group=dp_pg
+    )
+
+    if dp_rank == 0:
         flops = (
             cal_hstu_flops_single_rank(
                 num_layers,

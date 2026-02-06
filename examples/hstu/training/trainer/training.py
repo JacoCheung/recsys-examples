@@ -209,6 +209,9 @@ def train_with_pipeline(
                     hstu_config.is_causal,
                     hstu_config.residual,
                 )
+                # Get DP process group to gather only from DP ranks (not TP duplicates)
+                dp_pg = parallel_state.get_data_parallel_group()
+
                 flops = cal_hstu_flops(
                     num_layers,
                     hidden_size,
@@ -220,6 +223,7 @@ def train_with_pipeline(
                     has_bwd=True,
                     is_causal=is_causal,
                     residual=residual,
+                    dp_pg=dp_pg,
                 )
                 mfu = cal_mfu(
                     flops / cur_td / 1e9, world_size=dist.get_world_size(), dtype="bf16"
