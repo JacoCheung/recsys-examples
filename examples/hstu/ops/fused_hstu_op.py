@@ -20,6 +20,7 @@ import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
 import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export
 import nvtx
 import torch
+from commons.utils.attn_perf_tracker import PRINT_HSTU_PERF
 from commons.utils.clear_tensor_data import clear_tensor_data
 from configs import KernelBackend
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
@@ -277,6 +278,18 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             alpha,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
+            extension_args = ()
+            if sm_major_version == 8:
+                cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
+                ampere_paged_kv_args = (None, None, None, None, None)
+                extension_args = ampere_paged_kv_args
+            elif sm_major_version == 9:
+                cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
+                hopper_fp8_args = (-1, None, None, None, None, None, None, None, None)
+                extension_args = hopper_fp8_args
+
+            else:
+                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
             assert q.dim() == 3, "q shape should be (L, num_heads, head_dim)"
             assert k.dim() == 3, "k shape should be (L, num_heads, head_dim)"
             assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
@@ -287,57 +300,25 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             num_targets = (
                 num_targets.to(torch.int32) if num_targets is not None else None
             )
-            if sm_major_version == 8:
-                jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
-                    q,
-                    k,
-                    v,
-                    seq_offsets_q,
-                    seq_offsets_q,
-                    None,
-                    None,  # seqused_q, seqused_k
-                    max_seqlen_q,
-                    max_seqlen_q,
-                    scaling_seqlen,
-                    num_contexts,
-                    num_targets,
-                    target_group_size,
-                    -1,
-                    0,
-                    alpha,
-                    None,
-                    None,  # rab, func
-                )
-            elif sm_major_version == 9:
-                assert q.dtype in (
-                    torch.bfloat16,
-                    torch.float16,
-                ), f"Hopper fwd expects bfloat16 or float16, got {q.dtype}"
-                output_dtype = 0 if q.dtype == torch.bfloat16 else 1
-                jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
-                    q,
-                    k,
-                    v,
-                    seq_offsets_q,
-                    seq_offsets_q,
-                    None,
-                    None,  # seqused_q, seqused_k
-                    max_seqlen_q,
-                    max_seqlen_q,
-                    scaling_seqlen,
-                    num_contexts,
-                    num_targets,
-                    target_group_size,
-                    -1,
-                    0,
-                    alpha,
-                    None,
-                    None,  # rab, func
-                    -1,
-                    output_dtype,  # quant_mode, output_dtype
-                )
-            else:
-                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
+            jagged_attn_output, _ = cutlass_hstu_varlen_fwd(
+                q,
+                k,
+                v,
+                seq_offsets_q,
+                seq_offsets_q,
+                max_seqlen_q,
+                max_seqlen_q,
+                scaling_seqlen,
+                num_contexts,
+                num_targets,
+                target_group_size,
+                -1,  # window_size_left
+                0,  # window_size_right
+                alpha,
+                None,  # rab
+                None,  # func
+                *extension_args,
+            )
             # in case of padding
             P = jagged_attn_output[:, :, :linear_dim_per_head].reshape(
                 -1, num_heads * linear_dim_per_head
@@ -450,6 +431,22 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             tq = tq.view(-1, num_heads, attention_dim_per_head)
             tk = tk.view(-1, num_heads, attention_dim_per_head)
 
+        if PRINT_HSTU_PERF:
+            from commons.utils.attn_perf_tracker import _get_attn_perf_accum
+            from commons.utils.perf import _compute_attn_fwd_flops
+
+            _perf_fwd_flops = _compute_attn_fwd_flops(
+                seqlen_offsets,
+                num_heads,
+                attention_dim_per_head,
+                linear_dim_per_head,
+                causal,
+                num_targets,
+                num_contextuals,
+            )
+            _perf_fwd_start = torch.cuda.Event(enable_timing=True)
+            _perf_fwd_start.record()
+
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 # attn_output: [T, num_heads * attention_dim_per_head]
@@ -484,6 +481,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     num_targets=num_targets,
                     contextual_seq_len=num_contextuals,
                 )
+
+        if PRINT_HSTU_PERF:
+            _perf_fwd_end = torch.cuda.Event(enable_timing=True)
+            _perf_fwd_end.record()
+            _get_attn_perf_accum().add_fwd(
+                _perf_fwd_start, _perf_fwd_end, _perf_fwd_flops
+            )
+            ctx._perf_attn_fwd_flops = _perf_fwd_flops
 
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             # dropout ratio and seed are set in ctx
@@ -631,56 +636,48 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm_major_version = torch.cuda.get_device_properties(0).major
             assert dout.dim() == 3
             if sm_major_version == 8:
-                dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_80(
+                dq, dk, dv, _ = flash_attn_cuda_ampere.varlen_bwd(
                     dout,
                     q,
                     k,
                     v,
-                    seq_offsets_q,
-                    seq_offsets_q,
-                    None,
-                    None,  # seqused_q, seqused_k
-                    max_seqlen_q,
-                    max_seqlen_q,
-                    scaling_seqlen,
                     dq,
                     dk,
                     dv,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    scaling_seqlen,
                     num_contexts,
                     num_targets,
                     target_group_size,
                     window_size_left,
                     window_size_right,
                     alpha,
-                    None,
-                    False,
-                    None,
-                    False,  # rab, has_drab, func, deterministic
+                    None,  # rab_padded
+                    False,  # has_drab
+                    None,  # func
+                    False,  # deterministic
                 )
             elif sm_major_version == 9:
-                assert dout.dtype in (
-                    torch.bfloat16,
-                    torch.float16,
-                ), f"Hopper bwd expects bfloat16 or float16, got {dout.dtype}"
-                output_dtype = 0 if dout.dtype == torch.bfloat16 else 1
-                dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_90(
+                fp8_args = (None,) * 11
+                dq, dk, dv, _ = flash_attn_cuda_hopper.varlen_bwd(
                     dout,
-                    None,  # dout_t
-                    q,
-                    None,  # q_t
-                    k,
-                    None,  # k_t
-                    v,
-                    seq_offsets_q,
-                    seq_offsets_q,
                     None,
-                    None,  # seqused_q, seqused_k
-                    max_seqlen_q,
-                    max_seqlen_q,
-                    scaling_seqlen,
+                    q,
+                    None,
+                    k,
+                    None,
+                    v,
                     dq,
                     dk,
                     dv,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    scaling_seqlen,
                     num_contexts,
                     num_targets,
                     target_group_size,
@@ -688,21 +685,10 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     window_size_right,
                     alpha,
                     -1,  # quant_mode
-                    None,
-                    False,
-                    None,  # rab, has_drab, func
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,  # fp8 descale: q/qt/k/kt/v/do/dot/cu_qt/cu_kt/cu_q_block/cu_kv_block
-                    output_dtype,
+                    None,  # rab_padded
+                    False,  # has_drab
+                    None,  # func
+                    *fp8_args,
                     False,  # deterministic
                 )
             else:
@@ -865,6 +851,12 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 wait_event=ctx.wgrad_event,
                 du=pre_du,
             )
+        if PRINT_HSTU_PERF:
+            from commons.utils.attn_perf_tracker import _get_attn_perf_accum
+
+            _perf_bwd_start = torch.cuda.Event(enable_timing=True)
+            _perf_bwd_start.record()
+
         with nvtx.annotate("hstu attn bwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 grad_q, grad_k, grad_v = _hstu_attn_cutlass_bwd(
@@ -911,6 +903,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output = torch.cat(
                     [grad_u, grad_v, grad_q, grad_k], dim=-1
                 ).contiguous()
+
+        if PRINT_HSTU_PERF:
+            _perf_bwd_end = torch.cuda.Event(enable_timing=True)
+            _perf_bwd_end.record()
+            _perf_bwd_flops = ctx._perf_attn_fwd_flops * 2.5
+            _get_attn_perf_accum().add_bwd(
+                _perf_bwd_start, _perf_bwd_end, _perf_bwd_flops
+            )
 
         with nvtx.annotate("ln_linear_silu bwd", color="RED"):
             if ctx.recompute_input_layernorm:
