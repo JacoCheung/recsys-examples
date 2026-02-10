@@ -70,6 +70,11 @@ TrainerArgs.ckpt_save_interval = 999999999
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
 item_and_action_feature/FeatureArgs.max_sequence_length = 1024
 item_and_action_feature/FeatureArgs.is_jagged = True
+item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
+item_seqlen_dist/RandomDistribution.alpha = 1.2
+item_seqlen_dist/RandomDistribution.low = 256 # 256 is the minimum sequence length
+item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
+
 
 # Contextual Features (only 3)
 user_contextual_features/FeatureArgs.feature_names = ['user_id', 'user_age']
