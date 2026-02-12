@@ -32,9 +32,6 @@ embedding_checkpoint/
 *.xlsx
 pcie_lookup_poc/*
 **/triton/**/[0-9]*
-results/
-.docs/*
-.python-version
 **/results/*
 *.nsys-rep
 *.log
@@ -42,8 +39,4 @@ results/
 *-zh*.md
 *.pdf
 .SKILLS/
-**/torch_binding_build/**
-examples/hstu/inference/cpp_inference/build*
-examples/hstu/inference/inference_emb_dump*/
-examples/hstu/inference/export_test_dump*/
-splitops_demo
+.cursor/
