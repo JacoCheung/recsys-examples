@@ -16,8 +16,17 @@
 from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
-import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
-import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export
+try:
+    import hstu_attn_2_cuda as flash_attn_cuda_ampere
+except ImportError:
+    pass
+
+try:
+    import hstu_hopper_cuda as flash_attn_cuda_hopper
+except ImportError:
+    pass
+import warnings
+
 import nvtx
 import torch
 from commons.utils.attn_perf_tracker import PRINT_HSTU_PERF
@@ -144,7 +153,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         if num_contextuals is None and attn_backend == KernelBackend.TRITON:
             num_contextuals = 0
         if attn_backend == KernelBackend.TRITON:
-            assert isinstance(num_contextuals, int)
+            if not isinstance(num_contextuals, int):
+                assert torch.all(
+                    num_contextuals == num_contextuals[0]
+                ), "contextual features must have the same length"
+                warnings.warn(
+                    "make sure contextual features are fixed length, otherwise the attention kernel will not work correctly"
+                )
+                num_contextuals = num_contextuals[0].item()
         assert input.dim() == 2, "input tensor must be 2D"
         assert linear_uvqk_bias.dim() == 1, "linear_uvqk_bias must be 1D"
 
