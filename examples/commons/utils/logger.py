@@ -13,36 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import os
 
 # Set up logger with RichHandler if not already configured
 # Control via environment variable:
 #   DISABLE_RICH=1  - Disable Rich, use plain print instead
 import os
-from datetime import datetime
 
 import torch
 from rich.console import Console
 from rich.logging import RichHandler
 
-_disable_rich = os.environ.get("DISABLE_RICH", "").strip() not in (
-    "",
-    "0",
-    "false",
-    "False",
-)
+# Set up logger with RichHandler if not already configured
 
-if not _disable_rich:
-    console = Console(width=500, soft_wrap=True)
-    _logger = logging.getLogger("rich_rank0")
-    handler = RichHandler(
-        console=console, show_time=True, show_path=False, rich_tracebacks=True, markup=False
-    )
-    _logger.addHandler(handler)
-    _logger.propagate = False
-    _logger.setLevel(
-        getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
-    )
+console = Console(soft_wrap=True, width=240)
+_logger = logging.getLogger("rich_rank0")
+
+handler = RichHandler(
+    console=console, show_time=True, show_path=False, rich_tracebacks=True
+)
+_logger.addHandler(handler)
+_logger.propagate = False
+_logger.setLevel(
+    getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+)
 
 
 def print_rank_0(message, level=logging.INFO):
@@ -58,11 +51,7 @@ def info_rank_0(message):
     """If distributed is initialized, print on rank 0."""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
-            if _disable_rich:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{timestamp}] {message}", flush=True)
-            else:
-                _logger.info(message)
+            _logger.info(message)
     else:
         print(message, flush=True)
 

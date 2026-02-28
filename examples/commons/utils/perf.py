@@ -601,11 +601,13 @@ def cal_hstu_flops(
     if dp_pg is not None:
         dp_world_size = torch.distributed.get_world_size(group=dp_pg)
         dp_rank = torch.distributed.get_rank(group=dp_pg)
+        dst_global_rank = torch.distributed.get_global_rank(dp_pg, 0)
     else:
         dp_world_size = torch.distributed.get_world_size()
         dp_rank = torch.distributed.get_rank()
+        dst_global_rank = 0
 
-    # Gather to rank 0 in the DP group
+    # Gather to group rank 0 in the DP group
     gathered_seqlens = (
         [torch.empty_like(seqlens_tensor) for _ in range(dp_world_size)]
         if dp_rank == 0
@@ -622,12 +624,20 @@ def cal_hstu_flops(
         else None
     )
 
-    torch.distributed.gather(seqlens_tensor, gathered_seqlens, dst=0, group=dp_pg)
     torch.distributed.gather(
-        num_contextuals_tensor, gathered_num_contextuals, dst=0, group=dp_pg
+        seqlens_tensor, gathered_seqlens, dst=dst_global_rank, group=dp_pg
     )
     torch.distributed.gather(
-        num_candidates_tensor, gathered_num_candidates, dst=0, group=dp_pg
+        num_contextuals_tensor,
+        gathered_num_contextuals,
+        dst=dst_global_rank,
+        group=dp_pg,
+    )
+    torch.distributed.gather(
+        num_candidates_tensor,
+        gathered_num_candidates,
+        dst=dst_global_rank,
+        group=dp_pg,
     )
 
     if dp_rank == 0:
@@ -703,7 +713,6 @@ def get_mfu_summary(
         f"  Global Peak TFLOPS: {global_peak:.2f}\n"
         f"  MFU: {mfu:.2f}%"
     )
-
 
 
 def _compute_attn_fwd_flops(
