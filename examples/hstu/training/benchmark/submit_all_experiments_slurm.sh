@@ -25,6 +25,7 @@
 #   --dry-run            Print sbatch commands only, do not submit
 #   --wait-and-analyze   Wait for all jobs to complete and auto-analyze results
 #   --poll-interval=SEC  Polling interval for job status check (default: 60)
+#   --scp-dest=USER@HOST:PATH  SCP destination for results archive (optional, skip if not set)
 #   --help               Show help information
 # 
 # Experiment List File Format:
@@ -91,6 +92,7 @@ POLL_INTERVAL=30
 EXP_FILE=""
 CUSTOM_RESULTS_DIR=""
 CUSTOM_HSTU_ROOT=""
+SCP_DEST=""
 
 # ============================================================================
 # Help Information
@@ -211,6 +213,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --poll-interval)
             POLL_INTERVAL="$2"
+            shift 2
+            ;;
+        --scp-dest=*)
+            SCP_DEST="${1#*=}"
+            shift
+            ;;
+        --scp-dest)
+            SCP_DEST="$2"
             shift 2
             ;;
         --help|-h)
@@ -341,6 +351,21 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # ============================================================================
+# Capture Git Information
+# ============================================================================
+GIT_BRANCH=$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+GIT_COMMIT_HASH=$(git -C "${PROJECT_ROOT}" log -1 --format="%H" 2>/dev/null || echo "unknown")
+GIT_COMMIT_SHORT=$(git -C "${PROJECT_ROOT}" log -1 --format="%h" 2>/dev/null || echo "unknown")
+GIT_COMMIT_DATE=$(git -C "${PROJECT_ROOT}" log -1 --format="%ai" 2>/dev/null || echo "unknown")
+GIT_COMMIT_MSG=$(git -C "${PROJECT_ROOT}" log -1 --format="%s" 2>/dev/null || echo "unknown")
+GIT_DIRTY=$(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | head -1)
+if [ -n "$GIT_DIRTY" ]; then
+    GIT_STATUS="dirty (uncommitted changes)"
+else
+    GIT_STATUS="clean"
+fi
+
+# ============================================================================
 # Print Configuration Information
 # ============================================================================
 echo ""
@@ -374,6 +399,12 @@ if [ ${DRY_RUN} -eq 1 ]; then
     echo ""
 fi
 
+echo -e "${BLUE}Git Information:${NC}"
+echo "  Branch:           ${GIT_BRANCH}"
+echo "  Commit:           ${GIT_COMMIT_SHORT} (${GIT_COMMIT_DATE})"
+echo "  Message:          ${GIT_COMMIT_MSG}"
+echo "  Working tree:     ${GIT_STATUS}"
+echo ""
 echo -e "${BLUE}Batch timestamp:   ${BATCH_TIMESTAMP}${NC}"
 echo -e "${BLUE}Output directory:  ${BATCH_OUTPUT_DIR}${NC}"
 echo ""
@@ -499,6 +530,14 @@ if [ ${DRY_RUN} -eq 0 ]; then
         echo ""
         echo "Batch Timestamp: ${BATCH_TIMESTAMP}"
         echo "Submitted at:    $(date)"
+        echo ""
+        echo "Git Information:"
+        echo "  Branch:           ${GIT_BRANCH}"
+        echo "  Commit:           ${GIT_COMMIT_HASH}"
+        echo "  Commit (short):   ${GIT_COMMIT_SHORT}"
+        echo "  Commit date:      ${GIT_COMMIT_DATE}"
+        echo "  Commit message:   ${GIT_COMMIT_MSG}"
+        echo "  Working tree:     ${GIT_STATUS}"
         echo ""
         echo "SLURM Configuration:"
         echo "  Partition:        ${PARTITION}"
@@ -631,6 +670,7 @@ BATCH_OUTPUT_DIR="$2"
 POLL_INTERVAL="$3"
 ANALYZE_SCRIPT="$4"
 MONITOR_LOG="$5"
+SCP_DEST="$6"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${MONITOR_LOG}"
@@ -733,14 +773,13 @@ if [ -f "${ANALYZE_SCRIPT}" ]; then
         log "   Plot saved to: ${PLOT_OUTPUT}"
         log "   Results directory: ${BATCH_OUTPUT_DIR}"
         
-        # Send notification to terminal (if possible)
-        echo ""
-        echo "=================================================="
-        echo "🎉 HSTU Benchmark Analysis Complete!"
-        echo "=================================================="
-        echo "Results: ${BATCH_OUTPUT_DIR}"
-        echo "Plot:    ${PLOT_OUTPUT}"
-        echo "=================================================="
+        log ""
+        log "=================================================="
+        log "HSTU Benchmark Analysis Complete!"
+        log "=================================================="
+        log "Results: ${BATCH_OUTPUT_DIR}"
+        log "Plot:    ${PLOT_OUTPUT}"
+        log "=================================================="
     else
         log ""
         log "❌ Analysis failed. Check logs for details."
@@ -772,14 +811,27 @@ if [ -f "${ARCHIVE_PATH}" ]; then
     log "   Archive: ${ARCHIVE_PATH}"
     log "   Size: ${ARCHIVE_SIZE}"
     
-    # Send notification to terminal
-    echo ""
-    echo "=================================================="
-    echo "📦 Results Archive Created!"
-    echo "=================================================="
-    echo "Archive: ${ARCHIVE_PATH}"
-    echo "Size:    ${ARCHIVE_SIZE}"
-    echo "=================================================="
+    log ""
+    log "=================================================="
+    log "Results Archive Created!"
+    log "=================================================="
+    log "Archive: ${ARCHIVE_PATH}"
+    log "Size:    ${ARCHIVE_SIZE}"
+    log "=================================================="
+
+    # SCP archive to remote destination if specified
+    if [ -n "${SCP_DEST}" ]; then
+        log ""
+        log "=========================================="
+        log "Transferring archive via SCP..."
+        log "  Destination: ${SCP_DEST}"
+        log "=========================================="
+        if scp "${ARCHIVE_PATH}" "${SCP_DEST}"; then
+            log "✅ SCP transfer completed: ${SCP_DEST}"
+        else
+            log "❌ SCP transfer failed (exit code: $?). Archive is still available locally at: ${ARCHIVE_PATH}"
+        fi
+    fi
 else
     log ""
     log "❌ Failed to create archive."
@@ -791,8 +843,10 @@ MONITOR_EOF
 
         chmod +x "${MONITOR_SCRIPT}" 2>/dev/null || true
         
-        # Start monitor in background
-        nohup bash "${MONITOR_SCRIPT}" "${JOB_IDS}" "${BATCH_OUTPUT_DIR}" "${POLL_INTERVAL}" "${ANALYZE_SCRIPT}" "${MONITOR_LOG}" > "${MONITOR_LOG}" 2>&1 &
+        # Start monitor in background.
+        # log() inside the monitor uses tee -a to write to MONITOR_LOG,
+        # so redirect nohup stdout/stderr to /dev/null to avoid double-writing.
+        nohup bash "${MONITOR_SCRIPT}" "${JOB_IDS}" "${BATCH_OUTPUT_DIR}" "${POLL_INTERVAL}" "${ANALYZE_SCRIPT}" "${MONITOR_LOG}" "${SCP_DEST}" > /dev/null 2>&1 &
         MONITOR_PID=$!
         
         echo -e "${GREEN}✅ Background monitor started (PID: ${MONITOR_PID})${NC}"
