@@ -38,5 +38,6 @@ pcie_lookup_poc/*
 *.log
 *-zh*.md
 *.pdf
+.docs/
 .SKILLS/
 .cursor/
