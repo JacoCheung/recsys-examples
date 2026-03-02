@@ -77,10 +77,9 @@ echo ""
 # ============================================================================
 # Submit via SSH, capture output to extract monitor log path
 # ============================================================================
-SSH_OUTPUT=$(ssh "${LOGIN_HOST}" "${REMOTE_CMD}" 2>&1)
-SSH_EXIT=$?
+SSH_OUTPUT=$(ssh "${LOGIN_HOST}" "${REMOTE_CMD}" 2>&1) && SSH_EXIT=0 || SSH_EXIT=$?
 
-# Print the SSH output
+# Print the SSH output (always, even on failure)
 echo "${SSH_OUTPUT}"
 
 if [ ${SSH_EXIT} -ne 0 ]; then

@@ -351,6 +351,21 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # ============================================================================
+# Capture Git Information
+# ============================================================================
+GIT_BRANCH=$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+GIT_COMMIT_HASH=$(git -C "${PROJECT_ROOT}" log -1 --format="%H" 2>/dev/null || echo "unknown")
+GIT_COMMIT_SHORT=$(git -C "${PROJECT_ROOT}" log -1 --format="%h" 2>/dev/null || echo "unknown")
+GIT_COMMIT_DATE=$(git -C "${PROJECT_ROOT}" log -1 --format="%ai" 2>/dev/null || echo "unknown")
+GIT_COMMIT_MSG=$(git -C "${PROJECT_ROOT}" log -1 --format="%s" 2>/dev/null || echo "unknown")
+GIT_DIRTY=$(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | head -1)
+if [ -n "$GIT_DIRTY" ]; then
+    GIT_STATUS="dirty (uncommitted changes)"
+else
+    GIT_STATUS="clean"
+fi
+
+# ============================================================================
 # Print Configuration Information
 # ============================================================================
 echo ""
@@ -384,6 +399,12 @@ if [ ${DRY_RUN} -eq 1 ]; then
     echo ""
 fi
 
+echo -e "${BLUE}Git Information:${NC}"
+echo "  Branch:           ${GIT_BRANCH}"
+echo "  Commit:           ${GIT_COMMIT_SHORT} (${GIT_COMMIT_DATE})"
+echo "  Message:          ${GIT_COMMIT_MSG}"
+echo "  Working tree:     ${GIT_STATUS}"
+echo ""
 echo -e "${BLUE}Batch timestamp:   ${BATCH_TIMESTAMP}${NC}"
 echo -e "${BLUE}Output directory:  ${BATCH_OUTPUT_DIR}${NC}"
 echo ""
@@ -509,6 +530,14 @@ if [ ${DRY_RUN} -eq 0 ]; then
         echo ""
         echo "Batch Timestamp: ${BATCH_TIMESTAMP}"
         echo "Submitted at:    $(date)"
+        echo ""
+        echo "Git Information:"
+        echo "  Branch:           ${GIT_BRANCH}"
+        echo "  Commit:           ${GIT_COMMIT_HASH}"
+        echo "  Commit (short):   ${GIT_COMMIT_SHORT}"
+        echo "  Commit date:      ${GIT_COMMIT_DATE}"
+        echo "  Commit message:   ${GIT_COMMIT_MSG}"
+        echo "  Working tree:     ${GIT_STATUS}"
         echo ""
         echo "SLURM Configuration:"
         echo "  Partition:        ${PARTITION}"
