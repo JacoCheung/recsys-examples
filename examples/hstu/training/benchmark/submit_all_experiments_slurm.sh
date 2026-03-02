@@ -25,6 +25,7 @@
 #   --dry-run            Print sbatch commands only, do not submit
 #   --wait-and-analyze   Wait for all jobs to complete and auto-analyze results
 #   --poll-interval=SEC  Polling interval for job status check (default: 60)
+#   --scp-dest=USER@HOST:PATH  SCP destination for results archive (optional, skip if not set)
 #   --help               Show help information
 # 
 # Experiment List File Format:
@@ -91,6 +92,7 @@ POLL_INTERVAL=30
 EXP_FILE=""
 CUSTOM_RESULTS_DIR=""
 CUSTOM_HSTU_ROOT=""
+SCP_DEST=""
 
 # ============================================================================
 # Help Information
@@ -211,6 +213,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --poll-interval)
             POLL_INTERVAL="$2"
+            shift 2
+            ;;
+        --scp-dest=*)
+            SCP_DEST="${1#*=}"
+            shift
+            ;;
+        --scp-dest)
+            SCP_DEST="$2"
             shift 2
             ;;
         --help|-h)
@@ -780,6 +790,20 @@ if [ -f "${ARCHIVE_PATH}" ]; then
     echo "Archive: ${ARCHIVE_PATH}"
     echo "Size:    ${ARCHIVE_SIZE}"
     echo "=================================================="
+
+    # SCP archive to remote destination if specified
+    if [ -n "${SCP_DEST}" ]; then
+        log ""
+        log "=========================================="
+        log "Transferring archive via SCP..."
+        log "  Destination: ${SCP_DEST}"
+        log "=========================================="
+        if scp "${ARCHIVE_PATH}" "${SCP_DEST}"; then
+            log "✅ SCP transfer completed: ${SCP_DEST}"
+        else
+            log "❌ SCP transfer failed (exit code: $?). Archive is still available locally at: ${ARCHIVE_PATH}"
+        fi
+    fi
 else
     log ""
     log "❌ Failed to create archive."
