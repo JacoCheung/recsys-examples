@@ -670,6 +670,7 @@ BATCH_OUTPUT_DIR="$2"
 POLL_INTERVAL="$3"
 ANALYZE_SCRIPT="$4"
 MONITOR_LOG="$5"
+SCP_DEST="$6"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${MONITOR_LOG}"
@@ -845,7 +846,7 @@ MONITOR_EOF
         chmod +x "${MONITOR_SCRIPT}" 2>/dev/null || true
         
         # Start monitor in background
-        nohup bash "${MONITOR_SCRIPT}" "${JOB_IDS}" "${BATCH_OUTPUT_DIR}" "${POLL_INTERVAL}" "${ANALYZE_SCRIPT}" "${MONITOR_LOG}" > "${MONITOR_LOG}" 2>&1 &
+        nohup bash "${MONITOR_SCRIPT}" "${JOB_IDS}" "${BATCH_OUTPUT_DIR}" "${POLL_INTERVAL}" "${ANALYZE_SCRIPT}" "${MONITOR_LOG}" "${SCP_DEST}" > "${MONITOR_LOG}" 2>&1 &
         MONITOR_PID=$!
         
         echo -e "${GREEN}✅ Background monitor started (PID: ${MONITOR_PID})${NC}"

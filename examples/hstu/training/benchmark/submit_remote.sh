@@ -10,28 +10,7 @@
 # the remote monitor log and pops up a desktop notification when all jobs
 # finish. The script itself returns immediately so your terminal is not blocked.
 #
-# Options (override defaults):
-#   --exp-file=FILE          Experiment list file (default: training/benchmark/experiments.txt)
-#   --nodes=N                Number of nodes (default: 2)
-#   --container-image=IMAGE  Container image
-#   --account=NAME           SLURM account
-#   --job-name=NAME          SLURM job name prefix
-#   --scp-dest=DEST          SCP destination for results archive
-#   --nsys                   Enable nsys profiling
-#   --wait-and-analyze       Wait for jobs and auto-analyze
-#   --dry-run                Dry run mode
-#   -y, --yes                Skip confirmation
-#   (all other submit_all_experiments_slurm.sh options are also accepted)
-#
-# Examples:
-#   # Run with all defaults
-#   ./training/benchmark/submit_remote.sh
-#
-#   # Override nodes
-#   ./training/benchmark/submit_remote.sh --nodes=4
-#
-#   # Dry run
-#   ./training/benchmark/submit_remote.sh --dry-run
+# Run with --help / -h to see all available options and defaults.
 # ============================================================================
 
 set -e
@@ -48,22 +27,81 @@ EXP_FILE="training/benchmark/experiments.txt"
 NODES=2
 CONTAINER_IMAGE="gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_benchmark_e2e"
 MONITOR_POLL_INTERVAL=60  # seconds between polling the remote monitor log
+ENABLE_NSYS=true
 
+usage() {
+    cat <<'USAGE_EOF'
+Usage: submit_remote.sh [options]
+
+SSH into login-eos and run submit_all_experiments_slurm.sh with
+pre-configured defaults. A background watcher polls the remote
+monitor log and sends a desktop notification when all jobs finish.
+
+Options:
+  -h, --help                 Show this help message and exit
+  --login-host=HOST          SSH login host           (default: login-eos)
+  --remote-root=PATH         Remote HSTU root dir     (default: /lustre/fsw/.../examples/hstu)
+  --exp-file=FILE            Experiment list file    (default: training/benchmark/experiments.txt)
+  --nodes=N                  Number of nodes          (default: 2)
+  --container-image=IMAGE    Container image          (default: see script)
+  --account=NAME             SLURM account            (default: coreai_devtech_all)
+  --job-name=NAME            SLURM job name prefix    (default: coreai_devtech_all)
+  --scp-dest=DEST            SCP destination          (default: see script)
+  --poll-interval=SEC        Watcher poll interval    (default: 60)
+  --nsys / --no-nsys         Enable/disable nsys profiling (default: enabled)
+  --dry-run                  Dry run mode (passed to remote script)
+
+Any unrecognised options are forwarded to submit_all_experiments_slurm.sh.
+-y and --wait-and-analyze are always enabled (SSH is non-interactive).
+
+Examples:
+  ./training/benchmark/submit_remote.sh
+  ./training/benchmark/submit_remote.sh --nodes=4
+  ./training/benchmark/submit_remote.sh --dry-run --no-nsys
+USAGE_EOF
+    exit 0
+}
+
+# ============================================================================
+# Parse arguments
+# ============================================================================
+EXTRA_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)           usage ;;
+        --login-host=*)      LOGIN_HOST="${1#*=}" ;;
+        --remote-root=*)     REMOTE_HSTU_ROOT="${1#*=}" ;;
+        --exp-file=*)        EXP_FILE="${1#*=}" ;;
+        --nodes=*)           NODES="${1#*=}" ;;
+        --container-image=*) CONTAINER_IMAGE="${1#*=}" ;;
+        --account=*)         ACCOUNT="${1#*=}" ;;
+        --job-name=*)        JOB_NAME="${1#*=}" ;;
+        --scp-dest=*)        SCP_DEST="${1#*=}" ;;
+        --poll-interval=*)   MONITOR_POLL_INTERVAL="${1#*=}" ;;
+        --nsys)              ENABLE_NSYS=true ;;
+        --no-nsys)           ENABLE_NSYS=false ;;
+        *)                   EXTRA_ARGS+=("$1") ;;
+    esac
+    shift
+done
+
+# ============================================================================
 # Build the remote command
+# ============================================================================
 REMOTE_CMD="cd ${REMOTE_HSTU_ROOT} && bash training/benchmark/submit_all_experiments_slurm.sh"
 REMOTE_CMD+=" --scp-dest=${SCP_DEST}"
 REMOTE_CMD+=" --account=${ACCOUNT}"
 REMOTE_CMD+=" --job-name=${JOB_NAME}"
 REMOTE_CMD+=" --exp-file=${EXP_FILE}"
 REMOTE_CMD+=" --nodes=${NODES}"
-REMOTE_CMD+=" --nsys"
 REMOTE_CMD+=" --container-image ${CONTAINER_IMAGE}"
 REMOTE_CMD+=" --wait-and-analyze"
 REMOTE_CMD+=" -y"
-
-# Append any extra arguments passed to this script
-if [ $# -gt 0 ]; then
-    REMOTE_CMD+=" $*"
+if [ "${ENABLE_NSYS}" = true ]; then
+    REMOTE_CMD+=" --nsys"
+fi
+if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+    REMOTE_CMD+=" ${EXTRA_ARGS[*]}"
 fi
 
 echo "==========================================="
