@@ -773,14 +773,13 @@ if [ -f "${ANALYZE_SCRIPT}" ]; then
         log "   Plot saved to: ${PLOT_OUTPUT}"
         log "   Results directory: ${BATCH_OUTPUT_DIR}"
         
-        # Send notification to terminal (if possible)
-        echo ""
-        echo "=================================================="
-        echo "🎉 HSTU Benchmark Analysis Complete!"
-        echo "=================================================="
-        echo "Results: ${BATCH_OUTPUT_DIR}"
-        echo "Plot:    ${PLOT_OUTPUT}"
-        echo "=================================================="
+        log ""
+        log "=================================================="
+        log "HSTU Benchmark Analysis Complete!"
+        log "=================================================="
+        log "Results: ${BATCH_OUTPUT_DIR}"
+        log "Plot:    ${PLOT_OUTPUT}"
+        log "=================================================="
     else
         log ""
         log "❌ Analysis failed. Check logs for details."
@@ -812,14 +811,13 @@ if [ -f "${ARCHIVE_PATH}" ]; then
     log "   Archive: ${ARCHIVE_PATH}"
     log "   Size: ${ARCHIVE_SIZE}"
     
-    # Send notification to terminal
-    echo ""
-    echo "=================================================="
-    echo "📦 Results Archive Created!"
-    echo "=================================================="
-    echo "Archive: ${ARCHIVE_PATH}"
-    echo "Size:    ${ARCHIVE_SIZE}"
-    echo "=================================================="
+    log ""
+    log "=================================================="
+    log "Results Archive Created!"
+    log "=================================================="
+    log "Archive: ${ARCHIVE_PATH}"
+    log "Size:    ${ARCHIVE_SIZE}"
+    log "=================================================="
 
     # SCP archive to remote destination if specified
     if [ -n "${SCP_DEST}" ]; then
@@ -845,8 +843,10 @@ MONITOR_EOF
 
         chmod +x "${MONITOR_SCRIPT}" 2>/dev/null || true
         
-        # Start monitor in background
-        nohup bash "${MONITOR_SCRIPT}" "${JOB_IDS}" "${BATCH_OUTPUT_DIR}" "${POLL_INTERVAL}" "${ANALYZE_SCRIPT}" "${MONITOR_LOG}" "${SCP_DEST}" > "${MONITOR_LOG}" 2>&1 &
+        # Start monitor in background.
+        # log() inside the monitor uses tee -a to write to MONITOR_LOG,
+        # so redirect nohup stdout/stderr to /dev/null to avoid double-writing.
+        nohup bash "${MONITOR_SCRIPT}" "${JOB_IDS}" "${BATCH_OUTPUT_DIR}" "${POLL_INTERVAL}" "${ANALYZE_SCRIPT}" "${MONITOR_LOG}" "${SCP_DEST}" > /dev/null 2>&1 &
         MONITOR_PID=$!
         
         echo -e "${GREEN}✅ Background monitor started (PID: ${MONITOR_PID})${NC}"
