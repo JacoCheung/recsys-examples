@@ -49,6 +49,11 @@ def dmp_batch_to_tp(batch: Any, exclude_features: bool = True) -> Any:
         output_batch.num_candidates = gather_along_first_dim(
             batch.num_candidates, tp_pg
         )
+    if (
+        hasattr(output_batch, "total_candidates_seq_len")
+        and output_batch.total_candidates_seq_len is not None
+    ):
+        output_batch.total_candidates_seq_len *= tp_size
     if isinstance(batch.labels, KeyedJaggedTensor):
         output_batch.labels = keyed_jagged_tensor_allgather(batch.labels, tp_pg)
     # reduce max seqlen
