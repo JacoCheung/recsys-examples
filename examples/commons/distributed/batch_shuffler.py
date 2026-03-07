@@ -404,6 +404,8 @@ class BaseTaskBalancedBatchShuffler:
         if has_padding and actual_bs < new_batch.batch_size:
             new_batch = _strip_dense_padding(new_batch, actual_bs)
 
+        new_batch._on_samples_redistributed()
+
         return new_batch
 
     # ------------------------------------------------------------------
@@ -622,6 +624,8 @@ class BaseTaskBalancedBatchShuffler:
 
         if has_padding and actual_bs < new_batch.batch_size:
             new_batch = _strip_dense_padding(new_batch, actual_bs)
+
+        new_batch._on_samples_redistributed()
 
         ret = new_batch
         if return_indices:
