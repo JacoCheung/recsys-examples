@@ -336,7 +336,7 @@ if [ ${DRY_RUN} -eq 1 ]; then
         echo "    -o \"${NSYS_OUTPUT}\" \\"
         echo "    -f true \\"
         echo "    -s none \\"
-        echo "    -t cuda,cublas,nvtx \\"
+        echo "    -t cuda,cublas-verbose,nvtx \\"
         echo "    -c cudaProfilerApi \\"
         echo "    --cpuctxsw none \\"
         echo "    --cuda-flush-interval 100 \\"
@@ -393,11 +393,12 @@ if [ ${ENABLE_NSYS} -eq 1 ]; then
     
     # Use nsys to wrap torchrun, nsys will trace all child processes
     # Parameters consistent with slurm_job.sub
+    CUBLAS_NVTX_LEVEL=2 \
     nsys profile \
         -o "${NSYS_OUTPUT}" \
         -f true \
         -s none \
-        -t cuda,cublas,nvtx \
+        -t cuda,cublas-verbose,nvtx \
         -c cudaProfilerApi \
         --cpuctxsw none \
         --cuda-flush-interval 100 \

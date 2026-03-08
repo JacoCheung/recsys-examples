@@ -2,7 +2,8 @@
 gpu_arch=$(nvidia-smi -L |head -n 1| cut -d' ' -f4)
 num_layers=${1:-1}
 PROFILE=${PROFILE:-0}
-nsys_cmd='nsys profile -o ./profile/<placeholder> -f true -s none -t cuda,cublas,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node '
+export CUBLAS_NVTX_LEVEL=2
+nsys_cmd='nsys profile -o ./profile/<placeholder> -f true -s none -t cuda,cublas-verbose,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node '
 
 dim_per_heads=(256)
 num_heads=(4)

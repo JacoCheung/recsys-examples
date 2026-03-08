@@ -202,11 +202,12 @@ echo "[Rank ${GLOBAL_RANK}] Starting nsys profile, output: ${NSYS_OUTPUT}.nsys-r
 # appear as device 0, but training code tries to use device 3).
 
 # Run nsys profile
+export CUBLAS_NVTX_LEVEL=2
 exec nsys profile \
     -o "${NSYS_OUTPUT}" \
     -f true \
     -s none \
-    -t cuda,cublas,nvtx \
+    -t cuda,cublas-verbose,nvtx \
     -c cudaProfilerApi \
     --cpuctxsw none \
     --cuda-flush-interval 100 \

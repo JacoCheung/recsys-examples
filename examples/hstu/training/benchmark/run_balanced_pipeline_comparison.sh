@@ -133,10 +133,11 @@ GIN_EOF
     set +e
     if [ "$ENABLE_NSYS" = true ]; then
         eval ${EXTRA_ENVS} \
+        CUBLAS_NVTX_LEVEL=2 \
         nsys profile \
             -f true \
             -s none \
-            -t cuda,cublas,nvtx \
+            -t cuda,cublas-verbose,nvtx \
             -c cudaProfilerApi \
             --cpuctxsw none \
             --cuda-flush-interval 100 \
