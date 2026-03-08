@@ -60,6 +60,8 @@ HSTU_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$HSTU_ROOT"
 PYTHONPATH="${PYTHONPATH:-}:$(realpath ../)"
 export PYTHONPATH
+export CUDA_MODULE_LOADING=EAGER
+export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -133,10 +135,11 @@ GIN_EOF
     set +e
     if [ "$ENABLE_NSYS" = true ]; then
         eval ${EXTRA_ENVS} \
+        CUBLAS_NVTX_LEVEL=2 \
         nsys profile \
             -f true \
             -s none \
-            -t cuda,nvtx \
+            -t cuda,cublas-verbose,nvtx \
             -c cudaProfilerApi \
             --cpuctxsw none \
             --cuda-flush-interval 100 \

@@ -308,6 +308,7 @@ class BenchmarkDatasetArgs:
         contextual_feature_names (List[str]): **Required**. List of contextual feature names.
         action_feature_name (Optional[str]): Action feature name. Default: None.
         max_num_candidates (int): Maximum number of candidates. Default: 0.
+        num_generated_batches (int): Number of random batches to pre-generate. Default: 100.
     """
 
     feature_args: List[FeatureArgs]
@@ -316,6 +317,7 @@ class BenchmarkDatasetArgs:
     contextual_feature_names: List[str]
     action_feature_name: Optional[str] = None
     max_num_candidates: int = 0
+    num_generated_batches: int = 100
 
 
 @gin.configurable

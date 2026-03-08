@@ -128,6 +128,8 @@ export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export PYTHONWARNINGS="ignore"
 export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_MODULE_LOADING=EAGER
+export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 
 
 # Get Master address (first node)
@@ -202,11 +204,12 @@ echo "[Rank ${GLOBAL_RANK}] Starting nsys profile, output: ${NSYS_OUTPUT}.nsys-r
 # appear as device 0, but training code tries to use device 3).
 
 # Run nsys profile
+export CUBLAS_NVTX_LEVEL=2
 exec nsys profile \
     -o "${NSYS_OUTPUT}" \
     -f true \
     -s none \
-    -t cuda,nvtx \
+    -t cuda,cublas-verbose,nvtx \
     -c cudaProfilerApi \
     --cpuctxsw none \
     --cuda-flush-interval 100 \
