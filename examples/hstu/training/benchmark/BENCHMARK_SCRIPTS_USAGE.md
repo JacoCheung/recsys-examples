@@ -470,7 +470,7 @@ When `--nsys` is enabled, the following fixed parameters are used:
 | `-o` | `{output_path}` | Output file path (without extension) |
 | `-f true` | - | Force overwrite existing files |
 | `-s none` | - | No CPU sampling |
-| `-t cuda,nvtx` | - | Trace CUDA API and NVTX markers |
+| `-t cuda,cublas-verbose,nvtx` | - | Trace CUDA API, cuBLAS/cublasLt API (verbose), and NVTX markers |
 | `-c cudaProfilerApi` | - | Use CUDA Profiler API to control sampling scope |
 | `--cpuctxsw none` | - | No CPU context switch tracing |
 | `--cuda-flush-interval 100` | - | CUDA event flush interval 100ms |
