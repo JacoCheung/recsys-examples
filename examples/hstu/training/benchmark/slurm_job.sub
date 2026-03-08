@@ -206,7 +206,7 @@ exec nsys profile \
     -o "${NSYS_OUTPUT}" \
     -f true \
     -s none \
-    -t cuda,nvtx \
+    -t cuda,cublas,nvtx \
     -c cudaProfilerApi \
     --cpuctxsw none \
     --cuda-flush-interval 100 \

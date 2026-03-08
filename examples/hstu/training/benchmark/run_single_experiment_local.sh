@@ -336,7 +336,7 @@ if [ ${DRY_RUN} -eq 1 ]; then
         echo "    -o \"${NSYS_OUTPUT}\" \\"
         echo "    -f true \\"
         echo "    -s none \\"
-        echo "    -t cuda,nvtx \\"
+        echo "    -t cuda,cublas,nvtx \\"
         echo "    -c cudaProfilerApi \\"
         echo "    --cpuctxsw none \\"
         echo "    --cuda-flush-interval 100 \\"
@@ -397,7 +397,7 @@ if [ ${ENABLE_NSYS} -eq 1 ]; then
         -o "${NSYS_OUTPUT}" \
         -f true \
         -s none \
-        -t cuda,nvtx \
+        -t cuda,cublas,nvtx \
         -c cudaProfilerApi \
         --cpuctxsw none \
         --cuda-flush-interval 100 \
