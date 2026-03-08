@@ -317,6 +317,9 @@ echo ""
 # Environment variable setup (add HSTU_ROOT's parent directory to PYTHONPATH)
 export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_MODULE_LOADING=EAGER
+export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
+
 
 # Log file
 LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}_${TIMESTAMP}.log"
@@ -336,7 +339,7 @@ if [ ${DRY_RUN} -eq 1 ]; then
         echo "    -o \"${NSYS_OUTPUT}\" \\"
         echo "    -f true \\"
         echo "    -s none \\"
-        echo "    -t cuda,nvtx \\"
+        echo "    -t cuda,cublas-verbose,nvtx \\"
         echo "    -c cudaProfilerApi \\"
         echo "    --cpuctxsw none \\"
         echo "    --cuda-flush-interval 100 \\"
@@ -393,11 +396,12 @@ if [ ${ENABLE_NSYS} -eq 1 ]; then
     
     # Use nsys to wrap torchrun, nsys will trace all child processes
     # Parameters consistent with slurm_job.sub
+    CUBLAS_NVTX_LEVEL=2 \
     nsys profile \
         -o "${NSYS_OUTPUT}" \
         -f true \
         -s none \
-        -t cuda,nvtx \
+        -t cuda,cublas-verbose,nvtx \
         -c cudaProfilerApi \
         --cpuctxsw none \
         --cuda-flush-interval 100 \
