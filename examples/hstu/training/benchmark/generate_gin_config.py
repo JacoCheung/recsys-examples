@@ -56,10 +56,10 @@ TrainerArgs.seed = 1234
 TrainerArgs.pipeline_type = '{pipeline_type}'
 {balanced_shuffler_line}
 
-# Profiling
+# Profiling, we need iteration later than num_generated_batches to make sure jit-compiled kernels are cached
 TrainerArgs.profile = True
-TrainerArgs.profile_step_start = 50
-TrainerArgs.profile_step_end = 100
+TrainerArgs.profile_step_start = 150
+TrainerArgs.profile_step_end = 200
 
 # Checkpoint
 TrainerArgs.ckpt_save_dir = './checkpoints/generated_exp'
@@ -99,6 +99,7 @@ BenchmarkDatasetArgs.contextual_feature_names = [
 ]  # Total 3 contextual features
 BenchmarkDatasetArgs.action_feature_name = 'action'
 BenchmarkDatasetArgs.max_num_candidates = 0
+BenchmarkDatasetArgs.num_generated_batches = 100
 
 # ===== Embedding Configuration =====
 # Item embedding (main ID)
