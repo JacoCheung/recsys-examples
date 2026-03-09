@@ -593,9 +593,6 @@ class BaseTaskBalancedBatchShuffler:
                 rank,
                 batch.batch_size,
             )
-            # ``indices_this_rank`` (including padding) is passed as
-            # ``recv_ids``; the all2all exchange requires all
-            # ``local_batch_size`` entries to maintain symmetric counts.
             new_batch = self.shuffle_batch_by_global_indices_all2all(
                 batch,
                 indices_this_rank,
@@ -603,17 +600,10 @@ class BaseTaskBalancedBatchShuffler:
                 dst_rank=dst_rank,
                 recv_counts=recv_counts,
             )
-            # See comment in ``finish_shuffle`` — all2all output is in
-            # ascending global-index order, but ``indices_this_rank`` is
-            # real-first; reorder to match when padding exists.
             if has_padding and actual_bs < indices_this_rank.numel():
                 perm = indices_this_rank.sort().indices.argsort()
                 new_batch = new_batch.index_select(perm)
         else:
-            # ``indices_this_rank`` (including padding) is passed as
-            # ``recv_ids``; the allgather path selects all
-            # ``local_batch_size`` samples so that KJT lengths remain
-            # padded.  Dense padding is stripped below.
             new_batch = self.shuffle_batch_by_global_indices_allgather(
                 batch,
                 indices_this_rank,
@@ -624,8 +614,6 @@ class BaseTaskBalancedBatchShuffler:
 
         if has_padding and actual_bs < new_batch.batch_size:
             new_batch = _strip_dense_padding(new_batch, actual_bs)
-
-        new_batch._on_samples_redistributed()
 
         ret = new_batch
         if return_indices:
