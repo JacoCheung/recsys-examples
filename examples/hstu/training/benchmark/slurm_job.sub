@@ -128,6 +128,8 @@ export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export PYTHONWARNINGS="ignore"
 export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_MODULE_LOADING=EAGER
+export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 
 
 # Get Master address (first node)

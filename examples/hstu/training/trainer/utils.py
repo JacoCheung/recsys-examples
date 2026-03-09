@@ -155,7 +155,7 @@ def get_data_loader(
             contextual_feature_names=dataset_args.contextual_feature_names,
             action_feature_name=dataset_args.action_feature_name,
             max_num_candidates=dataset_args.max_num_candidates,
-            num_generated_batches=100,
+            num_generated_batches=dataset_args.num_generated_batches,
             num_tasks=num_tasks,
         )
         train_dataset = datasets.hstu_random_dataset.HSTURandomDataset(

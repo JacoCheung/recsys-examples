@@ -317,6 +317,9 @@ echo ""
 # Environment variable setup (add HSTU_ROOT's parent directory to PYTHONPATH)
 export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_MODULE_LOADING=EAGER
+export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
+
 
 # Log file
 LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}_${TIMESTAMP}.log"

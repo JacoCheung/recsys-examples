@@ -60,6 +60,8 @@ HSTU_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$HSTU_ROOT"
 PYTHONPATH="${PYTHONPATH:-}:$(realpath ../)"
 export PYTHONPATH
+export CUDA_MODULE_LOADING=EAGER
+export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
