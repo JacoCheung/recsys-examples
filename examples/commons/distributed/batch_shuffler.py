@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
+import torch.cuda.nvtx as nvtx
 from commons.ops.collective_ops import gather_along_first_dim
 from commons.perf_model.partitioner import karmarkar_karp
 from commons.sequence_batch.batch import BaseBatch
@@ -309,7 +310,9 @@ class BaseTaskBalancedBatchShuffler:
         )
 
         state = self._kk_states[handle]
+        nvtx.range_push("kk_future_wait")
         partitions_list: List[List[int]] = state["future"].result()
+        nvtx.range_pop()
         meta = state["meta"]
         # Clean up state after use
         del self._kk_states[handle]
@@ -403,8 +406,6 @@ class BaseTaskBalancedBatchShuffler:
 
         if has_padding and actual_bs < new_batch.batch_size:
             new_batch = _strip_dense_padding(new_batch, actual_bs)
-
-        new_batch._on_samples_redistributed()
 
         return new_batch
 
