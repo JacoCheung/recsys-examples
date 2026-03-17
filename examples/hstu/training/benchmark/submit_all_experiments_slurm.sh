@@ -93,6 +93,7 @@ EXP_FILE=""
 CUSTOM_RESULTS_DIR=""
 CUSTOM_HSTU_ROOT=""
 SCP_DEST=""
+GIT_BRANCH=""
 
 # ============================================================================
 # Help Information
@@ -221,6 +222,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --scp-dest)
             SCP_DEST="$2"
+            shift 2
+            ;;
+        --branch=*)
+            GIT_BRANCH="${1#*=}"
+            shift
+            ;;
+        --branch)
+            GIT_BRANCH="$2"
             shift 2
             ;;
         --help|-h)
@@ -353,7 +362,7 @@ NC='\033[0m' # No Color
 # ============================================================================
 # Capture Git Information
 # ============================================================================
-GIT_BRANCH=$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+GIT_BRANCH_REPO=$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 GIT_COMMIT_HASH=$(git -C "${PROJECT_ROOT}" log -1 --format="%H" 2>/dev/null || echo "unknown")
 GIT_COMMIT_SHORT=$(git -C "${PROJECT_ROOT}" log -1 --format="%h" 2>/dev/null || echo "unknown")
 GIT_COMMIT_DATE=$(git -C "${PROJECT_ROOT}" log -1 --format="%ai" 2>/dev/null || echo "unknown")
@@ -400,10 +409,13 @@ if [ ${DRY_RUN} -eq 1 ]; then
 fi
 
 echo -e "${BLUE}Git Information:${NC}"
-echo "  Branch:           ${GIT_BRANCH}"
+echo "  Branch (repo):    ${GIT_BRANCH_REPO}"
 echo "  Commit:           ${GIT_COMMIT_SHORT} (${GIT_COMMIT_DATE})"
 echo "  Message:          ${GIT_COMMIT_MSG}"
 echo "  Working tree:     ${GIT_STATUS}"
+if [ -n "$GIT_BRANCH" ]; then
+    echo -e "  ${YELLOW}Branch override:  ${GIT_BRANCH} (each job clones to isolated directory)${NC}"
+fi
 echo ""
 echo -e "${BLUE}Batch timestamp:   ${BATCH_TIMESTAMP}${NC}"
 echo -e "${BLUE}Output directory:  ${BATCH_OUTPUT_DIR}${NC}"
@@ -489,7 +501,11 @@ for i in "${!EXP_NAMES[@]}"; do
     fi
     
     # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
-    SBATCH_ARGS+=(--export="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}")
+    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
+    if [ -n "$GIT_BRANCH" ]; then
+        EXPORT_VARS+=",GIT_BRANCH=${GIT_BRANCH}"
+    fi
+    SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script
     SBATCH_ARGS+=("${SCRIPT_DIR}/slurm_job.sub")
@@ -532,7 +548,10 @@ if [ ${DRY_RUN} -eq 0 ]; then
         echo "Submitted at:    $(date)"
         echo ""
         echo "Git Information:"
-        echo "  Branch:           ${GIT_BRANCH}"
+        echo "  Branch (repo):    ${GIT_BRANCH_REPO}"
+        if [ -n "$GIT_BRANCH" ]; then
+            echo "  Branch override:  ${GIT_BRANCH}"
+        fi
         echo "  Commit:           ${GIT_COMMIT_HASH}"
         echo "  Commit (short):   ${GIT_COMMIT_SHORT}"
         echo "  Commit date:      ${GIT_COMMIT_DATE}"

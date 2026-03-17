@@ -28,6 +28,7 @@ NODES=2
 CONTAINER_IMAGE="gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_benchmark_e2e"
 MONITOR_POLL_INTERVAL=60  # seconds between polling the remote monitor log
 ENABLE_NSYS=true
+GIT_BRANCH=""
 
 usage() {
     cat <<'USAGE_EOF'
@@ -48,6 +49,7 @@ Options:
   --job-name=NAME            SLURM job name prefix    (default: coreai_devtech_all)
   --scp-dest=DEST            SCP destination          (default: see script)
   --poll-interval=SEC        Watcher poll interval    (default: 60)
+  --branch=BRANCH            Git branch to checkout (clones repo per job for isolation)
   --nsys / --no-nsys         Enable/disable nsys profiling (default: enabled)
   --dry-run                  Dry run mode (passed to remote script)
 
@@ -78,6 +80,7 @@ while [ $# -gt 0 ]; do
         --job-name=*)        JOB_NAME="${1#*=}" ;;
         --scp-dest=*)        SCP_DEST="${1#*=}" ;;
         --poll-interval=*)   MONITOR_POLL_INTERVAL="${1#*=}" ;;
+        --branch=*)          GIT_BRANCH="${1#*=}" ;;
         --nsys)              ENABLE_NSYS=true ;;
         --no-nsys)           ENABLE_NSYS=false ;;
         *)                   EXTRA_ARGS+=("$1") ;;
@@ -99,6 +102,9 @@ REMOTE_CMD+=" --wait-and-analyze"
 REMOTE_CMD+=" -y"
 if [ "${ENABLE_NSYS}" = true ]; then
     REMOTE_CMD+=" --nsys"
+fi
+if [ -n "${GIT_BRANCH}" ]; then
+    REMOTE_CMD+=" --branch=${GIT_BRANCH}"
 fi
 if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
     REMOTE_CMD+=" ${EXTRA_ARGS[*]}"

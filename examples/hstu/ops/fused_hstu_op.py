@@ -16,17 +16,7 @@
 from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
-try:
-    import hstu_attn_2_cuda as flash_attn_cuda_ampere
-except ImportError:
-    pass
-
-try:
-    import hstu_hopper_cuda as flash_attn_cuda_hopper
-except ImportError:
-    pass
-import warnings
-
+import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
 import nvtx
 import torch
 from commons.utils.attn_perf_tracker import PRINT_HSTU_PERF
@@ -149,20 +139,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.wgrad_event = wgrad_event
         ctx.recompute_input_layernorm = recompute_input_layernorm
         ctx.recompute_input_silu = recompute_input_silu
-        if ctx.attn_backend == KernelBackend.TRITON:
-            assert causal, "causal must be True when kernel backend is triton"
         saved_tensor_map = OrderedDict()
         if num_contextuals is None and attn_backend == KernelBackend.TRITON:
             num_contextuals = 0
         if attn_backend == KernelBackend.TRITON:
-            if not isinstance(num_contextuals, int):
-                assert torch.all(
-                    num_contextuals == num_contextuals[0]
-                ), "contextual features must have the same length"
-                warnings.warn(
-                    "make sure contextual features are fixed length, otherwise the attention kernel will not work correctly"
-                )
-                num_contextuals = num_contextuals[0].item()
+            assert isinstance(num_contextuals, int)
         assert input.dim() == 2, "input tensor must be 2D"
         assert linear_uvqk_bias.dim() == 1, "linear_uvqk_bias must be 1D"
 
@@ -275,13 +256,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 k=k,
                 v=v,
                 seq_offsets=seq_offsets,
+                causal=causal,
                 num_targets=num_targets,
                 max_attn_len=0,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
-                enable_tma=False
-                if torch.cuda.get_device_properties(0).major < 9
-                else True,
             ).reshape(-1, num_heads * attention_dim_per_head)
             return jagged_attn_output
 
@@ -298,18 +277,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             alpha,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
-            extension_args = ()
-            if sm_major_version == 8:
-                cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
-                ampere_paged_kv_args = (None, None, None, None, None)
-                extension_args = ampere_paged_kv_args
-            elif sm_major_version == 9:
-                cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
-                hopper_fp8_args = (-1, None, None, None, None, None, None, None, None)
-                extension_args = hopper_fp8_args
-
-            else:
-                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
             assert q.dim() == 3, "q shape should be (L, num_heads, head_dim)"
             assert k.dim() == 3, "k shape should be (L, num_heads, head_dim)"
             assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
@@ -320,25 +287,57 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             num_targets = (
                 num_targets.to(torch.int32) if num_targets is not None else None
             )
-            jagged_attn_output, _ = cutlass_hstu_varlen_fwd(
-                q,
-                k,
-                v,
-                seq_offsets_q,
-                seq_offsets_q,
-                max_seqlen_q,
-                max_seqlen_q,
-                scaling_seqlen,
-                num_contexts,
-                num_targets,
-                target_group_size,
-                -1,  # window_size_left
-                0,  # window_size_right
-                alpha,
-                None,  # rab
-                None,  # func
-                *extension_args,
-            )
+            if sm_major_version == 8:
+                jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
+                    q,
+                    k,
+                    v,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    scaling_seqlen,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    -1,
+                    0,
+                    alpha,
+                    None,
+                    None,  # rab, func
+                )
+            elif sm_major_version == 9:
+                assert q.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ), f"Hopper fwd expects bfloat16 or float16, got {q.dtype}"
+                output_dtype = 0 if q.dtype == torch.bfloat16 else 1
+                jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
+                    q,
+                    k,
+                    v,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    scaling_seqlen,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    -1,
+                    0,
+                    alpha,
+                    None,
+                    None,  # rab, func
+                    -1,
+                    output_dtype,  # quant_mode, output_dtype
+                )
+            else:
+                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
             # in case of padding
             P = jagged_attn_output[:, :, :linear_dim_per_head].reshape(
                 -1, num_heads * linear_dim_per_head
@@ -656,48 +655,56 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm_major_version = torch.cuda.get_device_properties(0).major
             assert dout.dim() == 3
             if sm_major_version == 8:
-                dq, dk, dv, _ = flash_attn_cuda_ampere.varlen_bwd(
+                dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_80(
                     dout,
                     q,
                     k,
                     v,
-                    dq,
-                    dk,
-                    dv,
                     seq_offsets_q,
                     seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
                     max_seqlen_q,
                     max_seqlen_q,
                     scaling_seqlen,
+                    dq,
+                    dk,
+                    dv,
                     num_contexts,
                     num_targets,
                     target_group_size,
                     window_size_left,
                     window_size_right,
                     alpha,
-                    None,  # rab_padded
-                    False,  # has_drab
-                    None,  # func
-                    False,  # deterministic
+                    None,
+                    False,
+                    None,
+                    False,  # rab, has_drab, func, deterministic
                 )
             elif sm_major_version == 9:
-                fp8_args = (None,) * 11
-                dq, dk, dv, _ = flash_attn_cuda_hopper.varlen_bwd(
+                assert dout.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ), f"Hopper bwd expects bfloat16 or float16, got {dout.dtype}"
+                output_dtype = 0 if dout.dtype == torch.bfloat16 else 1
+                dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_90(
                     dout,
-                    None,
+                    None,  # dout_t
                     q,
-                    None,
+                    None,  # q_t
                     k,
-                    None,
+                    None,  # k_t
                     v,
-                    dq,
-                    dk,
-                    dv,
                     seq_offsets_q,
                     seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
                     max_seqlen_q,
                     max_seqlen_q,
                     scaling_seqlen,
+                    dq,
+                    dk,
+                    dv,
                     num_contexts,
                     num_targets,
                     target_group_size,
@@ -705,10 +712,21 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     window_size_right,
                     alpha,
                     -1,  # quant_mode
-                    None,  # rab_padded
-                    False,  # has_drab
-                    None,  # func
-                    *fp8_args,
+                    None,
+                    False,
+                    None,  # rab, has_drab, func
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,  # fp8 descale: q/qt/k/kt/v/do/dot/cu_qt/cu_kt/cu_q_block/cu_kv_block
+                    output_dtype,
                     False,  # deterministic
                 )
             else:
@@ -747,11 +765,9 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 scaling_seqlen=scaling_seqlen,
                 alpha=alpha,
                 max_attn_len=0,
+                causal=causal,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
-                enable_tma=False
-                if torch.cuda.get_device_properties(0).major < 9
-                else True,
             )
             return dq, dk, dv
 
