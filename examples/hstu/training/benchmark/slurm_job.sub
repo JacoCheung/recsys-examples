@@ -36,6 +36,9 @@ CONTAINER_MOUNTS="/lustre:/lustre"
 #   EXP_OUTPUT_DIR  - Experiment output directory (required, passed by submit script)
 #   ENABLE_NSYS     - Whether to enable nsys profile (0/1, default 0)
 #   CONTAINER_IMAGE - Container image to use (optional, has default)
+#   GIT_BRANCH      - If set, clone repo to a job-specific directory and
+#                     checkout this branch before running. This enables
+#                     concurrent benchmarks on different branches.
 # ============================================================================
 
 set -e
@@ -46,6 +49,7 @@ EXP_NAME=${EXP_NAME:-"exp0_baseline"}
 GIN_OPTIONS=${GIN_OPTIONS:-""}
 EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR:-""}
 ENABLE_NSYS=${ENABLE_NSYS:-0}
+GIT_BRANCH=${GIT_BRANCH:-""}
 
 # Check HSTU_ROOT
 if [ -z "$HSTU_ROOT" ]; then
@@ -57,6 +61,40 @@ fi
 if [ -z "$EXP_OUTPUT_DIR" ]; then
     echo "❌ Error: EXP_OUTPUT_DIR environment variable not set"
     exit 1
+fi
+
+# ============================================================================
+# Branch isolation: clone repo to a job-specific directory
+# ============================================================================
+WORK_DIR=""
+if [ -n "$GIT_BRANCH" ]; then
+    ORIG_PROJECT_ROOT="$(cd "${HSTU_ROOT}/../.." && pwd)"
+    WORK_DIR="${ORIG_PROJECT_ROOT}-job${SLURM_JOB_ID}"
+
+    echo "📦 Cloning repo to job-specific directory..."
+    echo "   Source:  ${ORIG_PROJECT_ROOT}"
+    echo "   Target:  ${WORK_DIR}"
+    echo "   Branch:  ${GIT_BRANCH}"
+    echo ""
+
+    git clone --local --no-checkout "${ORIG_PROJECT_ROOT}" "${WORK_DIR}"
+    git -C "${WORK_DIR}" checkout "${GIT_BRANCH}"
+
+    # Also copy third_party submodules (git clone --local doesn't init them)
+    if [ -d "${ORIG_PROJECT_ROOT}/third_party/HierarchicalKV" ]; then
+        cp -a "${ORIG_PROJECT_ROOT}/third_party/HierarchicalKV" "${WORK_DIR}/third_party/" 2>/dev/null || true
+    fi
+
+    HSTU_ROOT="${WORK_DIR}/examples/hstu"
+    echo "✅ Working copy ready: $(git -C "${WORK_DIR}" log --oneline -1)"
+    echo "   HSTU_ROOT updated to: ${HSTU_ROOT}"
+    echo ""
+
+    cleanup_workdir() {
+        echo "🧹 Cleaning up job-specific work directory: ${WORK_DIR}"
+        rm -rf "${WORK_DIR}"
+    }
+    trap cleanup_workdir EXIT
 fi
 
 # Change to examples/hstu directory
