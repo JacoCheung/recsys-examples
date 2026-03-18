@@ -50,6 +50,7 @@ GIN_OPTIONS=${GIN_OPTIONS:-""}
 EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR:-""}
 ENABLE_NSYS=${ENABLE_NSYS:-0}
 GIT_BRANCH=${GIT_BRANCH:-""}
+CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-""}
 
 # Check HSTU_ROOT
 if [ -z "$HSTU_ROOT" ]; then
@@ -169,6 +170,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export CUDA_MODULE_LOADING=EAGER
 export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 
+# Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
+LAUNCH_BLOCKING_ENV=""
+if [ -n "$CUDA_LAUNCH_BLOCKING" ]; then
+    LAUNCH_BLOCKING_ENV="export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING} && "
+    echo "⚠️  CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING} (debug mode)"
+fi
+
 
 # Get Master address (first node)
 MASTER_ADDR=$(scontrol show hostnames ${SLURM_JOB_NODELIST} | head -n 1)
@@ -268,6 +276,7 @@ WRAPPER_EOF
             export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
             export PYTHONUNBUFFERED=1 && \
             export DISABLE_RICH=1 && \
+            ${LAUNCH_BLOCKING_ENV} \
             ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
             python -u ${TRAIN_CMD}
         " 2>&1 | tee -a ${LOG_FILE}
@@ -292,7 +301,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && python -u ${TRAIN_CMD}" \
+        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}

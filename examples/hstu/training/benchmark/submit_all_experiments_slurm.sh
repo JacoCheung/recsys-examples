@@ -48,7 +48,7 @@
 #       ├── summary.txt              # Batch experiment summary
 #       ├── comparison.png           # Performance comparison chart (if --wait-and-analyze)
 #       ├── monitor.log              # Job monitor log (if --wait-and-analyze)
-#       └── monitor.pid              # Monitor process ID (if --wait-and-analyze)
+#       └── ...
 #   └── {batch_timestamp}.tar.gz     # Archive of all results (if --wait-and-analyze)
 # 
 # Examples:
@@ -628,8 +628,7 @@ else
     if [ ${WAIT_AND_ANALYZE} -eq 1 ]; then
         echo "  ├── summary.txt"
         echo "  ├── comparison.png         (auto-generated after all jobs complete)"
-        echo "  ├── monitor.log            (job monitor log)"
-        echo "  └── monitor.pid            (monitor process ID)"
+        echo "  └── monitor.log            (job monitor log)"
         echo ""
         echo "  📦 Archive (in parent dir):"
         echo "  └── ${BATCH_TIMESTAMP}.tar.gz  (created after analysis)"
@@ -690,6 +689,7 @@ POLL_INTERVAL="$3"
 ANALYZE_SCRIPT="$4"
 MONITOR_LOG="$5"
 SCP_DEST="$6"
+SUMMARY_FILE="${BATCH_OUTPUT_DIR}/summary.txt"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${MONITOR_LOG}"
@@ -778,27 +778,31 @@ if [ -f "${ANALYZE_SCRIPT}" ]; then
     log "Analyzing results in: ${BATCH_OUTPUT_DIR}"
     log "Plot will be saved to: ${PLOT_OUTPUT}"
     
+    {
+        echo ""
+        echo "================================================================================"
+        echo "Performance Analysis Results"
+        echo "================================================================================"
+        echo ""
+    } >> "${SUMMARY_FILE}"
+
     python3 "${ANALYZE_SCRIPT}" "${BATCH_OUTPUT_DIR}" \
         --output "${PLOT_OUTPUT}" \
         --title "HSTU Benchmark Results - $(basename ${BATCH_OUTPUT_DIR})" \
-        2>&1 | tee -a "${MONITOR_LOG}"
+        2>&1 | tee -a "${SUMMARY_FILE}"
     
     # Use PIPESTATUS to get the exit code of python3, not tee
     ANALYZE_EXIT_CODE=${PIPESTATUS[0]}
     
     if [ ${ANALYZE_EXIT_CODE} -eq 0 ]; then
-        log ""
-        log "✅ Analysis complete!"
+        {
+            echo ""
+            echo "Plot: ${PLOT_OUTPUT}"
+            echo "================================================================================"
+        } >> "${SUMMARY_FILE}"
+
+        log "✅ Analysis complete! Results saved to: ${SUMMARY_FILE}"
         log "   Plot saved to: ${PLOT_OUTPUT}"
-        log "   Results directory: ${BATCH_OUTPUT_DIR}"
-        
-        log ""
-        log "=================================================="
-        log "HSTU Benchmark Analysis Complete!"
-        log "=================================================="
-        log "Results: ${BATCH_OUTPUT_DIR}"
-        log "Plot:    ${PLOT_OUTPUT}"
-        log "=================================================="
     else
         log ""
         log "❌ Analysis failed. Check logs for details."
@@ -880,8 +884,6 @@ MONITOR_EOF
         echo "  kill ${MONITOR_PID}"
         echo ""
         
-        # Save monitor PID to file for reference
-        echo "${MONITOR_PID}" > "${BATCH_OUTPUT_DIR}/monitor.pid"
     fi
 fi
 
