@@ -414,7 +414,7 @@ echo "  Commit:           ${GIT_COMMIT_SHORT} (${GIT_COMMIT_DATE})"
 echo "  Message:          ${GIT_COMMIT_MSG}"
 echo "  Working tree:     ${GIT_STATUS}"
 if [ -n "$GIT_BRANCH" ]; then
-    echo -e "  ${YELLOW}Branch override:  ${GIT_BRANCH} (each job clones to isolated directory)${NC}"
+    echo -e "  ${YELLOW}Branch override:  ${GIT_BRANCH} (running from branch-specific clone)${NC}"
 fi
 echo ""
 echo -e "${BLUE}Batch timestamp:   ${BATCH_TIMESTAMP}${NC}"
@@ -502,9 +502,6 @@ for i in "${!EXP_NAMES[@]}"; do
     
     # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
     EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
-    if [ -n "$GIT_BRANCH" ]; then
-        EXPORT_VARS+=",GIT_BRANCH=${GIT_BRANCH}"
-    fi
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script
