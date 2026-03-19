@@ -17,13 +17,11 @@
 
 exp0_baseline,
 exp1_cutlass,--kernel_backend cutlass
-exp2_recompute,--kernel_backend cutlass --recompute_layernorm
-exp3a_no_shuffler_no_pipeline,--kernel_backend cutlass --recompute_layernorm
-exp3b_shuffler_no_pipeline,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler
-exp3c_no_shuffler_pipeline,--kernel_backend cutlass --recompute_layernorm --pipeline_type prefetch
-exp3d_shuffler_pipeline,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --pipeline_type prefetch
-exp4_dynamicemb_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
-exp5_lfu,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu
-exp6_pipeline,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch
-exp7_tp,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
-exp8_full,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching --evict lfu --pipeline_type prefetch --tp_size 2
+exp2_caching,--kernel_backend cutlass --caching
+exp3_recompute,--kernel_backend cutlass --caching --recompute_layernorm
+exp4a_shuffler_no_pipeline,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler
+exp4b_no_shuffler_pipeline,--kernel_backend cutlass --caching --recompute_layernorm --pipeline_type prefetch
+exp4c_shuffler_pipeline,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler --pipeline_type prefetch
+exp5_lfu,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler --evict lfu
+exp6_pipeline,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler --evict lfu --pipeline_type prefetch
+exp7_tp,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler --evict lfu --pipeline_type prefetch --tp_size 2
