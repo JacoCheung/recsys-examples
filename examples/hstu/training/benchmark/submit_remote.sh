@@ -91,7 +91,27 @@ done
 # ============================================================================
 # Build the remote command
 # ============================================================================
-REMOTE_CMD="cd ${REMOTE_HSTU_ROOT} && bash training/benchmark/submit_all_experiments_slurm.sh"
+if [ -n "${GIT_BRANCH}" ]; then
+    # With --branch: clone repo to isolated directory, run submit from there.
+    # This ensures experiments.txt and all scripts come from the target branch.
+    REMOTE_REPO_ROOT="${REMOTE_HSTU_ROOT%/examples/hstu}"
+    BRANCH_SAFE=$(echo "${GIT_BRANCH}" | tr '/' '-')
+    CLONE_DIR="${REMOTE_REPO_ROOT}-runs/${BRANCH_SAFE}"
+
+    REMOTE_CMD="set -e"
+    REMOTE_CMD+=" && echo '📦 Cloning branch ${GIT_BRANCH} to ${CLONE_DIR}...'"
+    REMOTE_CMD+=" && rm -rf ${CLONE_DIR}"
+    REMOTE_CMD+=" && git clone -b ${GIT_BRANCH} --local ${REMOTE_REPO_ROOT} ${CLONE_DIR}"
+    REMOTE_CMD+=" && { [ -d ${REMOTE_REPO_ROOT}/third_party/HierarchicalKV ] && cp -a ${REMOTE_REPO_ROOT}/third_party/HierarchicalKV ${CLONE_DIR}/third_party/ || true; }"
+    REMOTE_CMD+=" && echo '✅ Clone ready: '\$(git -C ${CLONE_DIR} log --oneline -1)"
+    REMOTE_CMD+=" && cd ${CLONE_DIR}/examples/hstu"
+    REMOTE_CMD+=" && bash training/benchmark/submit_all_experiments_slurm.sh"
+else
+    # Without --branch: run directly from the remote working directory.
+    REMOTE_CMD="cd ${REMOTE_HSTU_ROOT} && bash training/benchmark/submit_all_experiments_slurm.sh"
+fi
+
+# Common options
 REMOTE_CMD+=" --scp-dest=${SCP_DEST}"
 REMOTE_CMD+=" --account=${ACCOUNT}"
 REMOTE_CMD+=" --job-name=${JOB_NAME}"
@@ -169,6 +189,15 @@ WATCHER_LOG="/tmp/hstu_benchmark_watcher_$$.log"
             echo "--- Last 20 lines of monitor log ---"
             ssh "${LOGIN_HOST}" "tail -20 '${MONITOR_LOG}'" 2>/dev/null || true
             echo "--- End of monitor log ---"
+
+            # ============================================================
+            # Clean up remote clone directory (created by --branch)
+            # ============================================================
+            if [ -n "${CLONE_DIR}" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🧹 Cleaning up remote clone: ${CLONE_DIR}"
+                ssh "${LOGIN_HOST}" "rm -rf '${CLONE_DIR}'" 2>/dev/null || true
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Clone directory cleaned up"
+            fi
 
             # ============================================================
             # Desktop notification (try multiple methods)
