@@ -254,7 +254,7 @@ Examples:
     parser.add_argument(
         "--pipeline_type",
         type=str,
-        choices=["none", "prefetch"],
+        choices=["none", "prefetch", "sw_serial"],
         default="none",
         help="Pipeline type (default: none)",
     )
