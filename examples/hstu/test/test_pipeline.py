@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from commons.distributed.finalize_model_grads import finalize_model_grads
+from commons.pipeline.sw_train_pipeline import SWSerialTrainPipeline
 from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
@@ -129,5 +130,103 @@ def test_pipeline(
             f"reporting loss mismatch",
         )
         collective_assert(torch.allclose(pipelined_logits, logits), f"logits mismatch")
+
+    init.destroy_global_state()
+
+
+@pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"], []])
+@pytest.mark.parametrize("max_num_candidates", [10, 0])
+@pytest.mark.parametrize(
+    "optimizer_type_str", ["sgd"]
+)  # adam does not work since torchrec does not save the optimizer state `step`.
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("use_dynamic_emb", [True, False])
+def test_sw_serial_pipeline(
+    contextual_feature_names: List[str],
+    max_num_candidates: int,
+    optimizer_type_str: str,
+    dtype: torch.dtype,
+    use_dynamic_emb: bool,
+):
+    """Verify SWSerialTrainPipeline is numerically equivalent to
+    JaggedMegatronTrainNonePipeline (the non-pipelined baseline)."""
+    init.initialize_distributed()
+    init.initialize_model_parallel(1)
+
+    model, dense_optimizer, history_batches = create_model(
+        task_type="ranking",
+        contextual_feature_names=contextual_feature_names,
+        max_num_candidates=max_num_candidates,
+        optimizer_type_str=optimizer_type_str,
+        use_dynamic_emb=use_dynamic_emb,
+        pipeline_type="none",
+        dtype=dtype,
+        seed=1234,
+    )
+    sw_model, sw_dense_optimizer, _ = create_model(
+        task_type="ranking",
+        contextual_feature_names=contextual_feature_names,
+        max_num_candidates=max_num_candidates,
+        optimizer_type_str=optimizer_type_str,
+        use_dynamic_emb=use_dynamic_emb,
+        pipeline_type="none",
+        dtype=dtype,
+        seed=1234,
+    )
+
+    for batch in history_batches:
+        model.module.zero_grad_buffer()
+        dense_optimizer.zero_grad()
+        loss, _ = model(batch)
+        collective_assert(not torch.isnan(loss).any(), f"loss has nan")
+        loss.sum().backward()
+        finalize_model_grads([model.module], None)
+        dense_optimizer.step()
+
+    save_path = "./gr_checkpoint_sw"
+    if dist.get_rank() == 0:
+        if os.path.exists(save_path):
+            shutil.rmtree(save_path)
+    dist.barrier(device_ids=[torch.cuda.current_device()])
+
+    if dist.get_rank() == 0:
+        os.makedirs(save_path, exist_ok=True)
+    dist.barrier(device_ids=[torch.cuda.current_device()])
+    checkpoint.save(save_path, model, dense_optimizer=dense_optimizer)
+    checkpoint.load(save_path, sw_model, dense_optimizer=sw_dense_optimizer)
+    dist.barrier(device_ids=[torch.cuda.current_device()])
+    if dist.get_rank() == 0:
+        shutil.rmtree(save_path)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    no_pipeline = JaggedMegatronTrainNonePipeline(
+        model,
+        dense_optimizer,
+        device=device,
+    )
+    sw_pipeline = SWSerialTrainPipeline(
+        sw_model,
+        sw_dense_optimizer,
+        device=device,
+    )
+
+    no_pipeline_batches = iter(history_batches)
+    sw_pipeline_batches = iter(history_batches)
+    for i, batch in enumerate(history_batches):
+        reporting_loss, (_, logits, _, _) = no_pipeline.progress(no_pipeline_batches)
+        sw_reporting_loss, (
+            _,
+            sw_logits,
+            _,
+            _,
+        ) = sw_pipeline.progress(sw_pipeline_batches)
+        collective_assert(
+            torch.allclose(sw_reporting_loss, reporting_loss),
+            f"reporting loss mismatch at iter {i}",
+        )
+        collective_assert(
+            torch.allclose(sw_logits, logits),
+            f"logits mismatch at iter {i}",
+        )
 
     init.destroy_global_state()

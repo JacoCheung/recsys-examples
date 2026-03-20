@@ -20,6 +20,7 @@ import commons.checkpoint as checkpoint
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from commons.checkpoint import get_unwrapped_module
+from commons.pipeline.sw_train_pipeline import SWSerialTrainPipeline
 from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
@@ -40,6 +41,7 @@ def evaluate(
         JaggedMegatronPrefetchTrainPipelineSparseDist,
         JaggedMegatronTrainNonePipeline,
         JaggedMegatronTrainPipelineSparseDist,
+        SWSerialTrainPipeline,
     ],
     stateful_metric_module: torch.nn.Module,
     trainer_args: TrainerArgs,
@@ -134,6 +136,7 @@ def train_with_pipeline(
         JaggedMegatronPrefetchTrainPipelineSparseDist,
         JaggedMegatronTrainNonePipeline,
         JaggedMegatronTrainPipelineSparseDist,
+        SWSerialTrainPipeline,
     ],
     stateful_metric_module: torch.nn.Module,
     trainer_args: TrainerArgs,

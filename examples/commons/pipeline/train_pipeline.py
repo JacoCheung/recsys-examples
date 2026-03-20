@@ -24,6 +24,7 @@
 import abc
 import logging
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import (
     Any,
     Callable,
@@ -53,7 +54,6 @@ from commons.pipeline.utils import (
     PrefetchTrainPipelineContext,
     TrainPipelineContext,
     _override_input_dist_forwards,
-    _pipeline_detach_model,
     _prefetch_embeddings,
     _rewrite_model,
     _start_data_dist,
@@ -193,31 +193,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._batch_ip2: Optional[In] = None
         self._context: TrainPipelineContext = context_type(version=0)
 
-    def detach(self) -> torch.nn.Module:
-        """
-        Detaches the model from sparse data dist (SDD) pipeline. A user might want to get
-        the original model back after training. The original model.forward was previously
-        modified by the train pipeline. for more please see:
-        https://github.com/pytorch/torchrec/pull/2076
-
-        To use the pipeline after detaching the model, pipeline.attach(model)
-        needs to be called.
-        Inflight batches are kept so pipeline.progress(data_iter) can be resumed normally.
-
-        Returns the original model.
-        """
-        if self._pipelined_modules:
-            _pipeline_detach_model(
-                model=self._model,
-                pipelined_modules=self._pipelined_modules,
-                original_forwards=self._original_forwards,
-                original_kjt_dist_forwards=self._original_kjt_dist_forwards,
-                pipelined_postprocs=self._pipelined_postprocs,
-            )
-
-        self._model_attached = False
-        return self._model
-
     def attach(
         self, model: Optional[torch.nn.Module] = None, sparse_dist: bool = True
     ) -> None:
@@ -325,10 +300,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
     def _wait_for_batch(self) -> None:
         with record_function("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self.batches[0]), self._data_dist_stream)
-
-    def _backward(self, losses: torch.Tensor) -> None:
-        with record_function("## backward ##"):
-            torch.sum(losses, dim=0).backward()
 
     def _create_context(self) -> TrainPipelineContext:
         context = self._context_type(index=self._next_index, version=1)
@@ -500,29 +471,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                     for name, request in zip(names, awaitable.wait()):
                         self._context.input_dist_tensors_requests[name] = request
 
-    def _fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
-        """
-        DEPRECATED: exists for backward compatibility
-        """
-        # pipeline is already filled
-        if self._batch_i and self._batch_ip1:
-            return
-        # executes last batch in pipeline
-        if self._batch_i and self._execute_all_batches:
-            return
-
-        # batch 1
-        self._batch_i = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
-        if self._batch_i is None:
-            raise StopIteration
-
-        self._init_pipelined_modules(self._batch_i, self._context)
-        self._start_sparse_data_dist(self._batch_i)
-        self._wait_sparse_data_dist()
-
-        # batch 2
-        self._batch_ip1 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
-
 
 class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     """
@@ -618,41 +566,6 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         # batch 2
         self._batch_ip1 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
         self._start_sparse_data_dist(self._batch_ip1)
-
-    def progress(self, dataloader_iter: Iterator[In]) -> Out:
-        self._fill_pipeline(dataloader_iter)
-
-        if self._model.training:
-            with record_function("## zero_grad ##"):
-                self._optimizer.zero_grad()
-
-        with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
-
-        self._batch_ip2 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
-
-        self._wait_sparse_data_dist()
-        # forward
-        with record_function("## forward ##"):
-            losses, output = self._model_fwd(self._batch_i)
-
-        self._prefetch(self._batch_ip1)
-
-        if self._model.training:
-            # backward
-            with record_function("## backward ##"):
-                torch.sum(losses, dim=0).backward()
-
-            # update
-            with record_function("## optimizer ##"):
-                self._optimizer.step()
-
-        self._start_sparse_data_dist(self._batch_ip2)
-
-        self._batch_i = self._batch_ip1
-        self._batch_ip1 = self._batch_ip2
-
-        return output
 
     def _prefetch(self, batch: Optional[In]) -> None:
         """
@@ -892,6 +805,41 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         self._is_identity_shuffler = isinstance(
             batch_shuffler, IdentityBalancedBatchShuffler
         )
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
+        self._prefetch_future: Optional[Future] = None
+
+    def _start_prefetch_async(self, batch: Optional[In]) -> None:
+        """Submit prefetch to a background thread.
+
+        DynamicEmb's per-key counter keeps in-flight keys pinned in cache,
+        so prefetch for batch_{i+1} cannot evict slots still used by
+        forward/backward of batch_i.  No GPU-level event sync is needed
+        between forward and prefetch.
+        CPU ordering is sufficient: this method is called after forward
+        returns, so module_input_post_prefetch has already been consumed.
+        """
+        if batch is None:
+            self._prefetch_future = None
+            return
+
+        def _run() -> None:
+            with nvtx.annotate("## prefetch ##"):
+                self._prefetch(batch)
+
+        self._prefetch_future = self._prefetch_executor.submit(_run)
+
+    def _wait_prefetch_async(self, batch: Optional[In] = None) -> None:
+        """Block until the background prefetch completes (CPU + GPU).
+
+        Also marks *batch* as used on the current stream so the caching
+        allocator does not reclaim its memory prematurely (same role as
+        ``_wait_for_batch``).
+        """
+        if self._prefetch_future is not None:
+            self._prefetch_future.result()
+            self._prefetch_future = None
+        if batch is not None:
+            _wait_for_batch(cast(In, batch), self._prefetch_stream)
 
     def progress(self, dataloader_iter: Iterator[In]) -> Tuple[torch.Tensor, Out]:
         """Prefetch pipeline with 2-phase async KK.
@@ -915,8 +863,8 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
                     self._model.module.zero_grad_buffer()
                 self._optimizer.zero_grad()
 
-        with nvtx.annotate("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
+        with nvtx.annotate("## wait_prefetch_async ##"):
+            self._wait_prefetch_async(self._batch_i)
 
         # ---- H2D for next batch (on _memcpy_stream, no NCCL) ----
         with nvtx.annotate("## copy_batch_to_gpu ##"):
@@ -944,6 +892,9 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         reporting_loss = None
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self._batch_i)
+
+        with nvtx.annotate("## prefetch (async submit) ##"):
+            self._start_prefetch_async(self._batch_ip1)
 
         # ---- Shuffle Phase 2 (on _memcpy_stream): wait KK + AllGather batch + index_select ----
         with nvtx.annotate("## finish_shuffle ##"):
@@ -987,14 +938,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             torch.distributed.all_reduce(
                 reporting_loss, group=parallel_state.get_data_parallel_group()
             )
-        with nvtx.annotate("## prefetch ##"):
-            self._prefetch(self._batch_ip1)
         if self._model.training:
-            # prefetch => Load to cache & might invalidate cache & flush to host
-            # bwd => read & write to cache/host
-            # the cache might be in a dangling state that a key is either not in cache or not in host.
-            # thererfore we enforce a sync: prefetch should be finished to avoid race condition.
-            torch.cuda.current_stream().wait_stream(self._prefetch_stream)
             # backward
             with nvtx.annotate("## backward ##"):
                 dp_size = parallel_state.get_data_parallel_world_size()
@@ -1014,6 +958,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
                 self._optimizer.step()
 
         with nvtx.annotate("## input_dist ##"):
+            # will wait the _memcpy_stream to complete before starting input_dist
             self._start_sparse_data_dist(self._batch_ip2)
 
         self._batch_i = self._batch_ip1

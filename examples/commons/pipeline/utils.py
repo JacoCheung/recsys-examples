@@ -25,7 +25,6 @@ import copy
 import itertools
 import logging
 from collections import OrderedDict, defaultdict
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import (
@@ -47,7 +46,6 @@ from typing import (
 
 import torch
 from torch import distributed as dist
-from torchrec.distributed.types import LazyAwaitable
 
 if not torch._running_with_deploy():
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule as FSDP2
@@ -73,7 +71,7 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
-from torchrec.distributed.types import Awaitable, LazyNoWait
+from torchrec.distributed.types import Awaitable
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
 
@@ -144,22 +142,6 @@ class PrefetchTrainPipelineContext(TrainPipelineContext):
 
 
 @dataclass
-class EmbeddingTrainPipelineContext(TrainPipelineContext):
-    embedding_a2a_requests: Dict[
-        str,
-        Union[
-            LazyAwaitable[Multistreamable],
-            # ManagedCollisionEC/EBC returns tuple of awaitables
-            Tuple[
-                LazyAwaitable[KeyedTensor], LazyAwaitable[Optional[KeyedJaggedTensor]]
-            ],
-        ],
-    ] = field(default_factory=dict)
-    embedding_tensors: List[List[torch.Tensor]] = field(default_factory=list)
-    embedding_features: List[List[Union[str, List[str]]]] = field(default_factory=list)
-    detached_embedding_tensors: List[List[torch.Tensor]] = field(default_factory=list)
-
-
 @dataclass
 class ArgInfo:
     """
@@ -555,91 +537,6 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
         return self._module.compute_and_output_dist(ctx, data)
 
 
-class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
-    """
-    This pipeline is used in TrainPipelineSemiSync
-    """
-
-    def __call__(
-        self,
-        # pyre-ignore
-        *input,
-        # pyre-ignore
-        **kwargs,
-    ) -> Union[
-        Awaitable[EmbeddingModuleRetType],
-        Tuple[
-            Awaitable[EmbeddingModuleRetType], Awaitable[Optional[KeyedJaggedTensor]]
-        ],
-    ]:
-        assert (
-            self._name in self._context.embedding_a2a_requests
-        ), "Invalid EmbeddingPipelinedForward usage, please do not directly call model.forward()"
-
-        ctx = self._context.module_contexts.pop(self._name)
-        cur_stream = torch.get_device_module(self._device).current_stream()
-
-        if self._stream is not None:
-            torch.get_device_module(self._device).current_stream().wait_stream(
-                self._stream
-            )
-            ctx.record_stream(cur_stream)
-        awaitable = self._context.embedding_a2a_requests.pop(self._name)
-        # in case of MC modules
-        is_mc_module: bool = isinstance(awaitable, Iterable)
-        remapped_kjts: Optional[KeyedJaggedTensor] = None
-
-        if is_mc_module:
-            embeddings = awaitable[0].wait()
-            remapped_kjts = awaitable[1].wait()
-        else:
-            assert isinstance(awaitable, Awaitable)
-            embeddings = (
-                awaitable.wait()
-            )  # trigger awaitable manually for type checking
-        tensors = []
-        detached_tensors = []
-        # in case of EC, embeddings are Dict[str, JaggedTensor]
-        if isinstance(embeddings, Dict):
-            for jt in embeddings.values():
-                assert isinstance(jt, JaggedTensor)
-                tensor = jt.values()
-                detached_tensor = tensor.detach().requires_grad_()
-                detached_tensor.retain_grad()
-                jt._values = detached_tensor
-                tensors.append(tensor)
-                detached_tensors.append(detached_tensor)
-            self._context.embedding_tensors.append(tensors)
-            self._context.embedding_features.append(list(embeddings.keys()))
-            self._context.detached_embedding_tensors.append(detached_tensors)
-        else:
-            # in case of EBC, embeddings are KeyedTensor
-            assert isinstance(embeddings, KeyedTensor)
-            embeddings.record_stream(cur_stream)
-            tensor = embeddings.values()
-            detached_tensor = tensor.detach().requires_grad_()
-            detached_tensor.retain_grad()
-            embeddings._values = detached_tensor
-            tensors.append(tensor)
-            detached_tensors.append(detached_tensor)
-            self._context.embedding_tensors.append(tensors)
-            """
-            KeyedTensor is returned by EmbeddingBagCollections and its variants
-            KeyedTensor holds dense data from multiple features and .values()
-            returns a single concatenated dense tensor. To ensure that
-            context.embedding_tensors[i] has the same length as
-            context.embedding_features[i], we pass in a list with a single item:
-            a list containing all the embedding feature names.
-            """
-            self._context.embedding_features.append([list(embeddings.keys())])
-            self._context.detached_embedding_tensors.append(detached_tensors)
-
-        if is_mc_module:
-            return (LazyNoWait(embeddings), LazyNoWait(remapped_kjts))
-        else:
-            return LazyNoWait(embeddings)
-
-
 class PrefetchPipelinedForward(BaseForward[PrefetchTrainPipelineContext]):
     """
     This pipeline is used in PrefetchTrainPipelineSparseDist
@@ -795,25 +692,6 @@ def _wait_for_batch(batch: In, stream: Optional[torch.Stream]) -> None:
     batch.record_stream(cur_stream)
 
 
-def _wait_for_events(
-    batch: In,
-    context: TrainPipelineContext,
-    stream: Optional[torch.Stream],
-) -> None:
-    """
-    Wait for any outstanding events for a given context
-    """
-
-    for event in context.events:
-        event.wait()
-    context.events.clear()
-    if stream:
-        assert isinstance(
-            batch, (torch.Tensor, Multistreamable)
-        ), f"{type(batch)} must implement Multistreamable interface"
-        batch.record_stream(stream)
-
-
 def _start_data_dist(
     pipelined_modules: List[ShardedModule],
     batch: Pipelineable,
@@ -831,7 +709,6 @@ def _start_data_dist(
             (
                 PipelinedForward,
                 PrefetchPipelinedForward,
-                EmbeddingPipelinedForward,
             ),
         )
 
@@ -852,25 +729,6 @@ def _start_data_dist(
             module_ctx, *args, **kwargs
         )
     _fuse_input_dist_splits(context)
-
-
-def _start_embedding_lookup(
-    module: ShardedModule,
-    context: EmbeddingTrainPipelineContext,
-    source_stream: Optional[torch.Stream],
-    target_stream: Optional[torch.Stream],
-    # pyre-ignore[2]
-    stream_context: Callable[..., AbstractContextManager[Any, Any]],
-) -> None:
-    module_context = context.module_contexts[module.forward.name]
-    with stream_context(source_stream):
-        kjt = context.input_dist_tensors_requests[module.forward.name].wait()
-
-    if target_stream is not None:
-        kjt.record_stream(target_stream)
-        module_context.record_stream(target_stream)
-    output_dist_out = module.compute_and_output_dist(module_context, kjt)
-    context.embedding_a2a_requests[module.forward.name] = output_dist_out
 
 
 def _fuse_input_dist_splits(context: TrainPipelineContext) -> None:
@@ -1393,47 +1251,6 @@ def _jit_modules(module: torch.nn.Module, path: str, optional: bool = True) -> b
                         )
 
     return len(sharded_children) > 0
-
-
-def _pipeline_detach_model(
-    model: torch.nn.Module,
-    pipelined_modules: List[ShardedModule],
-    # pyre-ignore[2]
-    original_forwards: List[Callable[..., Any]],
-    original_kjt_dist_forwards: List[
-        Callable[[KeyedJaggedTensor], Awaitable[KJTAllToAllTensorsAwaitable]]
-    ],
-    pipelined_postprocs: List[PipelinedPostproc],
-) -> None:
-    # Replace pipelined module forward and input dist forward with original forward
-    kjt_dists = []
-    for mod, original_fwd in zip(pipelined_modules, original_forwards):
-        # pyre-ignore
-        mod.forward = original_fwd
-
-        for _, child_module in mod.named_modules():
-            if not hasattr(child_module, "_input_dists"):
-                continue
-            for input_dist in child_module._input_dists:
-                if hasattr(input_dist, "_dist"):
-                    kjt_dists.append(input_dist._dist)
-    assert len(kjt_dists) == len(
-        original_kjt_dist_forwards
-    ), f"Number of KJT dists ({len(kjt_dists)}) does not match number of kjt dist forwards provided ({len(original_kjt_dist_forwards)})"
-
-    for kjt_dist, original_kjt_dist_fwd in zip(
-        kjt_dists,
-        original_kjt_dist_forwards,
-    ):
-        kjt_dist.forward = original_kjt_dist_fwd
-
-    # Get underlying nn.Module
-    if isinstance(model, DistributedModelParallel):
-        model = model.module
-
-    # Replace pipelined postproc modules with original postproc modules
-    for postproc_mod in pipelined_postprocs:
-        setattr(model, postproc_mod.fqn, postproc_mod.postproc_module)
 
 
 # pyre-ignore[3]

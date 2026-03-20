@@ -45,7 +45,8 @@ class TrainerArgs:
         ckpt_save_dir (str): Checkpoint save directory. Default: "./checkpoints".
         ckpt_load_dir (str): Checkpoint load directory. Default: "".
         pipeline_type (str): Pipeline overlap type: 'none' (no overlap), 'native'
-            (overlap h2d, input dist, fwd+bwd), 'prefetch' (includes prefetch overlap).
+            (overlap h2d, input dist, fwd+bwd), 'prefetch' (includes prefetch overlap),
+            'sw_serial' (SWPipeline serial baseline, single thread, single stream).
             Default: "native".
     """
 
@@ -73,7 +74,8 @@ class TrainerArgs:
     # - none -> no overlap
     # - native -> overlap [h2d, input dist, fwd+bwd]
     # - prefetch -> overlap [h2d, input dist, prefetch, fwd+bwd]
-    pipeline_type: str = "native"  # none, native, prefetch
+    # - sw -> SWPipeline-based scheduling (overlap h2d with fwd+bwd)
+    pipeline_type: str = "native"  # none, native, prefetch, sw
 
     # batch shuffler control
     # - True -> use balanced batch shuffler (e.g., HASTUBalancedBatchShuffler)

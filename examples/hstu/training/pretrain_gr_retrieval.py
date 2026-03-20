@@ -139,6 +139,7 @@ def main():
         "prefetch": "jagged_prefetch_sparse_dist",
         "native": "jagged_sparse_dist",
         "none": "jagged_none",
+        "sw_serial": "jagged_sw_serial",
     }
     pipeline_name = pipeline_type_map.get(trainer_args.pipeline_type, "jagged_none")
 
