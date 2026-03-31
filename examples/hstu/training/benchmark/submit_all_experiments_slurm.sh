@@ -17,7 +17,7 @@
 #   --partition=NAME     SLURM partition name (default: batch)
 #   --account=NAME       SLURM account name (optional, passed to sbatch -A)
 #   --job-name=NAME      SLURM job name prefix (optional, passed to sbatch -J)
-#   --container-image=IMAGE  Container image (default: gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest)
+#   --container-image=IMAGE  Container image (built from docker/Dockerfile)
 #   --nodes=N            Number of nodes (default: 2)
 #   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
 #   --time=HH:MM:SS      Job time limit (default: 04:00:00)
@@ -81,7 +81,7 @@ SEQUENTIAL=0
 PARTITION="batch"
 ACCOUNT=""
 JOB_PREFIX=""
-CONTAINER_IMAGE="gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest"
+CONTAINER_IMAGE=""  # Set to your container image, e.g. built from docker/Dockerfile
 NODES=2
 RANKS_PER_NODE=8
 TIME_LIMIT="04:00:00"

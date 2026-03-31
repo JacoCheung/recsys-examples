@@ -25,8 +25,8 @@
 # Container Configuration (used with srun, not sbatch)
 # Can be overridden via environment variable CONTAINER_IMAGE
 # ============================================================================
-CONTAINER_IMAGE=${CONTAINER_IMAGE:-"gitlab-master.nvidia.com/devtech-compute/distributed-recommender:devel_latest"}
-CONTAINER_MOUNTS="/lustre:/lustre"
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-""}  # Set via --container-image or CONTAINER_IMAGE env var
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-""}"  # Set via CONTAINER_MOUNTS env var, e.g. "/data:/data"
 
 # ============================================================================
 # Parameter Description:
