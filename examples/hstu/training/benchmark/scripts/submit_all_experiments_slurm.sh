@@ -786,7 +786,7 @@ if [ -f "${ANALYZE_SCRIPT}" ]; then
 
     python3 "${ANALYZE_SCRIPT}" "${BATCH_OUTPUT_DIR}" \
         --output "${PLOT_OUTPUT}" \
-        --title "HSTU Benchmark Results - $(basename ${BATCH_OUTPUT_DIR})" \
+        --title "HSTU Benchmark Comparison" \
         2>&1 | tee -a "${SUMMARY_FILE}"
     
     # Use PIPESTATUS to get the exit code of python3, not tee
