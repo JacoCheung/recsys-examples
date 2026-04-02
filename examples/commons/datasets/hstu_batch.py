@@ -247,6 +247,17 @@ class HSTUBatch(BaseBatch):
             self.max_num_candidates, (int, torch.export.dynamic_shapes._IntWrapper)
         ), "max_num_candidates must be an int"
 
+    def num_loss_tokens(self) -> torch.Tensor:
+        """Per-rank loss token count (pre-TP, as a scalar tensor).
+
+        Ranking: number of label values.
+        Retrieval (next-token prediction): sum of max(seqlen - 1, 0) per sample.
+        """
+        if self.labels is not None:
+            return torch.tensor(self.labels.values().numel(), dtype=torch.float)
+        item_lengths = self.features[self.item_feature_name].lengths()
+        return (item_lengths - 1).clamp(min=0).sum().float()
+
     # to(), pin_memory(), record_stream() are inherited from BaseBatch
 
     @staticmethod
