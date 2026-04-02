@@ -2,7 +2,7 @@
 # ============================================================================
 # Single Experiment Runner (Single Node)
 # 
-# Usage: ./training/benchmark/run_single_experiment_local.sh <exp_name> [options]
+# Usage: ./training/benchmark/scripts/run_single_experiment_local.sh <exp_name> [options]
 # 
 # Environment Variables:
 #   HSTU_ROOT         Path to examples/hstu directory (optional, defaults to pwd)
@@ -32,13 +32,13 @@
 # 
 # Examples:
 #   # Baseline (all defaults)
-#   ./training/benchmark/run_single_experiment_local.sh exp0_baseline
+#   ./training/benchmark/scripts/run_single_experiment_local.sh exp0_baseline
 #   
 #   # CUTLASS attention
-#   ./training/benchmark/run_single_experiment_local.sh exp1_cutlass --kernel_backend cutlass
+#   ./training/benchmark/scripts/run_single_experiment_local.sh exp1_cutlass --kernel_backend cutlass
 #   
 #   # Full optimization
-#   ./training/benchmark/run_single_experiment_local.sh exp8_full \
+#   ./training/benchmark/scripts/run_single_experiment_local.sh exp8_full \
 #       --kernel_backend cutlass --recompute_layernorm --balanced_shuffler \
 #       --caching --evict lfu --pipeline_type prefetch --tp_size 2
 # ============================================================================
@@ -220,8 +220,9 @@ if [ ${DRY_RUN} -eq 0 ]; then
 fi
 
 # Path configuration
-SCRIPT_DIR="${HSTU_ROOT}/training/benchmark"
-RESULTS_BASE="${SCRIPT_DIR}/results"
+SCRIPT_DIR="${HSTU_ROOT}/training/benchmark/scripts"
+BENCHMARK_DIR="${HSTU_ROOT}/training/benchmark"
+RESULTS_BASE="${BENCHMARK_DIR}/results"
 GIN_GENERATOR="${SCRIPT_DIR}/generate_gin_config.py"
 
 # Timestamp
