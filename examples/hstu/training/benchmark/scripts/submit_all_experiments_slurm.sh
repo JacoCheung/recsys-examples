@@ -3,7 +3,7 @@
 # Batch Submit All Experiments via SLURM sbatch
 # 
 # Usage: 
-#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=<file> [options]
+#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh --exp-file=<file> [options]
 # 
 # Environment Variables:
 #   HSTU_ROOT            Path to examples/hstu directory (optional, defaults to pwd)
@@ -53,7 +53,7 @@
 # 
 # Examples:
 #   # Run in examples/hstu directory
-#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt
+#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt
 #   
 #   # Use environment variable to specify HSTU_ROOT
 #   export HSTU_ROOT=/path/to/recsys-examples/examples/hstu
@@ -63,12 +63,12 @@
 #   ./submit_all_experiments_slurm.sh --hstu-root=/path/to/examples/hstu --exp-file=training/benchmark/experiments.txt
 #   
 #   # Other options
-#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --nsys
-#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --results-dir=/data/benchmark_results
+#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --nsys
+#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --results-dir=/data/benchmark_results
 #   
 #   # Wait for all jobs and auto-analyze
-#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze
-#   ./training/benchmark/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze --poll-interval=120
+#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze
+#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh --exp-file=training/benchmark/experiments.txt --wait-and-analyze --poll-interval=120
 # ============================================================================
 
 set -e
@@ -274,7 +274,8 @@ fi
 
 # Path configuration
 PROJECT_ROOT="${HSTU_ROOT}/../.."
-SCRIPT_DIR="${HSTU_ROOT}/training/benchmark"
+SCRIPT_DIR="${HSTU_ROOT}/training/benchmark/scripts"
+BENCHMARK_DIR="${HSTU_ROOT}/training/benchmark"
 
 # ============================================================================
 # Set Output Directory
@@ -288,7 +289,7 @@ if [ -n "$CUSTOM_RESULTS_DIR" ]; then
     fi
 else
     # Default directory
-    RESULTS_BASE="${SCRIPT_DIR}/results"
+    RESULTS_BASE="${BENCHMARK_DIR}/results"
 fi
 
 # Create timestamped batch experiment directory
