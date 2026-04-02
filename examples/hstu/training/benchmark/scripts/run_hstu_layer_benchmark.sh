@@ -35,7 +35,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
                 fi
                 echo -e "\n\033[32mbaseline hstu layer \033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${baseline_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend triton \
@@ -56,7 +56,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
 
                 echo -e "\n\033[32m +cutlass\033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${cutlass_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend cutlass \
@@ -76,7 +76,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
 
                 echo -e "\n\033[32m +fused\033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${fused_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend cutlass \
@@ -96,7 +96,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
 
                 echo -e "\n\033[32m + recompute\033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${recompute_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend cutlass \

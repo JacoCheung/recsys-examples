@@ -124,27 +124,23 @@ user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 user_id_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
 user_id_emb/DynamicEmbeddingArgs.caching = {caching}
 
-user_age_emb/DynamicEmbeddingArgs.feature_names = ['user_age']
-user_age_emb/DynamicEmbeddingArgs.table_name = 'user_age'
-user_age_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 100
-user_age_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio_small}
-user_age_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
-user_age_emb/DynamicEmbeddingArgs.caching = False
+user_age_emb/EmbeddingArgs.feature_names = ['user_age']
+user_age_emb/EmbeddingArgs.table_name = 'user_age'
+user_age_emb/EmbeddingArgs.item_vocab_size_or_capacity = 100
+user_age_emb/EmbeddingArgs.sharding_type = 'data_parallel'
 
-item_cat_l1_emb/DynamicEmbeddingArgs.feature_names = ['item_category_l1']
-item_cat_l1_emb/DynamicEmbeddingArgs.table_name = 'item_category_l1'
-item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50
-item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio_small}
-item_cat_l1_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
-item_cat_l1_emb/DynamicEmbeddingArgs.caching = False
+item_cat_l1_emb/EmbeddingArgs.feature_names = ['item_category_l1']
+item_cat_l1_emb/EmbeddingArgs.table_name = 'item_category_l1'
+item_cat_l1_emb/EmbeddingArgs.item_vocab_size_or_capacity = 50
+item_cat_l1_emb/EmbeddingArgs.sharding_type = 'data_parallel'
 
 # Aggregate all embedding configs (5 embedding tables total)
 BenchmarkDatasetArgs.embedding_args = [
     @item_embedding/DynamicEmbeddingArgs(),
     @action_embedding/EmbeddingArgs(),
     @user_id_emb/DynamicEmbeddingArgs(),
-    @user_age_emb/DynamicEmbeddingArgs(),
-    @item_cat_l1_emb/DynamicEmbeddingArgs(),
+    @user_age_emb/EmbeddingArgs(),
+    @item_cat_l1_emb/EmbeddingArgs(),
 ]
 
 # ===== Network Configuration =====
@@ -278,15 +274,6 @@ def generate_config(args):
             file=sys.stderr,
         )
 
-    # For small tables (user_age, item_cat_l1), use ratio=1 and caching=False when caching is enabled
-    # This keeps small tables fully in GPU
-    if args.caching:
-        ratio_small = 1
-        caching_small = "True"
-    else:
-        ratio_small = 0
-        caching_small = "False"
-
     # Generate balanced_shuffler line
     if args.balanced_shuffler:
         balanced_shuffler_line = (
@@ -303,8 +290,6 @@ def generate_config(args):
         balanced_shuffler_line=balanced_shuffler_line,
         caching=str(args.caching),
         ratio=ratio,  # Use auto-corrected ratio
-        ratio_small=ratio_small,
-        caching_small=caching_small,
         evict=args.evict,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,

@@ -24,7 +24,7 @@ Each experiment below adds **one** optimization on top of the previous, so the s
 | 2 | **DynamicEmb Caching** | Enable the GPU cache tier (10% of table rows on GPU). Hot embeddings served from HBM; cold embeddings fetched from host memory on cache miss. |
 | 3 | **Selective Recompute** | Recompute LayerNorm activations during backward instead of storing them. Trades a small amount of compute for significant activation memory savings. |
 | 4 | **Workload-Balanced Shuffler** | Redistribute variable-length sequences across GPUs so that each GPU's total attention FLOPs are balanced. Eliminates GPU idle time caused by HSTU's O(n²) attention on skewed sequence lengths. |
-| 5 | **Tensor Parallel (TP=2)** | Split HSTU's QKV projections and MLP across 2 GPUs within a node. Halves per-GPU parameter and activation memory. |
+| 5 | **Tensor Parallel (TP=2)** | Split HSTU's UVQK projections and HSTU attention across 2 GPUs within a node. Halves per-GPU parameter and activation memory. |
 
 ### Benchmark Configuration
 
@@ -69,16 +69,28 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 
 ## 2. Results
 
-> **TODO**: Fill in after benchmark runs complete.
+**Hardware**: 2× H100-SXM5-80GB nodes (16 GPUs total), measured on iteration 100–999 with 1 warmup skipped.
 
-| Exp | Name | MFU (%) | Speedup vs Baseline | Notes |
-|-----|------|---------|---------------------|-------|
-| 0 | Baseline | — | 1.00× | |
-| 1 | +CUTLASS | — | — | |
-| 2 | +Caching | — | — | |
-| 3 | +Recompute | — | — | |
-| 4 | +Shuffler | — | — | |
-| 5 | +TP=2 | — | — | |
+| Exp | Name | TFLOPS | MFU (%) | Speedup vs Baseline | Notes |
+|-----|------|--------|---------|---------------------|-------|
+| 0 | Baseline | 1077 | 6.29 | 1.00× | Triton attention, no cache, DP-only |
+| 1 | +CUTLASS | 2809 | 16.40 | 2.61× | Attention kernel swap alone gives 2.6× |
+| 2 | +Caching | 2769 | 16.16 | 2.57× | GPU embedding cache amortizes over time |
+| 3 | +Recompute | 2738 | 15.99 | 2.54× | Saves memory with negligible throughput cost |
+| 4 | **+Shuffler** | **3723** | **21.73** | **3.46×** | Largest single-step gain — eliminates attention skew |
+| 5 | +TP=2 | 2851 | 16.65 | 2.65× | Trades communication for per-GPU memory savings |
+
+<img src="figs/comparison.png" width="100%" />
+
+### Key Takeaways
+
+1. **CUTLASS attention is the foundation**: Replacing the Triton kernel with CUTLASS yields a 2.6× speedup — by far the most impactful single optimization, reflecting the attention-bound nature of HSTU.
+
+2. **Workload-balanced shuffler delivers the highest MFU (21.7%)**: Zipf-distributed sequence lengths cause severe load imbalance with O(n²) attention. Redistributing sequences to equalize per-GPU FLOPs eliminates idle time and adds another 1.36× on top of CUTLASS+Caching+Recompute.
+
+3. **Caching and recompute are memory-oriented**: DynamicEmb caching and selective recompute do not improve raw throughput (MFU drops slightly from 16.40% to 15.99%), but they significantly reduce memory pressure — enabling larger models or longer sequences.
+
+4. **Tensor Parallel introduces communication overhead**: TP=2 reduces per-GPU weight memory by half but adds AllReduce synchronization after each HSTU layer. The net effect is 16.65% MFU — better than baseline but lower than shuffler alone, suggesting TP is most beneficial when model size exceeds single-GPU memory capacity.
 
 ---
 
@@ -112,11 +124,11 @@ Each line is `exp_name,options_for_generate_gin_config.py`. The script `generate
 
 ```bash
 # Run one experiment on 8 GPUs
-./training/benchmark/run_single_experiment_local.sh exp1_cutlass \
+./training/benchmark/scripts/run_single_experiment_local.sh exp1_cutlass \
     --kernel_backend cutlass --nproc=8
 
 # Dry-run (prints generated config, does not train)
-./training/benchmark/run_single_experiment_local.sh exp1_cutlass \
+./training/benchmark/scripts/run_single_experiment_local.sh exp1_cutlass \
     --kernel_backend cutlass --dry-run
 ```
 
@@ -124,12 +136,12 @@ Each line is `exp_name,options_for_generate_gin_config.py`. The script `generate
 
 ```bash
 # Run every experiment in experiments.txt sequentially
-./training/benchmark/run_all_experiments_local.sh \
+./training/benchmark/scripts/run_all_experiments_local.sh \
     --exp-file=training/benchmark/experiments.txt \
     --nproc=8
 
 # With nsys profiling
-./training/benchmark/run_all_experiments_local.sh \
+./training/benchmark/scripts/run_all_experiments_local.sh \
     --exp-file=training/benchmark/experiments.txt \
     --nproc=8 --nsys
 ```
@@ -138,17 +150,17 @@ Each line is `exp_name,options_for_generate_gin_config.py`. The script `generate
 
 ```bash
 # Submit all experiments as SLURM jobs
-./training/benchmark/submit_all_experiments_slurm.sh \
+./training/benchmark/scripts/submit_all_experiments_slurm.sh \
     --exp-file=training/benchmark/experiments.txt \
     --nodes=2 --ranks-per-node=8 --nsys
 
 # Sequential execution (each job waits for the previous)
-./training/benchmark/submit_all_experiments_slurm.sh \
+./training/benchmark/scripts/submit_all_experiments_slurm.sh \
     --exp-file=training/benchmark/experiments.txt \
     --nodes=2 --ranks-per-node=8 --nsys --sequential
 
 # Dry-run
-./training/benchmark/submit_all_experiments_slurm.sh \
+./training/benchmark/scripts/submit_all_experiments_slurm.sh \
     --exp-file=training/benchmark/experiments.txt --dry-run
 ```
 
@@ -177,7 +189,7 @@ exp0_baseline,
 exp4_shuffler,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler
 EOF
 
-./training/benchmark/run_all_experiments_local.sh --exp-file=quick_test.txt --nproc=8
+./training/benchmark/scripts/run_all_experiments_local.sh --exp-file=quick_test.txt --nproc=8
 ```
 
 ### Output directory structure
@@ -192,14 +204,14 @@ training/benchmark/results/
     ├── exp1_cutlass/
     │   └── ...
     ├── summary.txt                           # batch summary
-    └── comparison.png                        # auto-generated chart (if --wait-and-analyze)
+    └── comparison.png                         # TFLOPS + MFU comparison chart
 ```
 
 ### Analyzing results
 
 ```bash
 # Parse MFU from training logs
-python training/benchmark/analyze_results.py \
+python training/benchmark/scripts/analyze_results.py \
     training/benchmark/results/{batch_timestamp}/
 
 # Nsight Systems CLI stats

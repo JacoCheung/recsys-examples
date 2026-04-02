@@ -2,7 +2,7 @@
 # ============================================================================
 # Batch Run All Experiments (Single Node)
 # 
-# Usage: ./training/benchmark/run_all_experiments_local.sh --exp-file=<file> [options]
+# Usage: ./training/benchmark/scripts/run_all_experiments_local.sh --exp-file=<file> [options]
 # 
 # Environment Variables:
 #   HSTU_ROOT            Path to examples/hstu directory (optional, defaults to pwd)
@@ -40,11 +40,11 @@
 #       └── summary.txt              # Batch experiment summary
 # 
 # Examples:
-#   ./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt
-#   ./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --nproc=4
-#   ./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --nsys
-#   ./training/benchmark/run_all_experiments_local.sh --hstu-root=/path/to/examples/hstu --exp-file=training/benchmark/experiments.txt
-#   ./training/benchmark/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --results-dir=/data/results
+#   ./training/benchmark/scripts/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt
+#   ./training/benchmark/scripts/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --nproc=4
+#   ./training/benchmark/scripts/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --nsys
+#   ./training/benchmark/scripts/run_all_experiments_local.sh --hstu-root=/path/to/examples/hstu --exp-file=training/benchmark/experiments.txt
+#   ./training/benchmark/scripts/run_all_experiments_local.sh --exp-file=training/benchmark/experiments.txt --results-dir=/data/results
 # ============================================================================
 
 set -e
@@ -139,7 +139,8 @@ if [ ${DRY_RUN} -eq 0 ]; then
 fi
 
 # Path configuration
-SCRIPT_DIR="${HSTU_ROOT}/training/benchmark"
+SCRIPT_DIR="${HSTU_ROOT}/training/benchmark/scripts"
+BENCHMARK_DIR="${HSTU_ROOT}/training/benchmark"
 
 # Set output directory
 if [ -n "$CUSTOM_RESULTS_DIR" ]; then
@@ -149,7 +150,7 @@ if [ -n "$CUSTOM_RESULTS_DIR" ]; then
         RESULTS_BASE="${CUSTOM_RESULTS_DIR}"
     fi
 else
-    RESULTS_BASE="${SCRIPT_DIR}/results"
+    RESULTS_BASE="${BENCHMARK_DIR}/results"
 fi
 
 # Create timestamped batch experiment directory

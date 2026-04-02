@@ -8,13 +8,26 @@ Progressive benchmark measuring end-to-end MFU as optimizations are incrementall
 
 **[E2E Benchmark Documentation](./E2E_BENCHMARK.md)**
 
+#### Results (2× H100-SXM5-80GB nodes, 16 GPUs)
+
+| Exp | Name | MFU (%) | Speedup |
+|-----|------|---------|---------|
+| 0 | Baseline (Triton, DP-only) | 6.29 | 1.00× |
+| 1 | +CUTLASS Attention | 16.40 | 2.61× |
+| 2 | +DynamicEmb Caching | 16.16 | 2.57× |
+| 3 | +Selective Recompute | 15.99 | 2.54× |
+| 4 | **+Workload-Balanced Shuffler** | **21.73** | **3.46×** |
+| 5 | +Tensor Parallel (TP=2) | 16.65 | 2.65× |
+
+CUTLASS attention (2.6×) and workload-balanced shuffler (3.5×) are the two largest contributors. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
+
 ### HSTU CUTLASS Attention MFU Heatmap
 
 Standalone benchmark for the **CUTLASS-based HSTU attention kernel**. Sweeps batch sizes and sequence lengths on non-jagged (full-length) inputs and outputs TFLOPS/MFU heatmaps as PNG files.
 
 ```bash
 cd recsys-examples/examples/hstu
-python ./training/benchmark/benchmark_hstu_attn_mfu.py \
+python ./training/benchmark/scripts/benchmark_hstu_attn_mfu.py \
     --gin-config-file training/configs/benchmark_ranking.gin \
     --batch-sizes 4 8 16 32 64 \
     --seqlens 512 1024 2048 4096
@@ -22,7 +35,9 @@ python ./training/benchmark/benchmark_hstu_attn_mfu.py \
 
 #### Results (single H100-SXM5-80GB)
 
-> **TODO**: Attach heatmap images here.
+<img src="figs/hstu_attn_mfu.png" width="100%" />
+
+The CUTLASS attention kernel achieves peak MFU at large batch × seqlen products, where the GPU compute units are fully saturated. OOM (grey cells) occurs at the largest configurations.
 
 ### HSTU Layer Benchmark
 
@@ -43,14 +58,14 @@ Key arguments:
 cd recsys-examples/examples/hstu
 
 # Single run (baseline, seqlen=1K)
-python ./training/benchmark/hstu_layer_benchmark.py run \
+python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
     --iters 100 --warmup-iters 50 \
     --layer-type native --kernel-backend triton \
     --dim-per-head 256 --num-heads 4 --num-layers 1 \
     --dtype bfloat16 --max-seqlen 1024 --full-sequence True --batchsize 32
 
 # Sweep across configurations
-bash ./training/benchmark/run_hstu_layer_benchmark.sh <num_layers>
+bash ./training/benchmark/scripts/run_hstu_layer_benchmark.sh <num_layers>
 ```
 
 Each run also produces a memory snapshot file. Visualize it with [PyTorch memory tools](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html).
@@ -61,11 +76,11 @@ Sequence lengths 1K–8K, batchsize=32, dim_per_head=256, num_heads=4, embedding
 
 **Throughput** (columns are incrementally applied):
 
-![hstu_layer_perf](./hstu_layer_perf.png)
+![hstu_layer_perf](figs/hstu_layer_perf.png)
 
 **Peak memory** (3 HSTU layers, seqlen=4K):
 
-![memory_snapshot](./memory_snapshot.png)
+![memory_snapshot](figs/memory_snapshot.png)
 
 ### Memory Estimation
 
@@ -73,10 +88,10 @@ CPU-only script that estimates parameter, activation, and optimizer memory. Supp
 
 ```bash
 # From gin config (batch_size, max_seq_len, etc. are read from the config)
-python ./training/benchmark/estimate_memory.py \
+python ./training/benchmark/scripts/estimate_memory.py \
     --gin_config training/benchmark/gin_configs/benchmark_exp0_baseline.gin
 
 # From command-line arguments (no gin file needed)
-python ./training/benchmark/estimate_memory.py \
+python ./training/benchmark/scripts/estimate_memory.py \
     --batch_size 32 --max_seq_len 4096 --hidden_size 1024 --num_layers 8
 ```

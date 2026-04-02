@@ -24,7 +24,7 @@ Results are printed as 2-D tables in the terminal and saved as heatmap
 images to ``--output-dir``.
 
 Usage (run from examples/hstu/):
-    python training/benchmark/benchmark_hstu_attn_mfu.py \\
+    python training/benchmark/scripts/benchmark_hstu_attn_mfu.py \\
         --gin-config-file training/configs/benchmark_ranking.gin \\
         --batch-sizes 1,2,4,8,16,32,64,128 \\
         --seqlens 64,128,256,512,1024,2048,4096 \\
@@ -249,6 +249,63 @@ def _print_2d_tables(
 # ---------------------------------------------------------------------------
 
 
+def _draw_heatmap(
+    ax: plt.Axes,
+    tflops_mat: np.ndarray,
+    mfu_mat: np.ndarray,
+    batch_sizes: list,
+    seqlens: list,
+    title: str,
+) -> None:
+    """Draw a single heatmap with TFLOPS as colour and MFU in parentheses."""
+    n_bs, n_sl = tflops_mat.shape
+    masked = np.ma.masked_invalid(tflops_mat)
+    cmap = plt.cm.YlOrRd.copy()
+    cmap.set_bad(color="lightgrey")
+
+    im = ax.imshow(masked, cmap=cmap, aspect="auto", origin="upper")
+    cbar = ax.figure.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("TFLOPS", fontsize=14)
+
+    ax.set_xticks(range(n_sl))
+    ax.set_xticklabels([str(s) for s in seqlens], fontsize=12)
+    ax.set_yticks(range(n_bs))
+    ax.set_yticklabels([str(b) for b in batch_sizes], fontsize=12)
+    ax.set_xlabel("Sequence Length", fontsize=14)
+    ax.set_ylabel("Batch Size", fontsize=14)
+
+    vmin, vmax = np.nanmin(tflops_mat), np.nanmax(tflops_mat)
+    mid = (vmin + vmax) / 2 if vmax > vmin else vmax
+
+    for i in range(n_bs):
+        for j in range(n_sl):
+            if np.isnan(tflops_mat[i, j]):
+                ax.text(
+                    j, i, "OOM",
+                    ha="center", va="center",
+                    fontsize=11, color="grey", fontstyle="italic",
+                )
+            else:
+                tv = tflops_mat[i, j]
+                mv = mfu_mat[i, j]
+                t_fmt = f"{tv:.0f}" if tv >= 10 else f"{tv:.1f}"
+                m_fmt = f"({mv:.1f}%)"
+                text_color = "white" if tv > mid else "black"
+                mfu_color = "#00CC00" if tv > mid else "#006600"
+                ax.text(
+                    j, i - 0.12, t_fmt,
+                    ha="center", va="center",
+                    fontsize=11, fontweight="bold", color=text_color,
+                )
+                ax.text(
+                    j, i + 0.22, m_fmt,
+                    ha="center", va="center",
+                    fontsize=9, fontweight="bold", color=mfu_color,
+                )
+
+    ax.set_title(title, fontsize=14)
+
+
 def _plot_heatmaps(
     results: dict,
     batch_sizes: list,
@@ -260,96 +317,64 @@ def _plot_heatmaps(
     dim_per_head: int,
     output_dir: str,
 ) -> None:
-    """Generate and save TFLOPS / MFU heatmaps for fwd, bwd, and e2e."""
+    """Generate a single combined heatmap image with Forward / Backward / E2E.
 
-    metrics = [
+    Each cell shows TFLOPS (bold) with MFU in parentheses below it.
+    """
+
+    phases = [
         ("fwd_tflops", "fwd_mfu", "Forward"),
         ("bwd_tflops", "bwd_mfu", "Backward"),
-        ("e2e_tflops", "e2e_mfu", "End-to-End (fwd+bwd)"),
+        ("e2e_tflops", "e2e_mfu", "End-to-End"),
     ]
 
     os.makedirs(output_dir, exist_ok=True)
 
-    for tflops_key, mfu_key, title_label in metrics:
-        # ---- Build 2-D matrices ----
-        n_bs, n_sl = len(batch_sizes), len(seqlens)
+    n_bs, n_sl = len(batch_sizes), len(seqlens)
+
+    matrices: dict = {}
+    for tflops_key, mfu_key, label in phases:
         tflops_mat = np.full((n_bs, n_sl), np.nan)
         mfu_mat = np.full((n_bs, n_sl), np.nan)
-
         for i, bs in enumerate(batch_sizes):
             for j, sl in enumerate(seqlens):
                 if (bs, sl) in results:
                     tflops_mat[i, j] = results[(bs, sl)][tflops_key]
                     mfu_mat[i, j] = results[(bs, sl)][mfu_key]
+        matrices[label] = {"tflops": tflops_mat, "mfu": mfu_mat}
 
-        for mat, val_label, suffix in [
-            (tflops_mat, "TFLOPS", "tflops"),
-            (mfu_mat, "MFU (%)", "mfu"),
-        ]:
-            fig, ax = plt.subplots(figsize=(max(8, n_sl * 1.1), max(5, n_bs * 0.7)))
+    hw_info = (
+        f"{device_name}  |  {kernel_backend_str}  |  "
+        f"H={num_heads} D={dim_per_head}  |  peak {peak_tflops:.0f} TFLOPS"
+    )
 
-            # Use masked array so NaN (OOM) cells appear as grey
-            masked = np.ma.masked_invalid(mat)
-            cmap = plt.cm.YlOrRd.copy()
-            cmap.set_bad(color="lightgrey")
+    cell_w = max(8, n_sl * 1.1)
+    cell_h = max(5, n_bs * 0.7)
+    fig, axes = plt.subplots(1, 3, figsize=(cell_w * 3 + 2, cell_h + 1.2))
 
-            im = ax.imshow(masked, cmap=cmap, aspect="auto", origin="upper")
-            cbar = fig.colorbar(im, ax=ax, pad=0.02)
-            cbar.set_label(val_label, fontsize=11)
+    for ax, (_, _, phase_label) in zip(axes, phases):
+        _draw_heatmap(
+            ax,
+            matrices[phase_label]["tflops"],
+            matrices[phase_label]["mfu"],
+            batch_sizes,
+            seqlens,
+            title=phase_label,
+        )
 
-            # Axis ticks
-            ax.set_xticks(range(n_sl))
-            ax.set_xticklabels([str(s) for s in seqlens], fontsize=9)
-            ax.set_yticks(range(n_bs))
-            ax.set_yticklabels([str(b) for b in batch_sizes], fontsize=9)
-            ax.set_xlabel("Sequence Length", fontsize=12)
-            ax.set_ylabel("Batch Size", fontsize=12)
+    fig.suptitle(
+        f"HSTU Attention TFLOPS  (MFU%)\n{hw_info}",
+        fontsize=17,
+        fontweight="bold",
+        y=1.02,
+    )
+    fig.tight_layout()
 
-            # Annotate each cell
-            for i in range(n_bs):
-                for j in range(n_sl):
-                    if np.isnan(mat[i, j]):
-                        ax.text(
-                            j,
-                            i,
-                            "OOM",
-                            ha="center",
-                            va="center",
-                            fontsize=8,
-                            color="grey",
-                            fontstyle="italic",
-                        )
-                    else:
-                        v = mat[i, j]
-                        fmt = f"{v:.0f}" if v >= 10 else f"{v:.1f}"
-                        # Dark text on light cells, light text on dark cells
-                        vmin, vmax = np.nanmin(mat), np.nanmax(mat)
-                        mid = (vmin + vmax) / 2 if vmax > vmin else vmax
-                        color = "white" if v > mid else "black"
-                        ax.text(
-                            j,
-                            i,
-                            fmt,
-                            ha="center",
-                            va="center",
-                            fontsize=8,
-                            fontweight="bold",
-                            color=color,
-                        )
-
-            ax.set_title(
-                f"HSTU Attention {title_label} {val_label}\n"
-                f"{device_name}  |  {kernel_backend_str}  |  "
-                f"H={num_heads} D={dim_per_head}  |  peak {peak_tflops:.0f} TFLOPS",
-                fontsize=11,
-            )
-            fig.tight_layout()
-
-            fname = f"hstu_attn_{title_label.split()[0].lower()}_{suffix}.png"
-            fpath = os.path.join(output_dir, fname)
-            fig.savefig(fpath, dpi=150)
-            plt.close(fig)
-            print(f"  Saved: {fpath}")
+    fname = "hstu_attn_mfu.png"
+    fpath = os.path.join(output_dir, fname)
+    fig.savefig(fpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {fpath}")
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +416,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="training/benchmark/results",
-        help="Directory to save heatmap images (default: training/benchmark/results).",
+        default="training/benchmark/figs",
+        help="Directory to save heatmap images (default: training/benchmark/figs).",
     )
     args = parser.parse_args()
 
