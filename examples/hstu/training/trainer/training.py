@@ -59,7 +59,7 @@ def evaluate(
     with torch.no_grad():
         while True:
             try:
-                reporting_loss, (_, logits, labels, _) = pipeline.progress(
+                reporting_loss, _, (_, logits, labels, _) = pipeline.progress(
                     iterated_eval_loader
                 )
             except StopIteration:
@@ -150,8 +150,9 @@ def train_with_pipeline(
     ddp_seqlens = []
     ddp_num_contextuals = []
     ddp_num_candidates = []
-    # using a tensor on gpu to avoid d2h copy
+    # using tensors on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
+    loss_logged = torch.zeros(1).cuda().float()
     # limit the number of iters to max_train_iters
     # we support max_train_iters > n_batches, i.e. multiple epochs
     train_loader_iter = islice(cycle(iter(train_loader)), max_train_iters)
@@ -181,7 +182,7 @@ def train_with_pipeline(
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
                 torch.cuda.nvtx.range_push(f"step {train_iter}")
-                reporting_loss, (
+                local_loss_sum, global_tokens_step, (
                     local_loss,
                     logits,
                     labels,
@@ -190,14 +191,16 @@ def train_with_pipeline(
                 ddp_seqlens.append(ddp_seqlen.view(-1))
                 ddp_num_contextuals.append(ddp_num_contextual.view(-1))
                 ddp_num_candidates.append(ddp_num_candidate.view(-1))
-                tokens_logged += reporting_loss[1]
+                tokens_logged += global_tokens_step
+                loss_logged += local_loss_sum
                 torch.cuda.nvtx.range_pop()
             except StopIteration:
                 start_iter = train_iter
                 torch.cuda.nvtx.range_pop()
                 break
             # log
-            if train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0:
+            is_log_step = train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0
+            if is_log_step:
                 gpu_timer.stop()
                 cur_td = gpu_timer.elapsed_time() - last_td
                 hstu_config = get_unwrapped_module(pipeline._model)._hstu_config
@@ -235,11 +238,17 @@ def train_with_pipeline(
                 mfu = cal_mfu(
                     flops / cur_td / 1e9, world_size=dist.get_world_size(), dtype="bf16"
                 )
+                global_tokens = int(tokens_logged.item())
+                torch.distributed.all_reduce(
+                    loss_logged, group=parallel_state.get_data_parallel_group()
+                )
+                avg_loss = loss_logged.item() / global_tokens
                 print_rank_0(
-                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS, MFU {mfu:.2f}%]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                    f"[train] [iter {train_iter}, tokens {global_tokens}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS, MFU {mfu:.2f}%]: loss {avg_loss:.6f}"
                 )
                 last_td = cur_td + last_td
                 tokens_logged.zero_()
+                loss_logged.zero_()
                 ddp_seqlens = []
                 ddp_num_contextuals = []
                 ddp_num_candidates = []
