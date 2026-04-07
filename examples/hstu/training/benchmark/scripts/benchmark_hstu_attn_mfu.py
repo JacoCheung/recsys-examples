@@ -35,6 +35,7 @@ are read from the gin-config file.
 """
 
 import argparse
+import json
 import os
 import statistics
 import warnings
@@ -265,14 +266,15 @@ def _draw_heatmap(
 
     im = ax.imshow(masked, cmap=cmap, aspect="auto", origin="upper")
     cbar = ax.figure.colorbar(im, ax=ax, pad=0.02)
-    cbar.set_label("TFLOPS", fontsize=14)
+    cbar.set_label("TFLOPS", fontsize=21)
+    cbar.ax.tick_params(labelsize=15)
 
     ax.set_xticks(range(n_sl))
-    ax.set_xticklabels([str(s) for s in seqlens], fontsize=12)
+    ax.set_xticklabels([str(s) for s in seqlens], fontsize=18)
     ax.set_yticks(range(n_bs))
-    ax.set_yticklabels([str(b) for b in batch_sizes], fontsize=12)
-    ax.set_xlabel("Sequence Length", fontsize=14)
-    ax.set_ylabel("Batch Size", fontsize=14)
+    ax.set_yticklabels([str(b) for b in batch_sizes], fontsize=18)
+    ax.set_xlabel("Sequence Length", fontsize=21)
+    ax.set_ylabel("Batch Size", fontsize=21)
 
     vmin, vmax = np.nanmin(tflops_mat), np.nanmax(tflops_mat)
     mid = (vmin + vmax) / 2 if vmax > vmin else vmax
@@ -283,7 +285,7 @@ def _draw_heatmap(
                 ax.text(
                     j, i, "OOM",
                     ha="center", va="center",
-                    fontsize=11, color="grey", fontstyle="italic",
+                    fontsize=16, color="grey", fontstyle="italic",
                 )
             else:
                 tv = tflops_mat[i, j]
@@ -291,19 +293,19 @@ def _draw_heatmap(
                 t_fmt = f"{tv:.0f}" if tv >= 10 else f"{tv:.1f}"
                 m_fmt = f"({mv:.1f}%)"
                 text_color = "white" if tv > mid else "black"
-                mfu_color = "#00CC00" if tv > mid else "#006600"
+                mfu_color = "#66FF66" if tv > mid else "#006600"
                 ax.text(
                     j, i - 0.12, t_fmt,
                     ha="center", va="center",
-                    fontsize=11, fontweight="bold", color=text_color,
+                    fontsize=16, fontweight="bold", color=text_color,
                 )
                 ax.text(
                     j, i + 0.22, m_fmt,
                     ha="center", va="center",
-                    fontsize=9, fontweight="bold", color=mfu_color,
+                    fontsize=14, fontweight="bold", color=mfu_color,
                 )
 
-    ax.set_title(title, fontsize=14)
+    ax.set_title(title, fontsize=21)
 
 
 def _plot_heatmaps(
@@ -348,11 +350,11 @@ def _plot_heatmaps(
         f"H={num_heads} D={dim_per_head}  |  peak {peak_tflops:.0f} TFLOPS"
     )
 
-    cell_w = max(8, n_sl * 1.1)
-    cell_h = max(5, n_bs * 0.7)
-    fig, axes = plt.subplots(1, 3, figsize=(cell_w * 3 + 2, cell_h + 1.2))
+    cell_w = max(10, n_sl * 1.4)
+    cell_h = max(5, n_bs * 0.8)
+    fig, axes = plt.subplots(3, 1, figsize=(cell_w, cell_h * 3 + 4))
 
-    for ax, (_, _, phase_label) in zip(axes, phases):
+    for idx, (ax, (_, _, phase_label)) in enumerate(zip(axes, phases)):
         _draw_heatmap(
             ax,
             matrices[phase_label]["tflops"],
@@ -361,12 +363,14 @@ def _plot_heatmaps(
             seqlens,
             title=phase_label,
         )
+        if idx < len(phases) - 1:
+            ax.set_xlabel("")
 
     fig.suptitle(
         f"HSTU Attention TFLOPS  (MFU%)\n{hw_info}",
-        fontsize=17,
+        fontsize=22,
         fontweight="bold",
-        y=1.02,
+        y=1.01,
     )
     fig.tight_layout()
 
@@ -567,6 +571,28 @@ def main():
 
     # ---- Print 2-D tables in terminal ----
     _print_2d_tables(results, batch_sizes, seqlens, peak_tflops)
+
+    # ---- Save raw results as JSON for later re-plotting ----
+    os.makedirs(args.output_dir, exist_ok=True)
+    json_data = {
+        "device_name": device_spec.device_name,
+        "peak_tflops": peak_tflops,
+        "kernel_backend": kernel_backend_str,
+        "num_heads": num_heads,
+        "dim_per_head": dim_per_head,
+        "dtype": dtype_str,
+        "batch_sizes": batch_sizes,
+        "seqlens": seqlens,
+        "warmup_iters": args.warmup_iters,
+        "bench_iters": args.bench_iters,
+        "results": {
+            f"{bs},{sl}": v for (bs, sl), v in results.items()
+        },
+    }
+    json_path = os.path.join(args.output_dir, "hstu_attn_mfu_results.json")
+    with open(json_path, "w") as f:
+        json.dump(json_data, f, indent=2)
+    print(f"  Saved results: {json_path}")
 
     # ---- Plot and save heatmaps ----
     print("\nGenerating heatmaps ...")
