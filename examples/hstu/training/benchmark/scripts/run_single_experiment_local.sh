@@ -318,8 +318,10 @@ echo ""
 # Environment variable setup (add HSTU_ROOT's parent directory to PYTHONPATH)
 export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export CUDA_MODULE_LOADING=EAGER
-export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
+# NOTE: Do NOT set CUDA_MODULE_LOADING=EAGER here. It causes NCCL
+# "invalid resource handle" errors because eager loading pre-initializes
+# all CUDA modules before fork, and those handles are not fork-safe.
+# export CUDA_MODULE_LOADING=EAGER
 
 
 # Log file
