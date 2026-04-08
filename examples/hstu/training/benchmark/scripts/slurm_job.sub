@@ -131,6 +131,7 @@ export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export CUDA_MODULE_LOADING=EAGER
 export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
+export FILL_DYNAMICEMB_TABLES=1
 
 # Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
 LAUNCH_BLOCKING_ENV=""
