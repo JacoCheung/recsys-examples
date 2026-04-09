@@ -23,6 +23,7 @@
 
 import abc
 import logging
+import os
 from collections import deque
 from typing import (
     Any,
@@ -69,8 +70,32 @@ from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.types import Awaitable
 from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-import os
+
 logger: logging.Logger = logging.getLogger(__name__)
+
+_MEM_DEBUG = os.environ.get("MEM_DEBUG", "0") == "1"
+_mem_debug_iter = 0
+
+
+def _log_mem(tag: str) -> None:
+    """Log GPU physical free/total memory (includes NCCL buffers)."""
+    if not _MEM_DEBUG:
+        return
+    global _mem_debug_iter
+    free, total = torch.cuda.mem_get_info()
+    alloc = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    print(
+        f"[rank{rank}] [MEM iter={_mem_debug_iter}] {tag}: "
+        f"physical_free={free // 1024 // 1024}MB "
+        f"pt_alloc={alloc // 1024 // 1024}MB "
+        f"pt_reserved={reserved // 1024 // 1024}MB "
+        f"total={total // 1024 // 1024}MB",
+        flush=True,
+    )
+
+
 # This is required to support older torch package export for older models
 try:
     pass
@@ -767,7 +792,10 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                 self._optimizer.zero_grad()
             with nvtx.annotate("## global_tokens ##"):
                 global_tokens = self.batches[0].num_loss_tokens().to(self._device)
+                _log_mem("before global_tokens all_reduce")
                 torch.distributed.all_reduce(global_tokens)
+                torch.cuda.synchronize()
+                _log_mem("after global_tokens all_reduce")
 
         # wait for batches[0] being available on device, this should always be completed since
         # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
@@ -833,6 +861,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                 self._memcpy_stream
             )
 
+        _log_mem("after forward")
         with nvtx.annotate("## loss postprocess ##"):
             if self._assert_nan_loss:
                 collective_assert(not torch.isnan(losses).any(), "loss has nan value")
@@ -842,12 +871,17 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             dp_size = parallel_state.get_data_parallel_world_size()
             with nvtx.annotate("## backward ##"):
                 (local_loss_sum * dp_size / global_tokens).backward()
+            _log_mem("after backward")
 
             with nvtx.annotate("## finalize_model_grads ##"):
                 if isinstance(self._model.module, DistributedDataParallel):
                     finalize_model_grads([self._model.module], None)
+            _log_mem("after finalize_grads")
             with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
+            _log_mem("after optimizer")
+        global _mem_debug_iter
+        _mem_debug_iter += 1
         self.dequeue_batch()
         return local_loss_sum.detach(), global_tokens, output
 
@@ -914,7 +948,10 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
                 self._optimizer.zero_grad()
             with nvtx.annotate("## global_tokens ##"):
                 global_tokens = self._batch_i.num_loss_tokens().to(self._device)
+                _log_mem("before global_tokens all_reduce")
                 torch.distributed.all_reduce(global_tokens)
+                torch.cuda.synchronize()
+                _log_mem("after global_tokens all_reduce")
 
         with nvtx.annotate("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
@@ -978,6 +1015,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
                 self._memcpy_stream
             )
 
+        _log_mem("after forward")
         with nvtx.annotate("## loss postprocess ##"):
             if self._assert_nan_loss:
                 collective_assert(not torch.isnan(losses).any(), "loss has nan value")
@@ -993,10 +1031,14 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
 
                 if isinstance(self._model.module, DistributedDataParallel):
                     finalize_model_grads([self._model.module], None)
+            _log_mem("after backward+finalize_grads")
 
             with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
+            _log_mem("after optimizer")
 
+        global _mem_debug_iter
+        _mem_debug_iter += 1
         with nvtx.annotate("## input_dist ##"):
             self._start_sparse_data_dist(self._batch_ip2)
 
@@ -1042,10 +1084,14 @@ class JaggedMegatronTrainNonePipeline:
         if self._model.training:
             with nvtx.annotate("## global_tokens ##"):
                 global_tokens = batch.num_loss_tokens().to(self._device)
+                _log_mem("before global_tokens all_reduce")
                 torch.distributed.all_reduce(global_tokens)
+                torch.cuda.synchronize()
+                _log_mem("after global_tokens all_reduce")
 
         with nvtx.annotate("## forward ##"):
             losses, output = self._model(batch)
+        _log_mem("after forward")
 
         with nvtx.annotate("## loss postprocess ##"):
             if self._assert_nan_loss:
@@ -1056,14 +1102,19 @@ class JaggedMegatronTrainNonePipeline:
             dp_size = parallel_state.get_data_parallel_world_size()
             with nvtx.annotate("## backward ##"):
                 (local_loss_sum * dp_size / global_tokens).backward()
+            _log_mem("after backward")
 
             with nvtx.annotate("## finalize_model_grads ##"):
                 if isinstance(self._model.module, DistributedDataParallel):
                     finalize_model_grads([self._model.module], None)
+            _log_mem("after finalize_grads")
 
             with nvtx.annotate("## optimizer step ##"):
                 self._optimizer.step()
+            _log_mem("after optimizer")
 
+        global _mem_debug_iter
+        _mem_debug_iter += 1
         return local_loss_sum.detach(), global_tokens, output
 
 

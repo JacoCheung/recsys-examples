@@ -132,6 +132,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export CUDA_MODULE_LOADING=EAGER
 export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 export FILL_DYNAMICEMB_TABLES=1
+export MEM_DEBUG=1
+export NCCL_DEBUG=INFO
 
 # Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
 LAUNCH_BLOCKING_ENV=""
@@ -239,6 +241,8 @@ WRAPPER_EOF
             export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
             export PYTHONUNBUFFERED=1 && \
             export DISABLE_RICH=1 && \
+            export MEM_DEBUG=${MEM_DEBUG:-0} && \
+            export NCCL_DEBUG=${NCCL_DEBUG:-WARN} && \
             ${LAUNCH_BLOCKING_ENV} \
             ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
             python -u ${TRAIN_CMD}
@@ -264,7 +268,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export NCCL_DEBUG=${NCCL_DEBUG:-WARN} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
