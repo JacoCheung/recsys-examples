@@ -182,11 +182,15 @@ def train_with_pipeline(
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
                 torch.cuda.nvtx.range_push(f"step {train_iter}")
-                local_loss_sum, global_tokens_step, (
-                    local_loss,
-                    logits,
-                    labels,
-                    (ddp_seqlen, ddp_num_contextual, ddp_num_candidate),
+                (
+                    local_loss_sum,
+                    global_tokens_step,
+                    (
+                        local_loss,
+                        logits,
+                        labels,
+                        (ddp_seqlen, ddp_num_contextual, ddp_num_candidate),
+                    ),
                 ) = pipeline.progress(batched_iterator)
                 ddp_seqlens.append(ddp_seqlen.view(-1))
                 ddp_num_contextuals.append(ddp_num_contextual.view(-1))
@@ -199,7 +203,9 @@ def train_with_pipeline(
                 torch.cuda.nvtx.range_pop()
                 break
             # log
-            is_log_step = train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0
+            is_log_step = (
+                train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0
+            )
             if is_log_step:
                 gpu_timer.stop()
                 cur_td = gpu_timer.elapsed_time() - last_td
