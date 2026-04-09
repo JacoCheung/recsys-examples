@@ -24,7 +24,6 @@ from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
-    _log_mem,
 )
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logger import print_rank_0
@@ -246,12 +245,10 @@ def train_with_pipeline(
                     flops / cur_td / 1e9, world_size=dist.get_world_size(), dtype="bf16"
                 )
                 global_tokens = int(tokens_logged.item())
-                _log_mem("before log_loss all_reduce (DP group)")
-                torch.distributed.all_reduce(
-                    loss_logged, group=parallel_state.get_data_parallel_group()
-                )
-                torch.cuda.synchronize()
-                _log_mem("after log_loss all_reduce (DP group)")
+                # EXPERIMENT: skip DP all_reduce to test if it causes OOM
+                # torch.distributed.all_reduce(
+                #     loss_logged, group=parallel_state.get_data_parallel_group()
+                # )
                 avg_loss = loss_logged.item() / global_tokens
                 print_rank_0(
                     f"[train] [iter {train_iter}, tokens {global_tokens}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS, MFU {mfu:.2f}%]: loss {avg_loss:.6f}"
