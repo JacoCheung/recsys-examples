@@ -1,8 +1,11 @@
+import os
 import sys
 import threading
 import time
 import traceback
 from typing import Iterable, Iterator, Optional, TypeVar
+
+import torch
 
 T = TypeVar("T")
 
@@ -158,6 +161,84 @@ class StackDumpWatchdog:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._shutdown()
         return False
+
+
+class CudaMemoryWatchdog:
+    """Watchdog that calls torch.cuda.empty_cache() when GPU memory fragmentation
+    exceeds a threshold.
+
+    Fragmentation is measured as (reserved - allocated) / total. When the PyTorch
+    caching allocator holds much more memory than is actually in use, NCCL and
+    other non-PyTorch CUDA allocations (cudaMalloc) can fail with OOM even though
+    the allocator could release the memory.
+
+    Enable via environment variables:
+        CUDA_MEM_WATCHDOG=1                  # enable (default: disabled)
+        CUDA_MEM_WATCHDOG_THRESHOLD=0.5      # fragmentation ratio threshold (default: 0.5)
+        CUDA_MEM_WATCHDOG_MIN_FREE_MB=2048   # or trigger when physical free < this (default: 2048)
+
+    Usage:
+        watchdog = CudaMemoryWatchdog.from_env()  # reads env vars
+        # In training loop:
+        watchdog.step()  # checks and defragments if needed
+    """
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        frag_threshold: float = 0.5,
+        min_free_mb: int = 2048,
+    ):
+        self.enabled = enabled
+        self.frag_threshold = frag_threshold
+        self.min_free_mb = min_free_mb
+        self._defrag_count = 0
+
+    @classmethod
+    def from_env(cls) -> "CudaMemoryWatchdog":
+        return cls(
+            enabled=os.environ.get("CUDA_MEM_WATCHDOG", "0") == "1",
+            frag_threshold=float(os.environ.get("CUDA_MEM_WATCHDOG_THRESHOLD", "0.5")),
+            min_free_mb=int(os.environ.get("CUDA_MEM_WATCHDOG_MIN_FREE_MB", "2048")),
+        )
+
+    def step(self) -> None:
+        if not self.enabled:
+            return
+        free, total = torch.cuda.mem_get_info()
+        alloc = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        free_mb = free // (1024 * 1024)
+        frag_ratio = (reserved - alloc) / total if total > 0 else 0.0
+
+        if frag_ratio > self.frag_threshold or free_mb < self.min_free_mb:
+            torch.cuda.empty_cache()
+            self._defrag_count += 1
+            if os.environ.get("MEM_DEBUG", "0") == "1":
+                new_free, _ = torch.cuda.mem_get_info()
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+                print(
+                    f"[rank{rank}] [WATCHDOG] empty_cache triggered "
+                    f"(frag={frag_ratio:.2%}, free={free_mb}MB -> "
+                    f"{new_free // 1024 // 1024}MB, "
+                    f"total defrag count={self._defrag_count})",
+                    flush=True,
+                )
+
+
+_cuda_mem_watchdog: Optional[CudaMemoryWatchdog] = None
+
+
+def get_cuda_mem_watchdog() -> CudaMemoryWatchdog:
+    """Get or create the global CudaMemoryWatchdog singleton."""
+    global _cuda_mem_watchdog
+    if _cuda_mem_watchdog is None:
+        _cuda_mem_watchdog = CudaMemoryWatchdog.from_env()
+    return _cuda_mem_watchdog
 
 
 def watched_iter(
