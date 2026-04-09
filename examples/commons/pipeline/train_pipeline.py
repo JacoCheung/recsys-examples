@@ -23,6 +23,7 @@
 
 import abc
 import logging
+import os
 from collections import deque
 from typing import (
     Any,
@@ -69,8 +70,12 @@ from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.types import Awaitable
 from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-import os
+
 logger: logging.Logger = logging.getLogger(__name__)
+
+from commons.utils.logger import log_mem
+from commons.utils.watchdog import get_cuda_mem_watchdog
+
 # This is required to support older torch package export for older models
 try:
     pass
@@ -848,6 +853,8 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                     finalize_model_grads([self._model.module], None)
             with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
+            log_mem("after optimizer")
+        get_cuda_mem_watchdog().step()
         self.dequeue_batch()
         return local_loss_sum.detach(), global_tokens, output
 
@@ -996,7 +1003,9 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
 
             with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
+            log_mem("after optimizer")
 
+        get_cuda_mem_watchdog().step()
         with nvtx.annotate("## input_dist ##"):
             self._start_sparse_data_dist(self._batch_ip2)
 
@@ -1063,7 +1072,9 @@ class JaggedMegatronTrainNonePipeline:
 
             with nvtx.annotate("## optimizer step ##"):
                 self._optimizer.step()
+            log_mem("after optimizer")
 
+        get_cuda_mem_watchdog().step()
         return local_loss_sum.detach(), global_tokens, output
 
 

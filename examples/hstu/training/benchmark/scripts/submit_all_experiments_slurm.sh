@@ -13,6 +13,8 @@
 #   --hstu-root=PATH     Specify examples/hstu directory path (overrides env var and pwd)
 #   --results-dir=PATH   Output directory (default: training/benchmark/results)
 #   --nsys               Enable nsys profile sampling
+#   --mem-debug          Enable GPU memory debug logging (MEM_DEBUG=1)
+#   --mem-watchdog       Enable CUDA memory fragmentation watchdog (CUDA_MEM_WATCHDOG=1)
 #   --sequential         Sequential execution (use dependencies, start next after previous completes)
 #   --partition=NAME     SLURM partition name (default: batch)
 #   --account=NAME       SLURM account name (optional, passed to sbatch -A)
@@ -20,7 +22,7 @@
 #   --container-image=IMAGE  Container image (built from docker/Dockerfile)
 #   --nodes=N            Number of nodes (default: 2)
 #   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
-#   --time=HH:MM:SS      Job time limit (default: 04:00:00)
+#   --time=HH:MM:SS      Job time limit (default: 00:30:00)
 #   -y, --yes            Skip confirmation prompt
 #   --dry-run            Print sbatch commands only, do not submit
 #   --wait-and-analyze   Wait for all jobs to complete and auto-analyze results
@@ -94,6 +96,8 @@ CUSTOM_RESULTS_DIR=""
 CUSTOM_HSTU_ROOT=""
 SCP_DEST=""
 GIT_BRANCH=""
+MEM_DEBUG=${MEM_DEBUG:-0}
+CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0}
 
 # ============================================================================
 # Help Information
@@ -134,6 +138,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --nsys)
             ENABLE_NSYS=1
+            shift
+            ;;
+        --mem-debug)
+            MEM_DEBUG=1
+            shift
+            ;;
+        --mem-watchdog)
+            CUDA_MEM_WATCHDOG=1
             shift
             ;;
         --sequential)
@@ -502,7 +514,7 @@ for i in "${!EXP_NAMES[@]}"; do
     fi
     
     # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
-    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE}"
+    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG}"
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script
