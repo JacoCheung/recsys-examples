@@ -143,7 +143,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             if num_contextuals is None:
                 num_contextuals = 0
             elif not isinstance(num_contextuals, int):
-                num_contextuals = num_contextuals[0].item()
+                num_contextuals = num_contextuals.view(-1)[0].item()
         assert input.dim() == 2, "input tensor must be 2D"
         assert linear_uvqk_bias.dim() == 1, "linear_uvqk_bias must be 1D"
 
