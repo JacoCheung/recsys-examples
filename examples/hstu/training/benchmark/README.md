@@ -12,14 +12,14 @@ Progressive benchmark measuring end-to-end MFU as optimizations are incrementall
 
 | Exp | Name | MFU (%) | Speedup |
 |-----|------|---------|---------|
-| 0 | Baseline (Triton, DP-only) | 6.29 | 1.00× |
-| 1 | +CUTLASS Attention | 16.40 | 2.61× |
-| 2 | +DynamicEmb Caching | 16.16 | 2.57× |
-| 3 | +Selective Recompute | 15.99 | 2.54× |
-| 4 | **+Workload-Balanced Shuffler** | **21.73** | **3.46×** |
-| 5 | +Tensor Parallel (TP=2) | 16.65 | 2.65× |
+| 0 | Baseline (Triton, DP-only) | 5.84 | 1.00× |
+| 1 | +CUTLASS Attention | 13.49 | 2.31× |
+| 2 | +DynamicEmb Caching | 15.57 | 2.67× |
+| 3 | +Selective Recompute | 15.40 | 2.64× |
+| 4 | **+Workload-Balanced Shuffler** | **22.19** | **3.80×** |
+| 5 | +Tensor Parallel (TP=2) | 16.54 | 2.83× |
 
-CUTLASS attention (2.6×) and workload-balanced shuffler (3.5×) are the two largest contributors. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
+CUTLASS attention (2.3×) and workload-balanced shuffler (3.8×) are the two largest contributors. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
 
 ### HSTU CUTLASS Attention MFU Heatmap
 
@@ -35,7 +35,7 @@ python ./training/benchmark/scripts/benchmark_hstu_attn_mfu.py \
 
 #### Results (single H100-SXM5-80GB)
 
-<img src="figs/hstu_attn_mfu.png" width="100%" />
+<p align="center"><img src="figs/hstu_attn_mfu.png" width="60%" /></p>
 
 The CUTLASS attention kernel achieves peak MFU at large batch × seqlen products, where the GPU compute units are fully saturated. OOM (grey cells) occurs at the largest configurations.
 
