@@ -73,24 +73,24 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 
 | Exp | Name | TFLOPS | MFU (%) | Speedup vs Baseline | Notes |
 |-----|------|--------|---------|---------------------|-------|
-| 0 | Baseline | 1077 | 6.29 | 1.00× | Triton attention, no cache, DP-only |
-| 1 | +CUTLASS | 2809 | 16.40 | 2.61× | Attention kernel swap alone gives 2.6× |
-| 2 | +Caching | 2769 | 16.16 | 2.57× | GPU embedding cache amortizes over time |
-| 3 | +Recompute | 2738 | 15.99 | 2.54× | Saves memory with negligible throughput cost |
-| 4 | **+Shuffler** | **3723** | **21.73** | **3.46×** | Largest single-step gain — eliminates attention skew |
-| 5 | +TP=2 | 2851 | 16.65 | 2.65× | Trades communication for per-GPU memory savings |
+| 0 | Baseline | 1000 | 5.84 | 1.00× | Triton attention, no cache, DP-only |
+| 1 | +CUTLASS | 2310 | 13.49 | 2.31× | Attention kernel swap alone gives 2.3× |
+| 2 | +Caching | 2667 | 15.57 | 2.67× | GPU embedding cache amortizes over time |
+| 3 | +Recompute | 2638 | 15.40 | 2.64× | Saves memory with negligible throughput cost |
+| 4 | **+Shuffler** | **3801** | **22.19** | **3.80×** | Largest single-step gain — eliminates attention skew |
+| 5 | +TP=2 | 2832 | 16.54 | 2.83× | Trades communication for per-GPU memory savings |
 
 <img src="figs/comparison.png" width="100%" />
 
 ### Key Takeaways
 
-1. **CUTLASS attention is the foundation**: Replacing the Triton kernel with CUTLASS yields a 2.6× speedup — by far the most impactful single optimization, reflecting the attention-bound nature of HSTU.
+1. **CUTLASS attention is the foundation**: Replacing the Triton kernel with CUTLASS yields a 2.3× speedup — by far the most impactful single optimization, reflecting the attention-bound nature of HSTU.
 
-2. **Workload-balanced shuffler delivers the highest MFU (21.7%)**: Zipf-distributed sequence lengths cause severe load imbalance with O(n²) attention. Redistributing sequences to equalize per-GPU FLOPs eliminates idle time and adds another 1.36× on top of CUTLASS+Caching+Recompute.
+2. **Workload-balanced shuffler delivers the highest MFU (22.2%)**: Zipf-distributed sequence lengths cause severe load imbalance with O(n²) attention. Redistributing sequences to equalize per-GPU FLOPs eliminates idle time and adds another 1.44× on top of CUTLASS+Caching+Recompute.
 
-3. **Caching and recompute are memory-oriented**: DynamicEmb caching and selective recompute do not improve raw throughput (MFU drops slightly from 16.40% to 15.99%), but they significantly reduce memory pressure — enabling larger models or longer sequences.
+3. **Caching and recompute are memory-oriented**: DynamicEmb caching improves throughput from 13.49% to 15.57% MFU by reducing embedding lookup latency. Selective recompute saves memory with negligible throughput cost (15.40% MFU).
 
-4. **Tensor Parallel introduces communication overhead**: TP=2 reduces per-GPU weight memory by half but adds AllReduce synchronization after each HSTU layer. The net effect is 16.65% MFU — better than baseline but lower than shuffler alone, suggesting TP is most beneficial when model size exceeds single-GPU memory capacity.
+4. **Tensor Parallel introduces communication overhead**: TP=2 reduces per-GPU weight memory by half but adds AllReduce synchronization after each HSTU layer. The net effect is 16.54% MFU — better than baseline but lower than shuffler alone, suggesting TP is most beneficial when model size exceeds single-GPU memory capacity.
 
 ---
 
