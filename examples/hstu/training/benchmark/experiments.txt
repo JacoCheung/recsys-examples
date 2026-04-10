@@ -15,8 +15,8 @@
 #   --tp_size INT                       (default: 1)
 
 exp0_baseline,
-exp1_cutlass,--kernel_backend cutlass
-exp2_caching,--kernel_backend cutlass --caching
-exp3_recompute,--kernel_backend cutlass --caching --recompute_layernorm
-exp4_shuffler,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler
-exp5_tp,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler --tp_size 2
+exp1_shuffler,--balanced_shuffler
+exp2_cutlass,--balanced_shuffler --kernel_backend cutlass
+exp3_caching,--balanced_shuffler --kernel_backend cutlass --caching
+exp4_recompute,--balanced_shuffler --kernel_backend cutlass --caching --recompute_layernorm
+exp5_tp,--balanced_shuffler --kernel_backend cutlass --caching --recompute_layernorm --tp_size 2

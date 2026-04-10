@@ -1,3 +1,4 @@
+exp0_baseline,--value_dist zipf
 exp1_shuffler,--balanced_shuffler --value_dist zipf
 exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf
 exp3_caching,--balanced_shuffler --kernel_backend cutlass --caching --value_dist zipf

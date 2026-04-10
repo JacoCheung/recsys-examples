@@ -1,0 +1,4 @@
+exp0_baseline,--value_dist zipf --value_dist_alpha 1.05
+exp1_cutlass,--kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.05
+exp2_caching,--kernel_backend cutlass --caching --value_dist zipf --value_dist_alpha 1.05
+exp4_shuffler,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuffler --value_dist zipf --value_dist_alpha 1.05
