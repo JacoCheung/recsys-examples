@@ -22,6 +22,9 @@ Usage:
         --pipeline_type prefetch \\
         --tp_size 2 \\
         -o exp8_full.gin
+
+    # Zipf key distribution (hot/cold access pattern)
+    python generate_gin_config.py --kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.2
 """
 
 import argparse
