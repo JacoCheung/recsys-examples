@@ -1,3 +1,4 @@
+exp0_baseline,--value_dist uniform
 exp1_shuffler,--balanced_shuffler --value_dist uniform
 exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist uniform
 exp3_caching,--balanced_shuffler --kernel_backend cutlass --caching --value_dist uniform

@@ -5,15 +5,9 @@ importing this module.  When enabled, a ``register_forward_hook`` is
 attached to every ``BatchedDynamicEmbeddingTable`` that has a GPU cache,
 logging per-table, per-rank hit/miss statistics after each forward pass.
 
-Usage — zero code changes needed in the training pipeline::
+Usage::
 
-    # In the training entry point, after model creation:
-    from dynamicemb.cache_debug import install_cache_debug_hooks
-    install_cache_debug_hooks(model)
-
-Or even simpler — call ``auto_install`` which checks the env var::
-
-    from dynamicemb.cache_debug import auto_install
+    from commons.utils.dynamicemb_cache_stats import auto_install
     auto_install(model)   # no-op if CACHE_DEBUG != "1"
 
 Output format (one line per table per rank per iteration)::
@@ -27,6 +21,7 @@ from typing import Any, List
 
 import torch
 import torch.nn as nn
+from commons.utils.dynamicemb_utils import find_dynamicemb_modules
 
 
 class _CacheDebugHook:
@@ -68,19 +63,26 @@ def install_cache_debug_hooks(model: nn.Module) -> int:
     Returns:
         Number of hooks installed.
     """
-    try:
-        from dynamicemb.dump_load import get_dynamic_emb_module
-    except ImportError:
-        return 0
-
     count = 0
-    for m in get_dynamic_emb_module(model):
-        if not hasattr(m, "cache") or m.cache is None:
+    modules = find_dynamicemb_modules(model)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0:
+        print(f"[CACHE_DEBUG] Found {len(modules)} DynamicEmb module(s)", flush=True)
+    for m in modules:
+        has_cache = hasattr(m, "cache") and m.cache is not None
+        if rank == 0:
+            print(
+                f"[CACHE_DEBUG]   tables={m.table_names} has_cache={has_cache}",
+                flush=True,
+            )
+        if not has_cache:
             continue
         m.set_record_cache_metrics(True)
         hook = _CacheDebugHook(m.table_names, m.cache)
         m.register_forward_hook(hook)
         count += 1
+    if rank == 0:
+        print(f"[CACHE_DEBUG] Installed {count} hook(s)", flush=True)
     return count
 
 

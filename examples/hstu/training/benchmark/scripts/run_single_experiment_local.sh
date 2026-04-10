@@ -61,6 +61,8 @@ RATIO=0
 EVICT="lru"
 PIPELINE_TYPE="none"
 TP_SIZE=1
+VALUE_DIST="uniform"
+VALUE_DIST_ALPHA=1.2
 
 # Parse arguments
 EXP_NAME=""
@@ -117,6 +119,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tp_size)
             TP_SIZE="$2"
+            shift 2
+            ;;
+        --value_dist=*)
+            VALUE_DIST="${1#*=}"
+            shift
+            ;;
+        --value_dist)
+            VALUE_DIST="$2"
+            shift 2
+            ;;
+        --value_dist_alpha=*)
+            VALUE_DIST_ALPHA="${1#*=}"
+            shift
+            ;;
+        --value_dist_alpha)
+            VALUE_DIST_ALPHA="$2"
             shift 2
             ;;
         # Other options (support both --arg value and --arg=value)
@@ -259,6 +277,8 @@ GIN_GEN_ARGS="${GIN_GEN_ARGS} --ratio ${RATIO}"
 GIN_GEN_ARGS="${GIN_GEN_ARGS} --evict ${EVICT}"
 GIN_GEN_ARGS="${GIN_GEN_ARGS} --pipeline_type ${PIPELINE_TYPE}"
 GIN_GEN_ARGS="${GIN_GEN_ARGS} --tp_size ${TP_SIZE}"
+GIN_GEN_ARGS="${GIN_GEN_ARGS} --value_dist ${VALUE_DIST}"
+GIN_GEN_ARGS="${GIN_GEN_ARGS} --value_dist_alpha ${VALUE_DIST_ALPHA}"
 
 # Generated config file path
 CONFIG_FILE="${OUTPUT_DIR}/${EXP_NAME}_${TIMESTAMP}.gin"
