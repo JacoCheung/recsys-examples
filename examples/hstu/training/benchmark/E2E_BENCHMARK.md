@@ -120,6 +120,16 @@ exp5_tp,--kernel_backend cutlass --caching --recompute_layernorm --balanced_shuf
 
 Each line is `exp_name,options_for_generate_gin_config.py`. The script `generate_gin_config.py` produces a complete gin config file from these flags.
 
+### Debug environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEM_DEBUG` | `0` | Log GPU physical memory (including NCCL buffers) after each optimizer step on all ranks |
+| `CUDA_MEM_WATCHDOG` | `0` | Auto-call `torch.cuda.empty_cache()` when caching allocator fragmentation exceeds threshold |
+| `CACHE_DEBUG` | `0` | Log per-table, per-rank DynamicEmb cache hit/miss/hit_rate after each forward pass |
+
+Set before launching training, e.g. `export CUDA_MEM_WATCHDOG=1` in the SLURM job script or shell.
+
 ### Option A: Single experiment (local)
 
 ```bash
