@@ -152,6 +152,10 @@ def main():
         f"model initialization done, start training. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
     )
 
+    from commons.utils.dynamicemb_cache_stats import auto_install
+
+    auto_install(model_train)
+
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
 
     if os.environ.get("FILL_DYNAMICEMB_TABLES", "0") == "1":
@@ -161,9 +165,7 @@ def main():
             if hasattr(dyn_module, "fill_tables"):
                 try:
                     dyn_module.fill_tables(load_factor=0.95)
-                    print_rank_0(
-                        f"fill_tables done for {dyn_module.table_names}"
-                    )
+                    print_rank_0(f"fill_tables done for {dyn_module.table_names}")
                 except TypeError:
                     pass
         torch.cuda.synchronize()

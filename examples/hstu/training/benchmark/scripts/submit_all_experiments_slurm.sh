@@ -15,6 +15,7 @@
 #   --nsys               Enable nsys profile sampling
 #   --mem-debug          Enable GPU memory debug logging (MEM_DEBUG=1)
 #   --mem-watchdog       Enable CUDA memory fragmentation watchdog (CUDA_MEM_WATCHDOG=1)
+#   --cache-debug        Enable DynamicEmb cache hit rate logging (CACHE_DEBUG=1)
 #   --sequential         Sequential execution (use dependencies, start next after previous completes)
 #   --partition=NAME     SLURM partition name (default: batch)
 #   --account=NAME       SLURM account name (optional, passed to sbatch -A)
@@ -98,6 +99,7 @@ SCP_DEST=""
 GIT_BRANCH=""
 MEM_DEBUG=${MEM_DEBUG:-0}
 CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0}
+CACHE_DEBUG=${CACHE_DEBUG:-0}
 
 # ============================================================================
 # Help Information
@@ -146,6 +148,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --mem-watchdog)
             CUDA_MEM_WATCHDOG=1
+            shift
+            ;;
+        --cache-debug)
+            CACHE_DEBUG=1
             shift
             ;;
         --sequential)
@@ -514,7 +520,7 @@ for i in "${!EXP_NAMES[@]}"; do
     fi
     
     # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
-    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG}"
+    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG},CACHE_DEBUG=${CACHE_DEBUG}"
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script
