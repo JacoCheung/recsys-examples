@@ -75,22 +75,12 @@ item_seqlen_dist/RandomDistribution.alpha = 1.2
 item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length
 item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
 
-# Item-ID value distribution: Zipf (long-tail), simulates hot/cold item access
-item_value_dist/RandomDistribution.dist_type = 'zipf'
-item_value_dist/RandomDistribution.alpha = 1.2
-item_and_action_feature/FeatureArgs.value_dists = {{
-    'item': @item_value_dist/RandomDistribution(),
-}}
-
+{value_dist_section}
 # Contextual Features (only 3)
-user_id_value_dist/RandomDistribution.dist_type = 'zipf'
-user_id_value_dist/RandomDistribution.alpha = 1.2
 user_contextual_features/FeatureArgs.feature_names = ['user_id', 'user_age']
 user_contextual_features/FeatureArgs.max_sequence_length = 1
 user_contextual_features/FeatureArgs.is_jagged = False
-user_contextual_features/FeatureArgs.value_dists = {{
-    'user_id': @user_id_value_dist/RandomDistribution(),
-}}
+{user_id_value_dist_section}
 
 item_contextual_features/FeatureArgs.feature_names = ['item_category_l1']
 item_contextual_features/FeatureArgs.max_sequence_length = 1
@@ -270,6 +260,21 @@ Examples:
         "--tp_size", type=int, default=1, help="Tensor Parallel size (default: 1)"
     )
 
+    parser.add_argument(
+        "--value_dist",
+        type=str,
+        choices=["uniform", "zipf"],
+        default="uniform",
+        help="Key value distribution for item/user_id (default: uniform)",
+    )
+
+    parser.add_argument(
+        "--value_dist_alpha",
+        type=float,
+        default=1.2,
+        help="Zipf alpha parameter when --value_dist=zipf (default: 1.2)",
+    )
+
     return parser.parse_args()
 
 
@@ -284,6 +289,28 @@ def generate_config(args):
             f"Warning: caching enabled but ratio=0, auto-setting ratio to 0.1 (10%)",
             file=sys.stderr,
         )
+
+    # Generate value distribution sections
+    if args.value_dist == "zipf":
+        alpha = args.value_dist_alpha
+        value_dist_section = (
+            f"# Item-ID value distribution: Zipf (long-tail)\n"
+            f"item_value_dist/RandomDistribution.dist_type = 'zipf'\n"
+            f"item_value_dist/RandomDistribution.alpha = {alpha}\n"
+            f"item_and_action_feature/FeatureArgs.value_dists = {{\n"
+            f"    'item': @item_value_dist/RandomDistribution(),\n"
+            f"}}"
+        )
+        user_id_value_dist_section = (
+            f"user_id_value_dist/RandomDistribution.dist_type = 'zipf'\n"
+            f"user_id_value_dist/RandomDistribution.alpha = {alpha}\n"
+            f"user_contextual_features/FeatureArgs.value_dists = {{\n"
+            f"    'user_id': @user_id_value_dist/RandomDistribution(),\n"
+            f"}}"
+        )
+    else:
+        value_dist_section = "# Item-ID value distribution: uniform (default)"
+        user_id_value_dist_section = ""
 
     # Generate balanced_shuffler line
     if args.balanced_shuffler:
@@ -304,6 +331,8 @@ def generate_config(args):
         evict=args.evict,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
+        value_dist_section=value_dist_section,
+        user_id_value_dist_section=user_id_value_dist_section,
     )
 
     return config
