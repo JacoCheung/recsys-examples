@@ -150,9 +150,9 @@ BenchmarkDatasetArgs.embedding_args = [
 # ===== Network Configuration =====
 NetworkArgs.item_embedding_dim = 128
 NetworkArgs.contextual_embedding_dim = 128  # Same as item_embedding_dim
-NetworkArgs.num_layers = 8
-NetworkArgs.num_attention_heads = 4
-NetworkArgs.hidden_size = 1024
+NetworkArgs.num_layers = 1
+NetworkArgs.num_attention_heads = 1
+NetworkArgs.hidden_size = 256
 NetworkArgs.kv_channels = 256
 
 # Kernel config
