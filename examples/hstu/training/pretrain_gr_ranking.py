@@ -156,6 +156,10 @@ def main():
 
     auto_install(model_train)
 
+    from commons.utils.debug_dynamicemb_keys import auto_install as key_debug_install
+
+    key_debug_install(model_train)
+
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
 
     if os.environ.get("FILL_DYNAMICEMB_TABLES", "0") == "1":
