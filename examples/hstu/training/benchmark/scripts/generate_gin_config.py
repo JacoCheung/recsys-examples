@@ -62,7 +62,7 @@ TrainerArgs.pipeline_type = '{pipeline_type}'
 # Profiling, we need iteration later than num_generated_batches to make sure jit-compiled kernels are cached
 TrainerArgs.profile = True
 TrainerArgs.profile_step_start = 150
-TrainerArgs.profile_step_end = 200
+TrainerArgs.profile_step_end = 160
 
 # Checkpoint
 TrainerArgs.ckpt_save_dir = './checkpoints/generated_exp'

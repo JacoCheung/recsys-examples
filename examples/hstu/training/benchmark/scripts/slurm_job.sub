@@ -227,6 +227,7 @@ exec nsys profile \
     --cuda-flush-interval 100 \
     --capture-range-end=stop \
     --cuda-graph-trace=node \
+    --backtrace=cuda \
     "$@"
 WRAPPER_EOF
     chmod +x ${WRAPPER_SCRIPT}
