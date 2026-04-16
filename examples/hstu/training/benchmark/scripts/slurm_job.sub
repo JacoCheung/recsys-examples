@@ -251,7 +251,7 @@ WRAPPER_EOF
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
         bash -c "
-            nvidia-smi && \
+            if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && \
             cd ${HSTU_ROOT} && \
             export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
             export PYTHONUNBUFFERED=1 && \
@@ -289,7 +289,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-} && export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-} && export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
