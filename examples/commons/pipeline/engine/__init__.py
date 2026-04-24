@@ -22,6 +22,7 @@ examples/tests/commons/test_engine_import_hygiene.py.
 
 from .autosched import ScheduleValidationError
 from .context import TaskContext
+from .executor import SequentialExecutor, ThreadedExecutor
 from .pipeline import SchedulablePipeline
 from .schedule import Schedule, Stage
 from .streams import StreamPool
@@ -32,8 +33,10 @@ __all__ = [
     "Schedule",
     "SchedulablePipeline",
     "ScheduleValidationError",
+    "SequentialExecutor",
     "Stage",
     "StreamPool",
     "Task",
     "TaskContext",
+    "ThreadedExecutor",
 ]

@@ -55,10 +55,12 @@ def test_engine_public_api_exact_surface() -> None:
         "Schedule",
         "SchedulablePipeline",
         "ScheduleValidationError",
+        "SequentialExecutor",
         "Stage",
         "StreamPool",
         "Task",
         "TaskContext",
+        "ThreadedExecutor",
     }
     actual = set(engine.__all__)
     assert actual == expected, (

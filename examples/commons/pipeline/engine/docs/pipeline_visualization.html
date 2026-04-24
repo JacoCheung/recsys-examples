@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Schedulable Pipeline Engine — Execution Visualization</title>
+<style>
+  :root {
+    --bg: #0d1117; --fg: #c9d1d9; --border: #30363d;
+    --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+    --yellow: #d29922; --purple: #bc8cff; --orange: #f0883e;
+    --cyan: #39d353; --pink: #f778ba;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font-family: 'SF Mono', 'Consolas', monospace; font-size: 13px; padding: 24px; }
+  h1 { font-size: 20px; color: var(--accent); margin-bottom: 4px; }
+  h2 { font-size: 16px; color: var(--fg); margin: 32px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 14px; color: var(--yellow); margin: 20px 0 8px; }
+  p, .note { line-height: 1.6; margin-bottom: 10px; max-width: 900px; }
+  .note { background: #161b22; border-left: 3px solid var(--accent); padding: 8px 12px; margin: 12px 0; }
+  .warn { border-left-color: var(--yellow); }
+  .good { border-left-color: var(--green); }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 2px; margin: 16px 0 0; }
+  .tab { padding: 8px 16px; cursor: pointer; background: #161b22; border: 1px solid var(--border); border-bottom: none; border-radius: 6px 6px 0 0; color: #8b949e; }
+  .tab.active { background: var(--bg); color: var(--accent); border-bottom: 1px solid var(--bg); position: relative; z-index: 1; }
+  .panels { border: 1px solid var(--border); border-radius: 0 6px 6px 6px; padding: 20px; margin-bottom: 32px; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* Timeline canvas */
+  .timeline { position: relative; overflow-x: auto; }
+  .timeline svg { display: block; }
+  .timeline svg text { font-family: 'SF Mono', 'Consolas', monospace; }
+
+  /* Legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 12px 0; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+
+  /* Code */
+  code { background: #161b22; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  pre { background: #161b22; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 12px; line-height: 1.5; }
+
+  /* Diagram containers */
+  .diagram-scroll { overflow-x: auto; padding-bottom: 8px; }
+</style>
+</head>
+<body>
+
+<h1>Schedulable Pipeline Engine</h1>
+<p style="color:#8b949e;">Multi-thread, multi-stream execution with data dependency &amp; NCCL ordering guarantees</p>
+
+<!-- ============================================================ -->
+<!-- Tab bar -->
+<!-- ============================================================ -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab(0)">1. Thread/Stream Decoupling</div>
+  <div class="tab" onclick="switchTab(1)">2. Data Dependency</div>
+  <div class="tab" onclick="switchTab(2)">3. NCCL Ordering</div>
+  <div class="tab" onclick="switchTab(3)">4. Multi-Batch Pipeline</div>
+</div>
+
+<div class="panels">
+
+<!-- ============================================================ -->
+<!-- Panel 1: Thread / Stream Decoupling -->
+<!-- ============================================================ -->
+<div class="panel active" id="panel-0">
+<h2>Thread / Stream Decoupling</h2>
+
+<div class="note">
+  <b>Core design:</b> A task's <code>stream</code> decides which <b>CUDA stream context</b> it runs in.
+  The <code>thread_map</code> decides which <b>CPU worker thread</b> submits it. They are independent.
+</div>
+
+<h3>Example: prefetch pipeline with 2 streams, 2 threads</h3>
+<div class="diagram-scroll" id="diagram-decoupling"></div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#58a6ff"></div> default stream (compute)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#f0883e"></div> memcpy stream (H2D)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#30363d;border:1px dashed #58a6ff"></div> CUDA stream context</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#30363d;border:1px solid #3fb950"></div> CPU thread boundary</div>
+</div>
+
+<h3>thread_map strategies</h3>
+<pre>
+ThreadedExecutor(thread_map="by_stream")    # default: group by task.stream
+ThreadedExecutor(thread_map="per_task")     # every task gets its own thread
+ThreadedExecutor(thread_map={"h2d": "io", "fwd": "compute", ...})   # explicit dict
+ThreadedExecutor(thread_map=lambda t: "io" if t.stream=="memcpy" else "compute")  # callable
+</pre>
+
+<div class="note good">
+  Same CUDA stream can be used from different CPU threads. Different CUDA streams can share a CPU thread.
+  The GPU serializes work per-stream regardless of which CPU thread submitted it.
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- Panel 2: Data Dependency -->
+<!-- ============================================================ -->
+<div class="panel" id="panel-1">
+<h2>Data Dependency Correctness</h2>
+
+<div class="note">
+  Two independent mechanisms ensure data visibility:<br>
+  <b>1. GPU-side:</b> <code>wait_stream</code> — from <code>cross_stream_waits</code> (stream-based)<br>
+  <b>2. CPU-side:</b> <code>threading.Event</code> — from DAG analysis (thread-based)
+</div>
+
+<h3>How dependencies are resolved</h3>
+<div class="diagram-scroll" id="diagram-deps"></div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#f85149"></div> GPU wait_stream (cross-stream)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#58a6ff"></div> CPU Event.wait (cross-thread)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#3fb950"></div> Implicit ordering (same thread, sequential)</div>
+</div>
+
+<h3>Dependency computation flow</h3>
+<pre>
+                    Schedule (tasks with reads/writes/depends_on)
+                                    │
+                 ┌──────────────────┼──────────────────┐
+                 ▼                                     ▼
+        infer_cross_stream_waits()           _compute_cpu_deps()
+         (deps.py — stream-based)          (executor.py — thread-based)
+                 │                                     │
+                 ▼                                     ▼
+    GPU: consumer_stream.wait_stream(     CPU: threading.Event.wait()
+         producer_stream)                 before task.run() on different
+                                          thread than the dependency
+</pre>
+
+<div class="note warn">
+  <b>Key invariant:</b> CPU deps are computed from the <b>task DAG</b> (reads/writes + depends_on),
+  NOT from stream assignment. This is what makes thread/stream decoupling safe.
+  Two tasks on the same stream but different threads still get correct CPU ordering.
+</div>
+
+<h3>Example: h2d writes "batch_gpu", forward reads it</h3>
+<div class="diagram-scroll" id="diagram-dep-example"></div>
+</div>
+
+<!-- ============================================================ -->
+<!-- Panel 3: NCCL Ordering -->
+<!-- ============================================================ -->
+<div class="panel" id="panel-2">
+<h2>NCCL Submission Ordering</h2>
+
+<div class="note warn">
+  <b>Problem:</b> NCCL collectives (AllReduce, AllGather) are matched across ranks by <b>call order</b>.
+  If rank 0 calls AllReduce_A then AllReduce_B, rank 1 must do the same. With multi-threading,
+  this order could differ → deadlock.
+</div>
+
+<h3>Solution: _NcclOrderedLock (ticket-based)</h3>
+<div class="diagram-scroll" id="diagram-nccl"></div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#bc8cff"></div> NCCL collective (nccl=True)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#58a6ff"></div> Regular task</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#f85149"></div> Ticket acquisition order</div>
+</div>
+
+<h3>Mechanism</h3>
+<pre>
+Declaration order:  [task_A (nccl), task_B (nccl), task_C (nccl)]
+Ticket assignment:   ticket=0       ticket=1       ticket=2
+
+_NcclOrderedLock state machine:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  next_ticket = 0                                            │
+  │                                                             │
+  │  Thread X: acquire(ticket=0) → runs immediately             │
+  │            task_A.run()                                     │
+  │            release() → next_ticket = 1, notify_all()        │
+  │                                                             │
+  │  Thread Y: acquire(ticket=1) → was waiting, now runs        │
+  │            task_B.run()                                     │
+  │            release() → next_ticket = 2, notify_all()        │
+  │                                                             │
+  │  Thread X: acquire(ticket=2) → runs                         │
+  │            task_C.run()                                     │
+  │            release() → next_ticket = 3                      │
+  └─────────────────────────────────────────────────────────────┘
+
+  If task_B fails:
+    release(failed=True) → self._failed = True
+    Thread X: acquire(ticket=2) → sees _failed → raises RuntimeError
+    → task_C never runs (no desync across ranks)
+</pre>
+
+<div class="note good">
+  <b>Guarantee:</b> All ranks execute NCCL collectives in identical declaration order,
+  regardless of thread scheduling. Failure in any NCCL task aborts all subsequent ones.
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- Panel 4: Multi-Batch Pipeline -->
+<!-- ============================================================ -->
+<div class="panel" id="panel-3">
+<h2>Multi-Batch Pipeline Overlap</h2>
+
+<div class="note">
+  The pipeline overlaps different batches via <code>batch_offset</code>.
+  Within one internal iteration, tasks with different offsets operate on <b>different batches</b>
+  in the BatchRing simultaneously.
+</div>
+
+<h3>Prefetch pipeline: in_flight_batches=2 (max_offset=1)</h3>
+<div class="diagram-scroll" id="diagram-pipeline"></div>
+
+<h3>BatchRing state per iteration</h3>
+<div class="diagram-scroll" id="diagram-ring"></div>
+
+<h3>Mask formula (SPEC &sect;4.8)</h3>
+<pre>
+Task with batch_offset=k runs at iteration i iff:
+    (max_offset - k) ≤ i < M + (max_offset - k)
+
+Where M = number of batches pulled from dataloader.
+
+For in_flight_batches=2 (max_offset=1), M=5:
+  k=1 (h2d):    runs at i=0,1,2,3,4    (prefetch: one iteration ahead)
+  k=0 (compute): runs at i=1,2,3,4,5    (steady + drain)
+
+  i=0: prefill  — only h2d(batch_0) runs
+  i=1: steady   — h2d(batch_1) + compute(batch_0) overlap!
+  i=2: steady   — h2d(batch_2) + compute(batch_1) overlap!
+  ...
+  i=5: drain    — only compute(batch_4) runs
+</pre>
+
+<div class="note good">
+  <b>Yes, different batches' stages DO overlap.</b> At iteration i=2, h2d is working on batch_2
+  (via offset=1) while forward/backward/optimizer work on batch_1 (via offset=0).
+  With <code>ThreadedExecutor</code>, these can run on <b>different CPU threads</b> too.
+</div>
+
+<h3>Full 3-batch pipeline: in_flight_batches=3</h3>
+<div class="diagram-scroll" id="diagram-pipeline-3"></div>
+</div>
+
+</div><!-- /panels -->
+
+<!-- ============================================================ -->
+<script>
+// --- Tab switching ---
+function switchTab(idx) {
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', i===idx));
+  document.querySelectorAll('.panel').forEach((p,i) => p.classList.toggle('active', i===idx));
+}
+
+// --- SVG helpers ---
+function svg(w, h) {
+  const s = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  s.setAttribute('width', w); s.setAttribute('height', h);
+  s.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  return s;
+}
+function rect(x,y,w,h,fill,rx,stroke,strokeDash) {
+  const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+  r.setAttribute('x',x); r.setAttribute('y',y); r.setAttribute('width',w); r.setAttribute('height',h);
+  r.setAttribute('fill',fill); r.setAttribute('rx',rx||4);
+  if(stroke) r.setAttribute('stroke',stroke);
+  if(strokeDash) r.setAttribute('stroke-dasharray',strokeDash);
+  return r;
+}
+function text(x,y,str,fill,size,anchor) {
+  const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+  t.setAttribute('x',x); t.setAttribute('y',y);
+  t.setAttribute('fill',fill||'#c9d1d9'); t.setAttribute('font-size',size||11);
+  if(anchor) t.setAttribute('text-anchor',anchor);
+  t.textContent = str; return t;
+}
+function line(x1,y1,x2,y2,stroke,dash) {
+  const l = document.createElementNS('http://www.w3.org/2000/svg','line');
+  l.setAttribute('x1',x1); l.setAttribute('y1',y1);
+  l.setAttribute('x2',x2); l.setAttribute('y2',y2);
+  l.setAttribute('stroke',stroke); l.setAttribute('stroke-width',2);
+  if(dash) l.setAttribute('stroke-dasharray',dash);
+  return l;
+}
+function arrow(x1,y1,x2,y2,color,dash) {
+  const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+  const l = line(x1,y1,x2,y2,color,dash);
+  g.appendChild(l);
+  // arrowhead
+  const angle = Math.atan2(y2-y1,x2-x1);
+  const sz = 8;
+  const p = document.createElementNS('http://www.w3.org/2000/svg','polygon');
+  const ax = x2 - sz*Math.cos(angle-0.4);
+  const ay = y2 - sz*Math.sin(angle-0.4);
+  const bx = x2 - sz*Math.cos(angle+0.4);
+  const by = y2 - sz*Math.sin(angle+0.4);
+  p.setAttribute('points',`${x2},${y2} ${ax},${ay} ${bx},${by}`);
+  p.setAttribute('fill',color);
+  g.appendChild(p);
+  return g;
+}
+
+// Colors
+const C = {
+  default:'#58a6ff', memcpy:'#f0883e', nccl:'#bc8cff',
+  bg:'#0d1117', border:'#30363d', fg:'#c9d1d9',
+  green:'#3fb950', red:'#f85149', yellow:'#d29922',
+  dim:'#484f58',
+  batch: ['#58a6ff','#3fb950','#f0883e','#bc8cff','#f778ba','#d29922']
+};
+
+// ============================================================
+// Diagram 1: Thread/Stream Decoupling
+// ============================================================
+(function(){
+  const W=820, H=260;
+  const s = svg(W, H);
+  const LM=120, TH=40, TW=140, TG=10, RH=80;
+
+  // Thread lanes
+  const threads = ['Thread "io"', 'Thread "compute"'];
+  threads.forEach((name,i) => {
+    const y = 50 + i*(RH+20);
+    s.appendChild(rect(LM-4, y, W-LM-10, RH, '#161b22', 6, C.green));
+    s.appendChild(text(10, y+RH/2+4, name, C.green, 11));
+  });
+
+  // Tasks
+  const tasks = [
+    {name:'h2d', stream:'memcpy', thread:0, x:0, w:130},
+    {name:'zero_grad', stream:'default', thread:1, x:0, w:100},
+    {name:'forward',   stream:'default', thread:1, x:110, w:130},
+    {name:'backward',  stream:'default', thread:1, x:250, w:130},
+    {name:'optimizer', stream:'default', thread:1, x:390, w:120},
+  ];
+  tasks.forEach(t => {
+    const x = LM + 10 + t.x;
+    const y = 50 + t.thread*(RH+20) + 15;
+    const col = t.stream==='memcpy' ? C.memcpy : C.default;
+    s.appendChild(rect(x, y, t.w, 46, col+'22', 6, col, '4 3'));
+    s.appendChild(text(x+t.w/2, y+18, t.name, col, 12, 'middle'));
+    s.appendChild(text(x+t.w/2, y+34, 'stream: '+t.stream, C.dim, 10, 'middle'));
+  });
+
+  // Title
+  s.appendChild(text(W/2, 24, 'thread_map={"h2d":"io", others:"compute"}', C.yellow, 13, 'middle'));
+  // Time arrow
+  s.appendChild(arrow(LM, H-15, W-20, H-15, C.dim));
+  s.appendChild(text(W-15, H-20, 'time', C.dim, 10, 'end'));
+
+  document.getElementById('diagram-decoupling').appendChild(s);
+})();
+
+// ============================================================
+// Diagram 2: Data Dependencies
+// ============================================================
+(function(){
+  const W=900, H=320;
+  const s = svg(W, H);
+  const LM=130;
+
+  // Thread lanes
+  ['Thread "io"', 'Thread "compute"'].forEach((name,i) => {
+    const y = 50 + i*130;
+    s.appendChild(rect(LM-4, y, W-LM-10, 100, '#161b22', 6, C.green));
+    s.appendChild(text(10, y+50, name, C.green, 11));
+  });
+
+  // Tasks with positions
+  const T = {
+    h2d:     {x:LM+20, y:60, w:140, h:46, stream:'memcpy', thread:0},
+    zero:    {x:LM+20, y:190, w:110, h:46, stream:'default', thread:1},
+    fwd:     {x:LM+180, y:190, w:140, h:46, stream:'default', thread:1},
+    bwd:     {x:LM+340, y:190, w:140, h:46, stream:'default', thread:1},
+    opt:     {x:LM+500, y:190, w:120, h:46, stream:'default', thread:1},
+  };
+
+  Object.entries(T).forEach(([name, t]) => {
+    const col = t.stream==='memcpy' ? C.memcpy : C.default;
+    s.appendChild(rect(t.x, t.y, t.w, t.h, col+'22', 6, col, '4 3'));
+    const label = {h2d:'h2d\nwrites: batch_gpu', zero:'zero_grad', fwd:'forward\nreads: batch_gpu', bwd:'backward', opt:'optimizer'}[name];
+    const lines = label.split('\n');
+    s.appendChild(text(t.x+t.w/2, t.y+18, lines[0], col, 12, 'middle'));
+    if(lines[1]) s.appendChild(text(t.x+t.w/2, t.y+34, lines[1], C.dim, 10, 'middle'));
+  });
+
+  // Dependency arrows
+  // h2d → forward (cross-thread, cross-stream)
+  const h=T.h2d, f=T.fwd;
+  s.appendChild(arrow(h.x+h.w/2, h.y+h.h, f.x+f.w/2, f.y, C.red));
+  s.appendChild(text(h.x+h.w/2+60, (h.y+h.h+f.y)/2, 'GPU: wait_stream(memcpy)', C.red, 10, 'start'));
+
+  s.appendChild(arrow(h.x+h.w/2-30, h.y+h.h, f.x+f.w/2-30, f.y, C.default, '4 3'));
+  s.appendChild(text(h.x+h.w/2-90, (h.y+h.h+f.y)/2+14, 'CPU: Event.wait()', C.default, 10, 'start'));
+
+  // zero → fwd (same thread: implicit)
+  s.appendChild(arrow(T.zero.x+T.zero.w, T.zero.y+T.zero.h/2, T.fwd.x, T.fwd.y+T.fwd.h/2, C.green, '2 4'));
+  s.appendChild(text((T.zero.x+T.zero.w+T.fwd.x)/2, T.zero.y+T.zero.h/2-8, 'implicit\n(same thread)', C.green, 9, 'middle'));
+
+  // fwd → bwd (same thread: implicit)
+  s.appendChild(arrow(T.fwd.x+T.fwd.w, T.fwd.y+T.fwd.h/2, T.bwd.x, T.bwd.y+T.bwd.h/2, C.green, '2 4'));
+
+  // bwd → opt (same thread: implicit)
+  s.appendChild(arrow(T.bwd.x+T.bwd.w, T.bwd.y+T.bwd.h/2, T.opt.x, T.opt.y+T.opt.h/2, C.green, '2 4'));
+
+  s.appendChild(text(W/2, 30, 'Data dependency resolution: GPU (wait_stream) + CPU (Event)', C.yellow, 13, 'middle'));
+
+  document.getElementById('diagram-deps').appendChild(s);
+})();
+
+// ============================================================
+// Diagram 2b: Dep example detail
+// ============================================================
+(function(){
+  const W=700, H=200;
+  const s = svg(W, H);
+
+  // Timeline
+  const steps = [
+    {x:30, w:200, label:'Thread "io"', sub:'h2d: ctx.slots.set("batch_gpu", tensor)', color:C.memcpy},
+    {x:280, w:10, label:'', sub:'completion["h2d"].set()', color:C.green},
+  ];
+  const steps2 = [
+    {x:30, w:180, label:'Thread "compute"', sub:'zero_grad ...', color:C.default},
+    {x:220, w:60, label:'', sub:'Event.wait()', color:C.yellow},
+    {x:290, w:200, label:'', sub:'forward: x = ctx.slots["batch_gpu"] ✓', color:C.default},
+  ];
+
+  // Row 1
+  steps.forEach(st => {
+    s.appendChild(rect(st.x, 30, st.w, 40, st.color+'22', 4, st.color));
+    s.appendChild(text(st.x+5, 55, st.sub, st.color, 10));
+  });
+  s.appendChild(text(10, 20, 'Thread "io":', C.green, 11));
+
+  // Row 2
+  steps2.forEach(st => {
+    s.appendChild(rect(st.x, 100, st.w, 40, st.color+'22', 4, st.color));
+    s.appendChild(text(st.x+5, 125, st.sub, st.color, 10));
+  });
+  s.appendChild(text(10, 90, 'Thread "compute":', C.green, 11));
+
+  // Arrow from completion to wait
+  s.appendChild(arrow(285, 70, 250, 100, C.accent));
+  s.appendChild(text(270, 88, 'unblock', C.accent, 9, 'middle'));
+
+  // Time
+  s.appendChild(arrow(30, H-15, W-20, H-15, C.dim));
+  s.appendChild(text(W-15, H-20, 'time', C.dim, 10, 'end'));
+  s.appendChild(text(W/2, H-4, 'slot write visible to consumer via CPU Event + GPU wait_stream', C.dim, 10, 'middle'));
+
+  document.getElementById('diagram-dep-example').appendChild(s);
+})();
+
+
+// ============================================================
+// Diagram 3: NCCL Ordering
+// ============================================================
+(function(){
+  const W=820, H=300;
+  const s = svg(W, H);
+  const LM=130;
+
+  s.appendChild(text(W/2, 24, 'NCCL tasks execute in declaration order via ticket lock', C.yellow, 13, 'middle'));
+
+  // Thread lanes
+  ['Thread A', 'Thread B'].forEach((name,i) => {
+    const y = 50 + i*110;
+    s.appendChild(rect(LM-4, y, W-LM-10, 90, '#161b22', 6, C.green));
+    s.appendChild(text(10, y+45, name, C.green, 11));
+  });
+
+  // Tasks
+  const tasks = [
+    // Thread A
+    {name:'AllGather', ticket:0, thread:0, x:0,   w:130, nccl:true},
+    {name:'compute_A', ticket:-1, thread:0, x:140, w:110, nccl:false},
+    {name:'AllReduce', ticket:2, thread:0, x:380, w:130, nccl:true},
+    // Thread B
+    {name:'compute_B', ticket:-1, thread:1, x:0,  w:140, nccl:false},
+    {name:'ReduceScatter', ticket:1, thread:1, x:150, w:160, nccl:true},
+    {name:'compute_C', ticket:-1, thread:1, x:440, w:110, nccl:false},
+  ];
+
+  tasks.forEach(t => {
+    const x = LM + 20 + t.x;
+    const y = 60 + t.thread*110 + 10;
+    const col = t.nccl ? C.nccl : C.default;
+    s.appendChild(rect(x, y, t.w, 50, col+'22', 6, col));
+    s.appendChild(text(x+t.w/2, y+20, t.name, col, 11, 'middle'));
+    if(t.nccl) {
+      s.appendChild(text(x+t.w/2, y+38, 'ticket='+t.ticket, C.yellow, 10, 'middle'));
+    }
+  });
+
+  // Ordering arrows (NCCL sequence)
+  const ncclPos = [
+    {x:LM+20+65, y:120},   // AllGather end
+    {x:LM+20+230, y:230},  // ReduceScatter end
+    {x:LM+20+445, y:120},  // AllReduce end
+  ];
+  // Arrow: ticket 0 → ticket 1
+  s.appendChild(arrow(ncclPos[0].x+65, ncclPos[0].y, ncclPos[1].x, ncclPos[1].y-40, C.red));
+  s.appendChild(text((ncclPos[0].x+65+ncclPos[1].x)/2+20, (ncclPos[0].y+ncclPos[1].y-40)/2, '①→②', C.red, 11, 'middle'));
+  // Arrow: ticket 1 → ticket 2
+  s.appendChild(arrow(ncclPos[1].x+80, ncclPos[1].y-40, ncclPos[2].x, ncclPos[2].y, C.red));
+  s.appendChild(text((ncclPos[1].x+80+ncclPos[2].x)/2-10, (ncclPos[1].y-40+ncclPos[2].y)/2-5, '②→③', C.red, 11, 'middle'));
+
+  // Time arrow
+  s.appendChild(arrow(LM, H-15, W-20, H-15, C.dim));
+  s.appendChild(text(W-15, H-20, 'time', C.dim, 10, 'end'));
+
+  document.getElementById('diagram-nccl').appendChild(s);
+})();
+
+// ============================================================
+// Diagram 4: Multi-Batch Pipeline (2 in-flight)
+// ============================================================
+(function(){
+  const W=900, H=350;
+  const s = svg(W, H);
+  const LM=80, CW=120, CH=36, GAP=6, RY=50;
+
+  s.appendChild(text(W/2, 24, 'Prefetch pipeline: in_flight_batches=2, 5 data batches', C.yellow, 13, 'middle'));
+
+  // Iteration labels
+  const iters = ['i=0\nprefill','i=1\nsteady','i=2\nsteady','i=3\nsteady','i=4\nsteady','i=5\ndrain'];
+  iters.forEach((label,i) => {
+    const x = LM + i*(CW+GAP*4);
+    const lines = label.split('\n');
+    s.appendChild(text(x+CW/2, RY-6, lines[0], C.fg, 11, 'middle'));
+    if(lines[1]) s.appendChild(text(x+CW/2, RY+6, lines[1], C.dim, 9, 'middle'));
+  });
+
+  // Row labels
+  s.appendChild(text(10, RY+CH/2+20, 'k=1', C.fg, 11));
+  s.appendChild(text(10, RY+CH/2+20+CH+30, 'k=0', C.fg, 11));
+  s.appendChild(text(2, RY+CH/2+32, '(h2d)', C.dim, 9));
+  s.appendChild(text(2, RY+CH/2+32+CH+30, '(compute)', C.dim, 9));
+
+  // Draw task blocks
+  function taskBlock(iter, row, batchIdx, label) {
+    const x = LM + iter*(CW+GAP*4);
+    const y = RY + 15 + row*(CH+30);
+    const col = C.batch[batchIdx % C.batch.length];
+    s.appendChild(rect(x, y, CW, CH, col+'33', 5, col));
+    s.appendChild(text(x+CW/2, y+CH/2+4, label, col, 10, 'middle'));
+  }
+
+  // k=1 (h2d) row — runs at i=0..4
+  for(let i=0; i<5; i++) taskBlock(i, 0, i, `h2d(batch_${i})`);
+
+  // k=0 (compute) row — runs at i=1..5
+  for(let i=1; i<=5; i++) taskBlock(i, 1, i-1, `compute(batch_${i-1})`);
+
+  // Overlap indicators
+  for(let i=1; i<5; i++) {
+    const x = LM + i*(CW+GAP*4) + CW/2;
+    const y1 = RY + 15 + CH;
+    const y2 = RY + 15 + CH + 30;
+    s.appendChild(line(x, y1+2, x, y2-2, C.green, '3 3'));
+    if(i===1) s.appendChild(text(x+5, (y1+y2)/2+4, 'overlap!', C.green, 9));
+  }
+
+  // Ring state
+  const ringY = RY + 2*(CH+30) + 40;
+  s.appendChild(text(10, ringY, 'BatchRing:', C.fg, 11));
+
+  iters.forEach((_, i) => {
+    const x = LM + i*(CW+GAP*4);
+    s.appendChild(rect(x, ringY+5, CW, 50, '#161b22', 4, C.border));
+
+    // Ring slots
+    const slot0 = i >= 1 ? `batch_${i-1}` : '(empty)';
+    const slot1 = i < 5 ? `batch_${i}` : '(empty)';
+    s.appendChild(text(x+5, ringY+22, `[0]: ${slot0}`, i>=1?C.batch[(i-1)%6]:C.dim, 9));
+    s.appendChild(text(x+5, ringY+42, `[1]: ${slot1}`, i<5?C.batch[i%6]:C.dim, 9));
+  });
+
+  // Time arrow
+  s.appendChild(arrow(LM, H-15, W-20, H-15, C.dim));
+  s.appendChild(text(W-15, H-20, 'time', C.dim, 10, 'end'));
+
+  document.getElementById('diagram-pipeline').appendChild(s);
+})();
+
+
+// ============================================================
+// Diagram 4b: Full 3-batch pipeline
+// ============================================================
+(function(){
+  const W=1100, H=380;
+  const s = svg(W, H);
+  const LM=80, CW=110, CH=30, GAP=4, RY=50;
+
+  s.appendChild(text(W/2, 24, 'in_flight_batches=3: h2d → data_dist → compute, 5 data batches', C.yellow, 13, 'middle'));
+
+  const iters = ['i=0','i=1','i=2','i=3','i=4','i=5','i=6'];
+  const phases = ['prefill','prefill','steady','steady','steady','drain','drain'];
+  iters.forEach((label,i) => {
+    const x = LM + i*(CW+GAP*3);
+    s.appendChild(text(x+CW/2, RY-6, label, C.fg, 10, 'middle'));
+    s.appendChild(text(x+CW/2, RY+6, phases[i], C.dim, 8, 'middle'));
+  });
+
+  // Rows
+  const rows = [
+    {label:'k=2 (h2d)', offset:2},
+    {label:'k=1 (dist)', offset:1},
+    {label:'k=0 (compute)', offset:0},
+  ];
+  rows.forEach((r,ri) => {
+    s.appendChild(text(2, RY+20+ri*(CH+14)+CH/2+3, r.label, C.dim, 9));
+  });
+
+  function taskBlock3(iter, row, batchIdx, label) {
+    if(batchIdx < 0 || batchIdx >= 5) return;
+    const x = LM + iter*(CW+GAP*3);
+    const y = RY + 14 + row*(CH+14);
+    const col = C.batch[batchIdx % C.batch.length];
+    s.appendChild(rect(x, y, CW, CH, col+'33', 4, col));
+    s.appendChild(text(x+CW/2, y+CH/2+4, label, col, 9, 'middle'));
+  }
+
+  // k=2: i=0..4, batch = i
+  for(let i=0;i<5;i++) taskBlock3(i, 0, i, `h2d(b${i})`);
+  // k=1: i=1..5, batch = i-1
+  for(let i=1;i<=5;i++) taskBlock3(i, 1, i-1, `dist(b${i-1})`);
+  // k=0: i=2..6, batch = i-2
+  for(let i=2;i<=6;i++) taskBlock3(i, 2, i-2, `compute(b${i-2})`);
+
+  // Overlap brackets for steady iterations
+  for(let i=2; i<5; i++) {
+    const x = LM + i*(CW+GAP*3) + CW + 2;
+    const y1 = RY + 14;
+    const y3 = RY + 14 + 2*(CH+14) + CH;
+    s.appendChild(line(x, y1, x, y3, C.green+'66'));
+    s.appendChild(text(x+4, (y1+y3)/2, '3 batches\noverlap', C.green, 8));
+  }
+
+  // User-visible output
+  const outY = RY + 3*(CH+14) + 20;
+  s.appendChild(text(10, outY+4, 'progress()\nreturns:', C.fg, 9));
+  const returns = ['-','-','batch_0','batch_1','batch_2','batch_3','batch_4'];
+  returns.forEach((r,i) => {
+    const x = LM + i*(CW+GAP*3);
+    const col = r==='-' ? C.dim : C.batch[(parseInt(r.slice(-1)))%6];
+    s.appendChild(text(x+CW/2, outY+4, r, col, 10, 'middle'));
+  });
+  s.appendChild(text(LM-10, outY+20, '(prefill absorbed: user sees M results for M batches)', C.dim, 9));
+
+  // Time
+  s.appendChild(arrow(LM, H-15, W-20, H-15, C.dim));
+  s.appendChild(text(W-15, H-20, 'time', C.dim, 10, 'end'));
+
+  document.getElementById('diagram-pipeline-3').appendChild(s);
+})();
+</script>
+
+</body>
+</html>
