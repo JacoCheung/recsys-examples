@@ -88,6 +88,7 @@ class Task:
     writes: Tuple[DataSlot, ...] = ()
     depends_on: Tuple[str, ...] = ()
     nvtx_tag: Optional[str] = None
+    nccl: bool = False
 
     def __init__(
         self,
@@ -101,6 +102,7 @@ class Task:
         writes: Optional[Tuple[DataSlot, ...]] = None,
         depends_on: Optional[Tuple[str, ...]] = None,
         nvtx_tag: Optional[str] = None,
+        nccl: Optional[bool] = None,
     ) -> None:
         # Instance fields override class defaults when provided.
         if name is not None:
@@ -121,6 +123,8 @@ class Task:
             self.depends_on = depends_on
         if nvtx_tag is not None:
             self.nvtx_tag = nvtx_tag
+        if nccl is not None:
+            self.nccl = nccl
 
         if not self.name:
             raise ValueError(
@@ -164,6 +168,7 @@ class Task:
         writes: Tuple[DataSlot, ...] = (),
         depends_on: Tuple[str, ...] = (),
         nvtx_tag: Optional[str] = None,
+        nccl: bool = False,
     ) -> "Task":
         """Factory for the lambda-style authoring form.
 
@@ -180,6 +185,7 @@ class Task:
             writes=writes,
             depends_on=depends_on,
             nvtx_tag=nvtx_tag,
+            nccl=nccl,
         )
 
 

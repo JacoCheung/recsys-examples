@@ -25,6 +25,7 @@ The store is scoped to one in-flight batch. V1 carries a single batch
 (`BatchRing(n=1)`); V4 generalizes to N batches with prefill/drain.
 """
 
+import threading
 from typing import Any, Dict, Generic, TypeVar
 
 __all__ = ["SlotStore", "BatchRing", "TaskContext"]
@@ -138,10 +139,27 @@ class TaskContext(Generic[In]):
     def __init__(self, ring: BatchRing, stream_pool) -> None:
         self._ring = ring
         self._stream_pool = stream_pool
-        self.iter_count: int = 0
-        # Set by the pipeline driver around each task.run() call.
-        # Default 0 for backward compat with V1-V3 call sites.
-        self._active_offset: int = 0
+        # Thread-local storage for _active_offset and iter_count so
+        # that ThreadedExecutor (Problem #3) can set them per-thread
+        # without races.  SequentialExecutor works identically — the
+        # main thread's local state is used.
+        self._local = threading.local()
+
+    @property
+    def _active_offset(self) -> int:
+        return getattr(self._local, "offset", 0)
+
+    @_active_offset.setter
+    def _active_offset(self, value: int) -> None:
+        self._local.offset = value
+
+    @property
+    def iter_count(self) -> int:
+        return getattr(self._local, "iter_count", 0)
+
+    @iter_count.setter
+    def iter_count(self, value: int) -> None:
+        self._local.iter_count = value
 
     @property
     def slots(self) -> SlotStore:
