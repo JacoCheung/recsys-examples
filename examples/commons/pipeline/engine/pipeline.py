@@ -39,6 +39,7 @@ import torch
 
 from .context import BatchRing, TaskContext
 from .deps import infer_cross_stream_waits
+from .executor import SequentialExecutor, ThreadedExecutor
 from .schedule import Schedule, Stage
 from .streams import StreamPool
 
@@ -77,11 +78,25 @@ class SchedulablePipeline(Generic[In, Out]):
         schedule: Schedule,
         stream_pool: StreamPool,
         *,
+        executor: Optional[object] = None,
         nvtx: bool = True,
     ) -> None:
         self._schedule = schedule
         self._stream_pool = stream_pool
         self._nvtx = nvtx
+        # Problem #3: pluggable executor. Default is sequential
+        # (backward-compatible with Problem #1).
+        if executor is None:
+            self._executor = SequentialExecutor()
+        elif executor == "threaded":
+            self._executor = ThreadedExecutor()
+        elif isinstance(executor, (SequentialExecutor, ThreadedExecutor)):
+            self._executor = executor
+        else:
+            raise TypeError(
+                f"executor must be None, 'threaded', SequentialExecutor, "
+                f"or ThreadedExecutor, got {type(executor).__name__}"
+            )
 
         # V4: multi-batch in-flight supported via BatchRing + §4.8
         # prefill/drain mask. V1 hardcoded n=1; V4 removes that cap.
@@ -162,31 +177,18 @@ class SchedulablePipeline(Generic[In, Out]):
         if self._exhausted and self._internal_iter >= self._pulled + self._max_offset:
             raise StopIteration
 
-        anchor_device = self._stream_pool.anchor_device
         iter_count = self._internal_iter
+        mask = lambda task: self._should_run(task, iter_count, self._pulled)
 
         for stage in self._schedule.stages:
-            for task in stage.tasks:
-                if not self._should_run(task, iter_count, self._pulled):
-                    continue
-                # Set the active offset so `ctx.slots` returns the
-                # task's declared batch's slot store.
-                self._ctx._active_offset = task.batch_offset
-                self._ctx.iter_count = iter_count
-                with self._stream_pool.use(task.stream):
-                    waits = self._cross_stream_waits.get(task.name, ())
-                    if waits and anchor_device is not None:
-                        consumer_stream = torch.cuda.current_stream()
-                        for producer_stream_name in waits:
-                            producer_stream = self._stream_pool.get(
-                                producer_stream_name
-                            )
-                            if producer_stream is None:
-                                producer_stream = torch.cuda.default_stream(
-                                    anchor_device
-                                )
-                            consumer_stream.wait_stream(producer_stream)
-                    task.run(self._ctx)
+            self._executor.execute_stage(
+                stage,
+                self._ctx,
+                iter_count,
+                mask,
+                self._cross_stream_waits,
+                self._stream_pool,
+            )
 
         # Restore active offset for any external inspection.
         self._ctx._active_offset = 0
@@ -232,10 +234,6 @@ class SchedulablePipeline(Generic[In, Out]):
         # StopIteration itself when no task's mask can fire anymore.
         return self._run_one_internal_iter(batch_iter)
 
-        result = self._ring.current().get(self.RETURN_SLOT, None)
-        self._ring.advance()
-        return result
-
     def step(self, batch) -> Optional[object]:
         """Convenience: run one iteration on a single batch.
 
@@ -244,6 +242,16 @@ class SchedulablePipeline(Generic[In, Out]):
         loop and wants minimal intrusion — one line change per step.
         """
         return self.progress(iter([batch]))
+
+    def shutdown(self) -> None:
+        """Release executor resources (e.g. thread pool)."""
+        self._executor.shutdown()
+
+    def __enter__(self) -> "SchedulablePipeline":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.shutdown()
 
     # ------------------------------------------------------------------
     # Preset: vanilla training-step pipeline (SPEC §4.7)
@@ -258,6 +266,10 @@ class SchedulablePipeline(Generic[In, Out]):
         # overlap knobs — enabled in V4
         prefetch: bool = False,
         memcpy_stream: bool = False,
+        # execution strategy (Problem #3)
+        threaded: bool = False,
+        thread_map: Optional[object] = None,
+        executor: Optional[object] = None,
         # escape hooks (AMP / clip / scheduler / custom loss)
         forward_fn: Optional[Callable[[torch.nn.Module, Any], Any]] = None,
         loss_fn: Optional[Callable[[Any], torch.Tensor]] = None,
@@ -348,4 +360,7 @@ class SchedulablePipeline(Generic[In, Out]):
                 torch.cuda.Stream(device) if device.type == "cuda" else None
             )
         pool = StreamPool(pool_dict)
-        return cls(schedule, pool)
+        # Resolve executor: explicit executor > threaded flag > default
+        if executor is None and threaded:
+            executor = ThreadedExecutor(thread_map=thread_map)
+        return cls(schedule, pool, executor=executor)

@@ -28,6 +28,7 @@ orchestration.
 | + gradient clipping | **T2** | Same, `optimizer_step_fn=lambda: (clip_grad_norm_(...), optimizer.step())` | ≤ 15 lines |
 | + LR scheduler | **T2** | Same, `optimizer_step_fn=lambda: (optimizer.step(), scheduler.step())` | ≤ 15 lines |
 | + H2D / compute overlap | **T2** | `prefetch=True, memcpy_stream=True` | ≤ 15 lines |
+| + multi-threaded task submission | **T2** | `threaded=True` or `ThreadedExecutor(thread_map=...)` — threads and streams decoupled | + 1 line |
 | Multi-task loss / custom routing / HSTU-style | **T3/T4** | Compose `Task` + `Schedule` + `StreamPool` directly | varies |
 
 ## Examples
@@ -61,6 +62,8 @@ Import surface (from `commons.pipeline.engine`):
 | `StreamPool` | Named stream registry. |
 | `TaskContext` | Per-iteration handle passed to every `Task.run(ctx)`. Exposes `ctx.slots`, `ctx.stream_pool`, `ctx.iter_count`. |
 | `ScheduleValidationError` | Raised when a `Schedule` violates [SPEC §4.2](../../../../../SPEC.md) rules. |
+| `ThreadedExecutor` | Multi-threaded executor (Problem #3). Threads and CUDA streams are decoupled; `thread_map` controls task→thread assignment. NCCL ordering safety built in. |
+| `SequentialExecutor` | Single-threaded executor (default). Identical to Problem #1 behavior. |
 
 For the auto-scheduler and cost profiler (V9):
 
