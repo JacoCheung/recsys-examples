@@ -154,6 +154,19 @@
   .badge-priv { background: #ffebe9; color: var(--critical); }
   .badge-int { background: #fff8c5; color: #6e5a00; }
 </style>
+<!-- KaTeX (math rendering) -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk" crossorigin="anonymous"
+  onload="renderMathInElement(document.body, {
+    delimiters: [
+      {left: '$$', right: '$$', display: true},
+      {left: '\\[', right: '\\]', display: true},
+      {left: '$', right: '$', display: false},
+      {left: '\\(', right: '\\)', display: false}
+    ],
+    throwOnError: false
+  });"></script>
 </head>
 <body>
 
@@ -240,15 +253,37 @@
 <main>
 <h1><span class="en">Schedulable Pipeline Engine</span><span class="zh">可调度流水线引擎</span></h1>
 <p class="meta">
-<span class="en">Branch: <code>junzhang/rework-mtms</code> · Last updated: 2026-04-26 · Coupled SPECs: <code>SPEC.md</code> (Problem #1), <code>SPEC_p2.md</code> (HSTU adapter), <code>SPEC_p3.md</code> (event-based sync, RESOLVED), <code>SPEC_p4_declarative_pipeline.md</code> (v2 declarative API).</span>
-<span class="zh">分支：<code>junzhang/rework-mtms</code> · 最后更新：2026-04-26 · 相互关联的 SPEC：<code>SPEC.md</code>（Problem #1）、<code>SPEC_p2.md</code>（HSTU 适配层）、<code>SPEC_p3.md</code>（基于事件的同步，已 RESOLVED）、<code>SPEC_p4_declarative_pipeline.md</code>（v2 声明式 API）。</span>
+<span class="en">Branch: <code>junzhang/postproc-cleanup</code> · Last updated: 2026-04-28 (UTC+8) · Coupled SPECs: <code>SPEC.md</code> (Problem #1), <code>SPEC_p2.md</code> (HSTU adapter), <code>SPEC_p3.md</code> (event-based sync, RESOLVED), <code>SPEC_p4_declarative_pipeline.md</code> (v2 declarative API).</span>
+<span class="zh">分支：<code>junzhang/postproc-cleanup</code> · 最后更新：2026-04-28（UTC+8）· 相互关联的 SPEC：<code>SPEC.md</code>（Problem #1）、<code>SPEC_p2.md</code>（HSTU 适配层）、<code>SPEC_p3.md</code>（基于事件的同步，已 RESOLVED）、<code>SPEC_p4_declarative_pipeline.md</code>（v2 声明式 API）。</span>
 </p>
+
+<div class="note" id="changelog-spec-p4-v3">
+  <strong><span class="en">Changelog: SPEC_p4 v3 (2026-04-28)</span><span class="zh">更新日志：SPEC_p4 v3（2026-04-28）</span></strong>
+  <ul>
+    <li><span class="en"><strong>Three-field dependency API</strong>: <code>depends_on</code> is now <em>same-batch logical dependency only</em> ("this task on batch K waits for X to have processed batch K"). Two new sibling fields cover the other two intents:
+      <ul>
+        <li><code>cross_iter_depends_on=("X", ("Y", -2), ...)</code> — different-batch logical dependency. Bare name is shorthand for <code>(name, -1)</code>; explicit tuple required for N&ne;1. Positive / zero offsets rejected.</li>
+        <li><code>same_progress_sync=("X", ...)</code> — same-progress GPU/stream coherency wait, regardless of which batches X and self are processing. Mirrors the legacy <code>default_stream.wait_stream(prefetch_stream)</code> pattern (e.g. <code>backward.same_progress_sync=("prefetch_embeddings",)</code>).</li>
+      </ul>
+      The three fields are non-overlapping (a producer name in two fields raises). Each is validated separately at <code>Task.__init__</code>.</span><span class="zh"><strong>三字段依赖 API</strong>：<code>depends_on</code> 现在<em>只</em>表达<em>同 batch 的逻辑依赖</em>（"本 task 处理 batch K 时，要等 X 处理完 batch K"）。另外两个意图改用新增的姐妹字段：
+      <ul>
+        <li><code>cross_iter_depends_on=("X", ("Y", -2), ...)</code> —— 跨 batch 的逻辑依赖。bare name 等价于 <code>(name, -1)</code>；N&ne;1 必须用显式 tuple。正/零 offset 直接拒绝。</li>
+        <li><code>same_progress_sync=("X", ...)</code> —— 同一次 progress 内的 GPU/stream 协同等待，与 X / self 处理的 batch 无关。对应遗留的 <code>default_stream.wait_stream(prefetch_stream)</code> 模式（如 <code>backward.same_progress_sync=("prefetch_embeddings",)</code>）。</li>
+      </ul>
+      三个字段名空间互斥（同一个 producer 名字出现在两个字段会报错），分别在 <code>Task.__init__</code> 校验。</span></li>
+    <li><span class="en"><strong>Topological-sort execution order replaces declaration order</strong>: <code>SchedulablePipeline.__init__</code> calls <code>topological_sort(schedule)</code> (Kahn's algorithm) and rebuilds the single-stage <code>Schedule</code> with the sorted task tuple. Edges come from <code>reads</code>/<code>writes</code> exact slot match, <code>depends_on</code> with matching lookahead, <code>same_progress_sync</code>, and <code>cross_iter_depends_on</code> entries with Δ=0 (auto-promoted, see next bullet). Δ ≥ 1 <code>cross_iter_depends_on</code> and cross-lookahead <code>depends_on</code> are excluded (cross-progress deps are satisfied by ring rotation, not intra-progress ordering). Declaration order is now only a tie-break for incomparable tasks.</span><span class="zh"><strong>拓扑排序执行序取代声明顺序</strong>：<code>SchedulablePipeline.__init__</code> 调用 <code>topological_sort(schedule)</code>（Kahn 算法），用排序后的任务元组重建单 stage 的 <code>Schedule</code>。边来自 <code>reads</code>/<code>writes</code> 精确 slot 匹配、lookahead 相等的 <code>depends_on</code>、<code>same_progress_sync</code>，以及 Δ=0 的 <code>cross_iter_depends_on</code>（自动提升，见下一条）；Δ ≥ 1 的 <code>cross_iter_depends_on</code> 与跨 lookahead 的 <code>depends_on</code> 不入边（跨 progress 由 ring 平移满足）。声明顺序仅作为不可比任务之间的 tie-break。</span></li>
+    <li><span class="en"><strong>Cross-iter slot-offset formula corrected</strong>: <code>cross_iter_depends_on=((X, -N))</code> now resolves the producer's event at <code>slot_offset = consumer.batch_offset + neg_offset</code>, not <code>producer.batch_offset + neg_offset</code>. The old formula was only correct when <code>producer.lookahead == consumer.lookahead</code>; the new one correctly indexes the consumer's view of the ring regardless of producer lookahead.</span><span class="zh"><strong>修正跨迭代 slot 偏移公式</strong>：<code>cross_iter_depends_on=((X, -N))</code> 现在通过 <code>slot_offset = consumer.batch_offset + neg_offset</code> 取 producer 事件，不再用 <code>producer.batch_offset + neg_offset</code>。旧公式只在 <code>producer.lookahead == consumer.lookahead</code> 时正确；新公式从 consumer 视角索引 ring，与 producer lookahead 无关。</span></li>
+    <li><span class="en"><strong>Δ = 0 <code>cross_iter_depends_on</code> auto-promoted to <code>same_progress_sync</code> semantics</strong>: when <code>consumer.la == producer.la + |neg_offset|</code> (the producer and consumer run in the same progress on different batches), the engine now treats the declaration as if the user had written <code>same_progress_sync=(producer,)</code> — adds a topo-DAG edge producer → consumer in <code>_build_same_progress_dag_edges</code>, adds the cross-thread CPU <code>threading.Event</code> in <code>_compute_cpu_deps</code>, and emits the cross-stream <code>wait_event</code> at <code>slot[producer.la]</code> (no ring rotation). Earlier this case raised at construction; the rejection was UX-only — see <code>tasks/SPEC_cross_iter_delta0_autoconvert.md</code> and <code>tests/commons/test_engine_same_progress_sync_correctness.py</code> (parametrized: same_progress_sync explicit ≡ cross_iter Δ=0 auto-promoted, GPU-verified).</span><span class="zh"><strong>Δ = 0 <code>cross_iter_depends_on</code> 自动提升为 <code>same_progress_sync</code> 语义</strong>：当 <code>consumer.la == producer.la + |neg_offset|</code>（producer 与 consumer 同 progress 处理不同 batch），引擎现在把这个声明当作用户写了 <code>same_progress_sync=(producer,)</code> 处理：在 <code>_build_same_progress_dag_edges</code> 里加 topo 边 producer → consumer，在 <code>_compute_cpu_deps</code> 里加跨线程 <code>threading.Event</code> 边，跨 stream 时在 <code>slot[producer.la]</code> emit <code>wait_event</code>（无 ring 旋转）。早期版本会在构造时 raise；之前的拒绝纯属 UX 选择——详见 <code>tasks/SPEC_cross_iter_delta0_autoconvert.md</code> 与 <code>tests/commons/test_engine_same_progress_sync_correctness.py</code>（参数化：显式 same_progress_sync ≡ Δ=0 cross_iter 自动提升，GPU 验证一致）。</span></li>
+    <li><span class="en"><strong>Cross-iter future-read validator</strong>: <code>infer_cross_stream_event_deps</code> raises at schedule construction when <strong>Δ &lt; 0</strong> (i.e., <code>consumer.la &gt; producer.la + |neg_offset|</code>): the producer hasn't yet processed batch K-N by the consumer's progress, so the dependency is impossible to honor.</span><span class="zh"><strong>跨迭代 future-read 校验</strong>：<code>infer_cross_stream_event_deps</code> 在 <strong>Δ &lt; 0</strong>（即 <code>consumer.la &gt; producer.la + |neg_offset|</code>）时构造期 raise——consumer 的 progress 时 producer 还没处理过 batch K-N，依赖不可能满足。</span></li>
+    <li><span class="en"><strong>PostProc dead-code removed</strong>: <code>PipelinedPostproc</code>, <code>PipelineState.pipelined_postprocs</code>, the <code>set_module_context</code> propagation loop, and the now-orphaned <code>_validate_set_context_colocation</code> guard are deleted (never wired in production). The torchrec <code>set_context</code> mutation that motivated those guards no longer exists in this codebase.</span><span class="zh"><strong>删除 PostProc 死代码</strong>：<code>PipelinedPostproc</code>、<code>PipelineState.pipelined_postprocs</code>、<code>set_module_context</code> 传播循环、以及随之失去意义的 <code>_validate_set_context_colocation</code> 守卫全部删除（从未在生产链路接入）。当初触发这些守卫的 torchrec <code>set_context</code> mutation 已不在本仓库出现。</span></li>
+  </ul>
+</div>
 
 <div class="note" id="changelog-spec-p4-v2">
   <strong><span class="en">Changelog: SPEC_p4 v2 (2026-04-26)</span><span class="zh">更新日志：SPEC_p4 v2（2026-04-26）</span></strong>
   <ul>
     <li><span class="en"><strong>User-facing Task API</strong>: <code>batch_offset=N</code> kwarg removed. Use <code>lookahead=N</code> instead — same semantics, better name. <code>reads</code> / <code>writes</code> accept bare strings; offsets are inferred from the producer's <code>lookahead</code>.</span><span class="zh"><strong>用户可见的 Task API</strong>：移除了 <code>batch_offset=N</code> 形参。改用 <code>lookahead=N</code>，语义不变、名字更准。<code>reads</code> / <code>writes</code> 直接传字符串，offset 由生产者的 <code>lookahead</code> 自动推断。</span></li>
-    <li><span class="en"><strong>Bare-name <code>depends_on</code></strong>: write <code>depends_on=("prefetch_embeddings",)</code> and the engine auto-classifies as within-iter or cross-iter from the producer's vs consumer's <code>lookahead</code>. No more leaking pseudo-slot names like <code>module_input_post_prefetch</code> in user code.</span><span class="zh"><strong>bare-name <code>depends_on</code></strong>：直接写 <code>depends_on=("prefetch_embeddings",)</code>，引擎根据生产者/消费者的 <code>lookahead</code> 自动判断是同迭代还是跨迭代依赖。再也不用把 <code>module_input_post_prefetch</code> 这类 pseudo-slot 暴露在用户代码里。</span></li>
+    <li><span class="en"><strong>Bare-name <code>depends_on</code></strong>: write <code>depends_on=("prefetch_embeddings",)</code> and the engine auto-classifies as within-iter or cross-iter from the producer's vs consumer's <code>lookahead</code>. No more leaking pseudo-slot names like <code>module_input_post_prefetch</code> in user code. <em>(Superseded in v3 — see above.)</em></span><span class="zh"><strong>bare-name <code>depends_on</code></strong>：直接写 <code>depends_on=("prefetch_embeddings",)</code>，引擎根据生产者/消费者的 <code>lookahead</code> 自动判断是同迭代还是跨迭代依赖。再也不用把 <code>module_input_post_prefetch</code> 这类 pseudo-slot 暴露在用户代码里。<em>（v3 已替换为三字段，见上。）</em></span></li>
     <li><span class="en"><strong>Declarative <code>Pipeline</code> wrapper</strong>: <code>commons.pipeline.engine.Pipeline(tasks=[...])</code> — a thin façade over <code>SchedulablePipeline</code> + <code>Schedule</code> + <code>StreamPool</code> for one-shot user code.</span><span class="zh"><strong>声明式 <code>Pipeline</code> 封装</strong>：<code>commons.pipeline.engine.Pipeline(tasks=[...])</code>，把 <code>SchedulablePipeline</code> + <code>Schedule</code> + <code>StreamPool</code> 一层薄封装，给一次性用户代码用。</span></li>
     <li><span class="en"><strong>Event-based cross-stream sync</strong>: executor prefers <code>wait_event(producer_event)</code> from the ring slot over coarse <code>wait_stream(producer_stream)</code>. Stream-level wait remains as first-iter fallback.</span><span class="zh"><strong>基于 Event 的跨流同步</strong>：执行器优先从 ring slot 取 <code>wait_event(producer_event)</code>，回退到粗粒度的 <code>wait_stream(producer_stream)</code>。stream 级别的 wait 仍作为第一轮迭代的兜底。</span></li>
     <li><span class="en"><strong>NVTX integration</strong>: every <code>task.run(ctx)</code> is wrapped in <code>nvtx.annotate(task.nvtx_tag or task.name)</code> at all execution callsites (sequential, threaded, single-task fast path, NCCL-locked path). No-op on CPU-only hosts.</span><span class="zh"><strong>NVTX 集成</strong>：所有执行点（sequential / threaded / 单任务快路径 / NCCL-锁路径）都用 <code>nvtx.annotate(task.nvtx_tag or task.name)</code> 包裹了 <code>task.run(ctx)</code>。CPU-only 环境下是 no-op。</span></li>
@@ -447,9 +482,11 @@ commons.pipeline.hstu_pipeline
     <span class="zh"><code>create_torchrec_ctx</code> 断言 <code>ctx.version == 1</code>。由 <code>test_no_v0_context_references_in_hstu_pipeline</code>（正则扫描）强制约束。</span>
   </li>
   <li>
-    <strong><span class="en">Set-context co-location</span><span class="zh">set_context 同线程</span></strong>:
-    <span class="en">HSTU's <code>start_input_dist</code> and <code>forward</code> must run on the same worker thread. Enforced at construction by <code>HSTUPipeline._validate_set_context_colocation</code>.</span>
-    <span class="zh">HSTU 的 <code>start_input_dist</code> 与 <code>forward</code> 必须落在同一个工作线程。在构造时由 <code>HSTUPipeline._validate_set_context_colocation</code> 校验。</span>
+    <strong><span class="en">Out-of-slot shared state needs an engine-visible happens-before</span><span class="zh">slot 之外的共享状态需要引擎可见的 happens-before</span></strong>:
+    <span class="en"><strong>Rule.</strong> Engine only inserts sync for edges it can see: same-slot <code>reads</code>/<code>writes</code>, matching-la <code>depends_on</code>, or <code>same_progress_sync</code>. Anything outside slots — module attributes, <code>PipelineState</code> fields, globals — is invisible. If two tasks mutate the same out-of-slot object without one of those declared edges, author must colocate them on one thread via <code>thread_map</code> (same thread = serial, no race). Convention only; no runtime check.<br><br>
+    <strong>Example.</strong> Two tasks both write <code>module.forward._context</code>: <code>start_input_dist</code> (la=1) and <code>forward</code> (la=0). Within one progress, ordering is fine — <code>forward</code> reads <code>torchrec_ctx</code> that <code>start_input_dist</code> wrote (slot edge). But across progresses <code>forward</code>(P_n) and <code>start_input_dist</code>(P_n) actually run concurrently in the same progress on different lookaheads, touching <em>different</em> batches' contexts but the <em>same</em> Python attribute → race. Fix used: drop the shared mutation entirely (PostProc cleanup); the colocation guard that previously enforced "put both on one thread" was deleted along with it.</span>
+    <span class="zh"><strong>规则。</strong>引擎只对它能看见的边加 sync：同 slot 的 <code>reads</code>/<code>writes</code>、la 相等的 <code>depends_on</code>、或 <code>same_progress_sync</code>。slot 之外的东西—— module 属性、<code>PipelineState</code> 字段、全局变量——引擎看不见。如果两个 task 改 slot 之外的同一个对象、又没声明上述任意一种边，必须用 <code>thread_map</code> 放到同一个线程（单线程内自然串行）。约定式约束，运行时不检查。<br><br>
+    <strong>例子。</strong>两个 task 都写 <code>module.forward._context</code>：<code>start_input_dist</code>(la=1) 与 <code>forward</code>(la=0)。同一次 progress 内顺序没问题——<code>forward</code> 读 <code>start_input_dist</code> 写过的 <code>torchrec_ctx</code> slot（slot 边）。但 P_n 里的 <code>forward</code> 与 <code>start_input_dist</code> 同 progress 不同 la 并发跑，触碰<em>不同</em>批次的 context 但是<em>同一个</em> Python 属性 → 竞态。修法：直接砍掉这个共享 mutation（PostProc 清理），原本"把两者放同线程"的运行时校验也一并删除。</span>
   </li>
 </ul>
 </section>
@@ -467,22 +504,33 @@ commons.pipeline.hstu_pipeline
 </p>
 <pre><span class="kw">class</span> <span class="ty">Task</span>:
     name: <span class="ty">str</span>
-    stream: <span class="ty">str</span>                       <span class="cm"># named CUDA stream context</span>
-    priority: <span class="ty">int</span>                    <span class="cm"># NVTX priority hint</span>
-    lookahead: <span class="ty">int</span>                   <span class="cm"># SPEC_p4 v2: 0 = current batch, k = k iters ahead</span>
-    reads: Tuple[<span class="ty">DataSlot</span>, ...]      <span class="cm"># slots consumed (str shorthand auto-wraps)</span>
-    writes: Tuple[<span class="ty">DataSlot</span>, ...]     <span class="cm"># slots produced</span>
-    depends_on: Tuple[<span class="ty">str</span>, ...]      <span class="cm"># bare-name task edges; engine</span>
-                                       <span class="cm">#   auto-classifies within/cross-iter</span>
-                                       <span class="cm">#   from producer.lookahead vs consumer.lookahead</span>
-    nccl: <span class="ty">bool</span>                       <span class="cm"># participate in NCCL ordered lock</span>
-    nvtx_tag: Optional[<span class="ty">str</span>]            <span class="cm"># auto-emitted via nvtx.annotate</span>
+    stream: <span class="ty">str</span>                                 <span class="cm"># named CUDA stream context</span>
+    priority: <span class="ty">int</span>                              <span class="cm"># NVTX priority hint</span>
+    lookahead: <span class="ty">int</span>                             <span class="cm"># SPEC_p4 v2: 0 = current batch, k = k iters ahead</span>
+    reads: Tuple[<span class="ty">DataSlot</span>, ...]                <span class="cm"># slots consumed (str shorthand auto-wraps)</span>
+    writes: Tuple[<span class="ty">DataSlot</span>, ...]               <span class="cm"># slots produced</span>
+    depends_on: Tuple[<span class="ty">str</span>, ...]                <span class="cm"># SAME-batch logical edge: this task on</span>
+                                                 <span class="cm">#   batch K waits for X to have processed K</span>
+    cross_iter_depends_on: Tuple[Tuple[<span class="ty">str</span>, <span class="ty">int</span>], ...]
+                                                 <span class="cm"># DIFFERENT-batch logical edge: ("X",) is</span>
+                                                 <span class="cm">#   shorthand for (X, -1); ("Y", -N) for N&ne;1.</span>
+                                                 <span class="cm">#   Positive/zero offsets rejected.</span>
+    same_progress_sync: Tuple[<span class="ty">str</span>, ...]        <span class="cm"># SAME-progress GPU/stream coherency wait,</span>
+                                                 <span class="cm">#   regardless of which batches X/self process</span>
+                                                 <span class="cm">#   (mirrors legacy default_stream.wait_stream)</span>
+    nccl: <span class="ty">bool</span>                                 <span class="cm"># participate in NCCL ordered lock</span>
+    nvtx_tag: Optional[<span class="ty">str</span>]                      <span class="cm"># auto-emitted via nvtx.annotate</span>
 
     <span class="kw">def</span> run(<span class="kw">self</span>, ctx: <span class="ty">TaskContext</span>) -> <span class="ty">None</span>: ...</pre>
 
 <p>
-<span class="en"><strong>SPEC_p4 v2 user API note</strong> (commits <code>2060ee62</code>, <code>9a2c7a12</code>, <code>faa7a30f</code>): the legacy <code>batch_offset=N</code> kwarg is removed (Phase C hard break). Pass <code>lookahead=N</code>; <code>reads</code> / <code>writes</code> accept bare strings; <code>depends_on</code> is bare-name and the engine derives within/cross-iter from the lookahead diff. Pseudo-slot names (e.g. <code>module_input_post_prefetch</code>) are no longer required to model HSTU's prefetch→forward mutation chain.</span>
-<span class="zh"><strong>SPEC_p4 v2 用户 API 说明</strong>（提交 <code>2060ee62</code>、<code>9a2c7a12</code>、<code>faa7a30f</code>）：legacy 的 <code>batch_offset=N</code> 形参已移除（Phase C hard break）。改用 <code>lookahead=N</code>；<code>reads</code> / <code>writes</code> 直接传字符串；<code>depends_on</code> 用 bare name，引擎从 lookahead 差自动判断同迭代/跨迭代。HSTU 的 prefetch→forward mutation chain 不再需要 pseudo-slot 名（如 <code>module_input_post_prefetch</code>）。</span>
+<span class="en"><strong>SPEC_p4 v3 user API note</strong>: the three dependency fields encode three distinct intents and are <em>not</em> interchangeable. <code>depends_on</code> is for same-batch logical waits (e.g. <code>backward.depends_on=("zero_grad",)</code>); <code>cross_iter_depends_on</code> is for "wait for X from N batches ago" (rare in HSTU); <code>same_progress_sync</code> is for "wait for X's GPU work in <em>this</em> progress to finish" (e.g. <code>backward.same_progress_sync=("prefetch_embeddings",)</code> in the prefetch variant — a stream coherency wait, not a logical batch dependency). Names mentioned in two fields raise at <code>Task.__init__</code>. Subclasses can set the three as class attributes; normalization runs unconditionally so bare-name shorthand works in both kwargs and class-attr forms.</span>
+<span class="zh"><strong>SPEC_p4 v3 用户 API 说明</strong>：三个依赖字段表达三种不同的意图，<em>不可</em>互换。<code>depends_on</code> 用于同 batch 的逻辑等待（如 <code>backward.depends_on=("zero_grad",)</code>）；<code>cross_iter_depends_on</code> 用于"等 X 处理 N 个 batch 之前的工作"（HSTU 暂无用例）；<code>same_progress_sync</code> 用于"等 X 在<em>本次</em> progress 内的 GPU 工作做完"（如 prefetch 变体的 <code>backward.same_progress_sync=("prefetch_embeddings",)</code> —— 是 stream 协同等待，不是逻辑 batch 依赖）。同一个名字出现在两个字段会在 <code>Task.__init__</code> 抛错。子类可以以类属性形式设置三者；规范化无条件运行，bare-name 简写在 kwargs 和 class-attr 两种写法下都生效。</span>
+</p>
+
+<p>
+<span class="en"><strong>SPEC_p4 v2 user API note</strong> (commits <code>2060ee62</code>, <code>9a2c7a12</code>, <code>faa7a30f</code>): the legacy <code>batch_offset=N</code> kwarg is removed (Phase C hard break). Pass <code>lookahead=N</code>; <code>reads</code> / <code>writes</code> accept bare strings. Pseudo-slot names (e.g. <code>module_input_post_prefetch</code>) are no longer required to model HSTU's prefetch→forward mutation chain.</span>
+<span class="zh"><strong>SPEC_p4 v2 用户 API 说明</strong>（提交 <code>2060ee62</code>、<code>9a2c7a12</code>、<code>faa7a30f</code>）：legacy 的 <code>batch_offset=N</code> 形参已移除（Phase C hard break）。改用 <code>lookahead=N</code>；<code>reads</code> / <code>writes</code> 直接传字符串。HSTU 的 prefetch→forward mutation chain 不再需要 pseudo-slot 名（如 <code>module_input_post_prefetch</code>）。</span>
 </p>
 
 <p>
@@ -504,8 +552,8 @@ commons.pipeline.hstu_pipeline
     stream_slots=(<span class="st">"default"</span>, <span class="st">"memcpy"</span>),
 )</pre>
 <p>
-<span class="en">Stages run in declaration order; tasks within a stage run subject to the <a href="#engine-mask">§4.8 mask</a> + executor's parallelism choice. <code>in_flight_batches</code> is derived from <code>max(task.batch_offset) + 1</code>.</span>
-<span class="zh">Stage 按声明顺序运行；同一个 Stage 内的任务受 <a href="#engine-mask">§4.8 掩码</a> 与执行器的并行策略共同约束。<code>in_flight_batches</code> 由 <code>max(task.batch_offset) + 1</code> 推导得到。</span>
+<span class="en">Stages run in the order they appear in <code>Schedule.stages</code>. The <em>tasks</em> within a single-stage schedule are reordered at <code>SchedulablePipeline.__init__</code> by <code>topological_sort()</code> (<code>autosched/deps.py</code>): edges come from exact-slot <code>reads</code>/<code>writes</code> match, <code>depends_on</code> with matching <code>lookahead</code>, and <code>same_progress_sync</code>; <code>cross_iter_depends_on</code> and cross-lookahead <code>depends_on</code> contribute no in-progress edge (cross-iter is satisfied by ring rotation). Author-declaration order is the tie-break for incomparable tasks. The §4.8 mask + executor parallelism choice still gate runtime triggering. <code>in_flight_batches</code> is derived from <code>max(task.lookahead) + 1</code>.</span>
+<span class="zh">Stage 按 <code>Schedule.stages</code> 中出现的顺序运行。单 stage 内的<em>任务</em>由 <code>SchedulablePipeline.__init__</code> 调用 <code>topological_sort()</code>（<code>autosched/deps.py</code>）重新排序：边来自 <code>reads</code>/<code>writes</code> 精确 slot 匹配、<code>lookahead</code> 相等的 <code>depends_on</code>、以及 <code>same_progress_sync</code>；<code>cross_iter_depends_on</code> 与跨 lookahead 的 <code>depends_on</code> 不入边（跨迭代由 ring 平移满足）。声明顺序作为不可比任务之间的 tie-break。运行期触发仍由 §4.8 掩码与执行器并行策略约束。<code>in_flight_batches</code> 由 <code>max(task.lookahead) + 1</code> 推导。</span>
 </p>
 
 <p>
@@ -519,12 +567,12 @@ commons.pipeline.hstu_pipeline
 </tr></thead>
 <tbody>
 <tr><td>1</td><td><span class="en">Task names are unique within the schedule.</span><span class="zh">同一个 schedule 中任务名唯一。</span></td></tr>
-<tr><td>2</td><td><span class="en"><code>batch_offset &gt;= 0</code> for tasks and slots.</span><span class="zh">任务和 slot 的 <code>batch_offset &gt;= 0</code>。</span></td></tr>
+<tr><td>2</td><td><span class="en"><code>task.lookahead &gt;= 0</code> and <code>slot.batch_offset &gt;= 0</code>.</span><span class="zh"><code>task.lookahead &gt;= 0</code> 且 <code>slot.batch_offset &gt;= 0</code>。</span></td></tr>
 <tr><td>3</td><td><span class="en">Every <code>task.stream</code> is in <code>schedule.stream_slots</code> AND in <code>StreamPool</code>.</span><span class="zh">每个 <code>task.stream</code> 既要在 <code>schedule.stream_slots</code> 中，也要在 <code>StreamPool</code> 中。</span></td></tr>
 <tr><td>4</td><td><span class="en">Each <code>DataSlot(name, offset)</code> has at most one writer.</span><span class="zh">每个 <code>DataSlot(name, offset)</code> 最多只有一个 writer。</span></td></tr>
 <tr><td>5</td><td><span class="en">Every read resolves to a writer (cross-iter via ring carry allowed; reserved slot <code>batch_cpu</code> exempt).</span><span class="zh">每个读都能解析到一个 writer（允许跨迭代通过 ring 进位；保留 slot <code>batch_cpu</code> 例外）。</span></td></tr>
-<tr><td>6</td><td><span class="en">Every <code>depends_on</code> name resolves to a task that appears earlier in declaration order.</span><span class="zh">每个 <code>depends_on</code> 引用的任务都必须在声明顺序中位于当前任务之前。</span></td></tr>
-<tr><td>7</td><td><span class="en">The combined slot + depends_on graph is acyclic.</span><span class="zh">slot + depends_on 形成的图无环。</span></td></tr>
+<tr><td>6</td><td><span class="en">Every name in <code>depends_on</code>, <code>cross_iter_depends_on</code>, or <code>same_progress_sync</code> resolves to a task in the same schedule. Declaration-order is no longer required; <code>topological_sort</code> picks a valid execution order.</span><span class="zh">出现在 <code>depends_on</code>、<code>cross_iter_depends_on</code> 或 <code>same_progress_sync</code> 中的名字必须能解析到本 schedule 中的任务。不再要求声明顺序；<code>topological_sort</code> 会算出可执行顺序。</span></td></tr>
+<tr><td>7</td><td><span class="en">The intra-progress graph (slot edges + matching-lookahead <code>depends_on</code> + <code>same_progress_sync</code>) is acyclic — checked by running <code>topological_sort</code>; failure raises <code>SchedulingError("cyclic dependency")</code>.</span><span class="zh">progress 内的图（slot 边 + 同 lookahead 的 <code>depends_on</code> + <code>same_progress_sync</code>）必须无环 —— 直接调用 <code>topological_sort</code> 检测，失败时抛 <code>SchedulingError("cyclic dependency")</code>。</span></td></tr>
 <tr><td>8</td><td><span class="en">Cross-stream waits are emitted exactly once per (consumer, producer-stream) pair.</span><span class="zh">每个 (consumer, producer-stream) 对的 cross-stream wait 仅插入一次。</span></td></tr>
 </tbody>
 </table>
@@ -610,26 +658,26 @@ commons.pipeline.hstu_pipeline
 <section id="engine-mask">
 <h3><span class="en">3.4 §4.8 mask formula</span><span class="zh">3.4 §4.8 触发掩码公式</span></h3>
 <p>
-<span class="en">Determines whether a task at <code>batch_offset = k</code> fires at iteration <code>i</code>:</span>
-<span class="zh">决定 <code>batch_offset = k</code> 的任务是否在迭代 <code>i</code> 触发：</span>
+<span class="en">Determines whether a task at <code>lookahead = k</code> fires at iteration <code>i</code> (<code>max_lookahead</code> = <code>max(task.lookahead)</code> across the schedule):</span>
+<span class="zh">决定 <code>lookahead = k</code> 的任务是否在迭代 <code>i</code> 触发（<code>max_lookahead</code> 取 schedule 中所有 task 的 <code>lookahead</code> 最大值）：</span>
 </p>
-<pre>fire iff   <span class="kw">(max_offset - k) ≤ i &lt; M_known + (max_offset - k)</span></pre>
+<pre>fire iff   <span class="kw">(max_lookahead - k) ≤ i &lt; M_known + (max_lookahead - k)</span></pre>
 <p>
 <span class="en">where <code>M_known = pulled</code> while pulling is live, otherwise the final <code>M</code>.</span>
 <span class="zh">其中 <code>M_known</code> 在还在拉数据时等于已拉数 <code>pulled</code>，拉完之后等于最终的 <code>M</code>。</span>
 </p>
 <ul>
   <li>
-    <span class="en">The <strong>prefill phase</strong> (i &lt; max_offset) runs only deep-offset tasks; compute @ offset 0 doesn't fire yet.</span>
-    <span class="zh"><strong>预热阶段</strong>（i &lt; max_offset）只跑深 offset 的任务；offset 0 上的 compute 还不触发。</span>
+    <span class="en">The <strong>prefill phase</strong> (i &lt; max_lookahead) runs only deep-lookahead tasks; compute @ lookahead=0 doesn't fire yet.</span>
+    <span class="zh"><strong>预热阶段</strong>（i &lt; max_lookahead）只跑 lookahead 较深的任务；lookahead=0 上的 compute 还不触发。</span>
   </li>
   <li>
-    <span class="en">The <strong>steady phase</strong> (max_offset ≤ i &lt; M) runs all qualifying tasks each iter.</span>
-    <span class="zh"><strong>稳态阶段</strong>（max_offset ≤ i &lt; M）每轮都跑所有满足条件的任务。</span>
+    <span class="en">The <strong>steady phase</strong> (max_lookahead ≤ i &lt; M) runs all qualifying tasks each iter.</span>
+    <span class="zh"><strong>稳态阶段</strong>（max_lookahead ≤ i &lt; M）每轮都跑所有满足条件的任务。</span>
   </li>
   <li>
-    <span class="en">The <strong>drain phase</strong> (i ≥ M) runs only shallow-offset tasks until the ring is empty.</span>
-    <span class="zh"><strong>排空阶段</strong>（i ≥ M）只跑浅 offset 的任务，直到环清空。</span>
+    <span class="en">The <strong>drain phase</strong> (i ≥ M) runs only shallow-lookahead tasks until the ring is empty.</span>
+    <span class="zh"><strong>排空阶段</strong>（i ≥ M）只跑 lookahead 较浅的任务，直到环清空。</span>
   </li>
 </ul>
 <p>
@@ -662,6 +710,279 @@ commons.pipeline.hstu_pipeline
 <tr><td><code>_seed_first_batch</code></td><td><span class="badge badge-priv">private</span></td><td><span class="en">Pre-populate <code>ring.at(max_offset)</code> for adapter bootstrap.</span><span class="zh">为适配层引导预填 <code>ring.at(max_offset)</code>。</span></td></tr>
 </tbody>
 </table>
+</section>
+
+<section id="event-deps-graph">
+<h3><span class="en">3.6 Event-sync graph &amp; slot_offset</span><span class="zh">3.6 事件同步图与 slot_offset</span></h3>
+
+<p>
+<span class="en"><code>deps.infer_cross_stream_event_deps(schedule)</code> compiles the four user-facing dependency declarations (<code>reads/writes</code>, <code>depends_on</code>, <code>cross_iter_depends_on</code>, <code>same_progress_sync</code>) into a flat per-consumer list of <code>(producer, producer_stream, slot_offset)</code> triples. At runtime the executor performs <code>ring.at(slot_offset).get_event(producer)</code> + <code>consumer.wait_event(event)</code>. Two views below clarify (a) which declarations become topological-sort edges vs. only event-emit edges, and (b) how each edge's <code>slot_offset</code> is derived from ring rotation.</span>
+<span class="zh"><code>deps.infer_cross_stream_event_deps(schedule)</code> 把用户层四种依赖声明（<code>reads/writes</code>、<code>depends_on</code>、<code>cross_iter_depends_on</code>、<code>same_progress_sync</code>）编译成每个 consumer 的扁平三元组列表 <code>(producer, producer_stream, slot_offset)</code>。运行期 executor 执行 <code>ring.at(slot_offset).get_event(producer)</code> + <code>consumer.wait_event(event)</code>。下面两张图分别说明：(a) 哪些声明会成为 topological_sort 的边、哪些只 emit 事件；(b) 每种边的 <code>slot_offset</code> 如何由 ring 旋转推出。</span>
+</p>
+
+<figure><div class="svg-wrap">
+<svg width="820" height="320" viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg">
+  <text x="410" y="20" text-anchor="middle" font-family="ui-monospace,monospace" font-size="14" font-weight="700">Same-progress dependency DAG (topological sort source)</text>
+  <text x="410" y="36" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" fill="#656d76">solid edges constrain in-progress execution order; dashed edges only emit ring-rotated wait_event</text>
+
+  <defs>
+    <marker id="arrEvBlk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <marker id="arrEvBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0969da"/>
+    </marker>
+    <marker id="arrEvOr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#bc4c00"/>
+    </marker>
+    <marker id="arrEvRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/>
+    </marker>
+  </defs>
+
+  <g>
+    <rect x="30" y="80" width="120" height="40" rx="4" class="uml-box-fill"/>
+    <text x="90" y="98" text-anchor="middle" class="uml-text-em">start_input_dist</text>
+    <text x="90" y="112" text-anchor="middle" class="uml-text-mute">la=1, data_dist</text>
+  </g>
+  <g>
+    <rect x="190" y="80" width="120" height="40" rx="4" class="uml-box-fill"/>
+    <text x="250" y="98" text-anchor="middle" class="uml-text-em">wait_input_dist</text>
+    <text x="250" y="112" text-anchor="middle" class="uml-text-mute">la=1, data_dist</text>
+  </g>
+  <g>
+    <rect x="350" y="30" width="140" height="40" rx="4" class="uml-box-fill"/>
+    <text x="420" y="48" text-anchor="middle" class="uml-text-em">prefetch_embeddings</text>
+    <text x="420" y="62" text-anchor="middle" class="uml-text-mute">la=1, prefetch</text>
+  </g>
+  <g>
+    <rect x="350" y="140" width="140" height="40" rx="4" class="uml-box-fill"/>
+    <text x="420" y="158" text-anchor="middle" class="uml-text-em">forward</text>
+    <text x="420" y="172" text-anchor="middle" class="uml-text-mute">la=0, default</text>
+  </g>
+  <g>
+    <rect x="530" y="140" width="120" height="40" rx="4" class="uml-box-fill"/>
+    <text x="590" y="158" text-anchor="middle" class="uml-text-em">backward</text>
+    <text x="590" y="172" text-anchor="middle" class="uml-text-mute">la=0, default</text>
+  </g>
+  <g>
+    <rect x="540" y="30" width="120" height="40" rx="4" class="uml-box-fill" style="stroke-dasharray: 4,3;"/>
+    <text x="600" y="48" text-anchor="middle" class="uml-text-em">aux_stats</text>
+    <text x="600" y="62" text-anchor="middle" class="uml-text-mute">la=2, stats (hyp.)</text>
+  </g>
+
+  <line x1="150" y1="100" x2="190" y2="100" stroke="#0969da" stroke-width="2" marker-end="url(#arrEvBlue)"/>
+  <text x="170" y="93" text-anchor="middle" font-family="ui-monospace,monospace" font-size="9" fill="#0969da">depends_on</text>
+
+  <path d="M310 88 Q335 65 350 56" stroke="#0969da" stroke-width="2" fill="none" marker-end="url(#arrEvBlue)"/>
+  <text x="318" y="74" font-family="ui-monospace,monospace" font-size="9" fill="#0969da">depends_on</text>
+
+  <path d="M420 70 L420 140" stroke="#0969da" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrEvBlue)"/>
+  <text x="425" y="108" font-family="ui-monospace,monospace" font-size="9" fill="#0969da">depends_on (cross-la)</text>
+
+  <path d="M490 60 Q540 100 555 140" stroke="#bc4c00" stroke-width="2" fill="none" marker-end="url(#arrEvOr)"/>
+  <text x="500" y="100" font-family="ui-monospace,monospace" font-size="9" fill="#bc4c00">same_progress_sync</text>
+
+  <path d="M490 50 L540 50" stroke="#cf222e" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrEvRed)"/>
+  <text x="495" y="42" font-family="ui-monospace,monospace" font-size="9" fill="#cf222e">cross_iter (-1)</text>
+
+  <g font-family="ui-monospace,monospace" font-size="11">
+    <text x="20" y="218" font-weight="700">Edge legend (color = sync source; line style = topo membership):</text>
+
+    <line x1="20" y1="240" x2="60" y2="240" stroke="#1f2328" stroke-width="2" marker-end="url(#arrEvBlk)"/>
+    <text x="70" y="244">reads/writes — TOPO if same offset, else ring-rotated; slot_offset = read_slot.batch_offset</text>
+
+    <line x1="20" y1="260" x2="60" y2="260" stroke="#0969da" stroke-width="2" marker-end="url(#arrEvBlue)"/>
+    <text x="70" y="264">depends_on (producer.la == consumer.la) — TOPO; slot_offset = consumer.la</text>
+
+    <line x1="20" y1="280" x2="60" y2="280" stroke="#0969da" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrEvBlue)"/>
+    <text x="70" y="284">depends_on (producer.la &gt; consumer.la) — NOT topo, ring-rotated; slot_offset = consumer.la</text>
+
+    <line x1="20" y1="300" x2="60" y2="300" stroke="#bc4c00" stroke-width="2" marker-end="url(#arrEvOr)"/>
+    <text x="70" y="304">same_progress_sync — TOPO; slot_offset = producer.la</text>
+
+    <line x1="450" y1="300" x2="490" y2="300" stroke="#cf222e" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrEvRed)"/>
+    <text x="500" y="304">cross_iter_depends_on=(X,-N) — NOT topo; slot_offset = consumer.la + neg_offset</text>
+  </g>
+</svg>
+</div><figcaption>
+<span class="en">Five tasks from HSTU prefetch variant + one hypothetical <code>aux_stats</code> task (not in real HSTU; only here to illustrate <code>cross_iter_depends_on</code>).<br>
+<strong>Why la=2 for the cross_iter consumer?</strong> Two constraints, derived from the slot_offset math:
+<ol>
+  <li><code>cross_iter_depends_on=((X,-N))</code> code-level: <code>slot_offset = consumer.la − N ≥ 0</code> → <strong>consumer.la ≥ N</strong> (deps.py:446, otherwise rejected as out-of-ring).</li>
+  <li><code>depends_on</code> future-read: any same-batch <code>depends_on=("Y",)</code> requires <strong>consumer.la ≤ Y.la</strong> (deps.py:368). So a task that depends_on a low-la training task (backward/optimizer/forward, la=0) is itself constrained to la=0 — and would therefore <em>fail constraint (1)</em>.</li>
+</ol>
+Combined: a cross_iter consumer cannot have any same-batch <code>depends_on</code> on low-la training tasks. It must be a high-lookahead, prefetch-side task whose only same-batch deps are on other high-la tasks (h2d, prefetch). Streaming / auxiliary statistics is the canonical example.<br>
+<code>topological_sort</code> only consumes the three solid edges (<code>start_input_dist</code> → <code>wait_input_dist</code> → <code>prefetch_embeddings</code>, plus <code>prefetch_embeddings</code> → <code>backward</code>); the dashed edges contribute event triples but no in-progress ordering — their producer/consumer ordering across progress() calls is mediated by ring rotation, not by topo sort.</span>
+<span class="zh">HSTU prefetch 变体里抽出 5 个 task，加 1 个假想的 <code>aux_stats</code> task（HSTU 实际无此任务，这里只为演示 <code>cross_iter_depends_on</code>）。<br>
+<strong>为什么 cross_iter consumer 是 la=2？</strong>由 slot_offset 数学推出两条约束：
+<ol>
+  <li><code>cross_iter_depends_on=((X,-N))</code> 代码层：<code>slot_offset = consumer.la − N ≥ 0</code> → <strong>consumer.la ≥ N</strong>（deps.py:446，否则视为出 ring 拒绝）。</li>
+  <li><code>depends_on</code> future-read：同 batch <code>depends_on=("Y",)</code> 要求 <strong>consumer.la ≤ Y.la</strong>（deps.py:368）。所以任何 depends_on 低 la 训练 task（backward/optimizer/forward，la=0）的 task，自身也被钉在 la=0——这就<em>违反约束 (1)</em>。</li>
+</ol>
+合起来：cross_iter consumer 在同 batch 内不能 <code>depends_on</code> 任何低 la 训练 task，必须是高 lookahead 的 prefetch 侧任务，同 batch 依赖只能落在其它高 la task（h2d、prefetch）上。流式/辅助统计就是典型用例。<br>
+<code>topological_sort</code> 只看 3 条实线边（<code>start_input_dist</code> → <code>wait_input_dist</code> → <code>prefetch_embeddings</code>，加 <code>prefetch_embeddings</code> → <code>backward</code>）；虚线边只 emit 事件三元组，不参与 progress 内顺序——它们 producer/consumer 跨 progress 的顺序由 ring 旋转保证，不由 topo sort 排。</span>
+</figcaption></figure>
+
+<figure><div class="svg-wrap">
+<svg width="900" height="380" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="20" text-anchor="middle" font-family="ui-monospace,monospace" font-size="14" font-weight="700">Ring rotation — three sync types resolving to slot_offset</text>
+  <text x="450" y="36" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" fill="#656d76">events recorded by producer at slot[producer.la]; consumer reads from slot[slot_offset]</text>
+
+  <defs>
+    <marker id="arrRotGray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8c959f"/>
+    </marker>
+    <marker id="arrSyncBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0969da"/>
+    </marker>
+    <marker id="arrSyncOr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#bc4c00"/>
+    </marker>
+    <marker id="arrSyncRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/>
+    </marker>
+  </defs>
+
+  <text x="200" y="68" text-anchor="middle" font-family="ui-monospace,monospace" font-size="13" font-weight="700">P_(n-1)</text>
+  <text x="600" y="68" text-anchor="middle" font-family="ui-monospace,monospace" font-size="13" font-weight="700">P_n</text>
+
+  <g>
+    <rect x="80" y="80" width="240" height="50" rx="4" class="uml-box-fill"/>
+    <text x="92" y="100" font-family="ui-monospace,monospace" font-size="11" font-weight="700">slot[2]</text>
+    <text x="200" y="100" text-anchor="middle" class="uml-text">B_(n+1)</text>
+    <text x="200" y="120" text-anchor="middle" font-family="ui-monospace,monospace" font-size="10" fill="#cf222e">● h2d_evt</text>
+
+    <rect x="80" y="140" width="240" height="50" rx="4" class="uml-box-fill"/>
+    <text x="92" y="160" font-family="ui-monospace,monospace" font-size="11" font-weight="700">slot[1]</text>
+    <text x="200" y="160" text-anchor="middle" class="uml-text">B_n</text>
+    <text x="200" y="180" text-anchor="middle" font-family="ui-monospace,monospace" font-size="10" fill="#0969da">● prefetch_evt</text>
+
+    <rect x="80" y="200" width="240" height="50" rx="4" class="uml-box-fill"/>
+    <text x="92" y="220" font-family="ui-monospace,monospace" font-size="11" font-weight="700">slot[0]</text>
+    <text x="200" y="220" text-anchor="middle" class="uml-text">B_(n-1)</text>
+    <text x="200" y="240" text-anchor="middle" class="uml-text-mute">forward_evt</text>
+  </g>
+
+  <g>
+    <rect x="480" y="80" width="240" height="50" rx="4" class="uml-box-fill"/>
+    <text x="492" y="100" font-family="ui-monospace,monospace" font-size="11" font-weight="700">slot[2]</text>
+    <text x="600" y="100" text-anchor="middle" class="uml-text">B_(n+2)</text>
+    <text x="600" y="120" text-anchor="middle" font-family="ui-monospace,monospace" font-size="10" fill="#cf222e">● h2d_evt</text>
+
+    <rect x="480" y="140" width="240" height="50" rx="4" class="uml-box-fill"/>
+    <text x="492" y="160" font-family="ui-monospace,monospace" font-size="11" font-weight="700">slot[1]</text>
+    <text x="600" y="160" text-anchor="middle" class="uml-text">B_(n+1)</text>
+    <text x="600" y="180" text-anchor="middle" font-family="ui-monospace,monospace" font-size="10" fill="#0969da">● prefetch_evt</text>
+
+    <rect x="480" y="200" width="240" height="50" rx="4" class="uml-box-fill"/>
+    <text x="492" y="220" font-family="ui-monospace,monospace" font-size="11" font-weight="700">slot[0]</text>
+    <text x="600" y="220" text-anchor="middle" class="uml-text">B_n</text>
+    <text x="600" y="240" text-anchor="middle" font-family="ui-monospace,monospace" font-size="10" fill="#0969da">● prefetch_evt(B_n)</text>
+  </g>
+
+  <path d="M320 105 Q400 130 480 165" stroke="#8c959f" stroke-width="1" stroke-dasharray="3,3" fill="none" marker-end="url(#arrRotGray)" opacity="0.6"/>
+  <path d="M320 165 Q400 195 480 225" stroke="#8c959f" stroke-width="1" stroke-dasharray="3,3" fill="none" marker-end="url(#arrRotGray)" opacity="0.6"/>
+  <text x="400" y="278" text-anchor="middle" font-family="ui-monospace,monospace" font-size="10" fill="#8c959f">ring.advance() — slot[k] → slot[k-1]</text>
+
+  <path d="M320 175 C 400 250 440 250 480 225" stroke="#0969da" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrSyncBlue)"/>
+  <text x="50" y="310" font-family="ui-monospace,monospace" font-size="10" fill="#0969da">①  forward.depends_on=("prefetch")  —  slot_offset = consumer.la = 0  (after 1 ring advance)</text>
+
+  <path d="M620 195 C 700 250 720 230 670 195" stroke="#bc4c00" stroke-width="2" fill="none" marker-end="url(#arrSyncOr)"/>
+  <text x="50" y="328" font-family="ui-monospace,monospace" font-size="10" fill="#bc4c00">②  backward.same_progress_sync=("prefetch")  —  slot_offset = producer.la = 1  (no rotation)</text>
+
+  <path d="M320 105 C 380 105 420 165 480 165" stroke="#cf222e" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrSyncRed)"/>
+  <text x="50" y="346" font-family="ui-monospace,monospace" font-size="10" fill="#cf222e">③  aux_stats(la=2).cross_iter_depends_on=(("h2d", -1))  —  slot_offset = consumer.la + neg_offset = 2 + (-1) = 1  (after 1 ring advance)</text>
+</svg>
+</div><figcaption>
+<span class="en">Two consecutive progress() calls. ① <strong>depends_on</strong> across progresses: prefetch records its event for B_n at slot[1] in P_(n-1); after one ring advance that slot rotates to slot[0]; forward in P_n looks up slot[<em>consumer.la</em>=0] and finds prefetch_evt(B_n). ② <strong>same_progress_sync</strong> within one progress: prefetch records at slot[1] in P_n; backward (also in P_n, no rotation between them) looks up slot[<em>producer.la</em>=1] directly. ③ <strong>cross_iter_depends_on</strong>: an aux task with la=2 depending on h2d(la=2) from one progress earlier — h2d's event was at slot[2] in P_(n-1); after rotation it's at slot[1] in P_n; aux looks up slot[<em>consumer.la + neg_offset</em>=1]. The shared structure: producer always records at slot[producer.la] in <em>its own</em> progress; consumer's slot_offset depends on which sync type and how many ring advances have happened in between.</span>
+<span class="zh">两次连续 progress() 调用。① <strong>depends_on 跨 progress</strong>：prefetch 在 P_(n-1) 的 slot[1] 录 B_n 的 event；ring advance 一次后该 slot 旋到 slot[0]；P_n 里的 forward 查 slot[<em>consumer.la</em>=0]，拿到 prefetch_evt(B_n)。② <strong>same_progress_sync 同 progress 内</strong>：prefetch 在 P_n 的 slot[1] 录 event；backward 也在 P_n（中间没有 ring 旋转），直接查 slot[<em>producer.la</em>=1]。③ <strong>cross_iter_depends_on</strong>：假想 aux 任务 la=2，依赖 1 个 progress 之前的 h2d(la=2)——h2d 的 event 当时在 P_(n-1) 的 slot[2]，旋转一次后到 P_n 的 slot[1]；aux 查 slot[<em>consumer.la + neg_offset</em>=1]。共同结构：producer 永远在自己 progress 的 slot[producer.la] 录 event；consumer 的 slot_offset 取决于是哪种 sync、中间 ring 转了几次。</span>
+</figcaption></figure>
+
+<table>
+<thead><tr>
+  <th><span class="en">Edge type</span><span class="zh">边类型</span></th>
+  <th><span class="en">slot_offset formula</span><span class="zh">slot_offset 公式</span></th>
+  <th><span class="en">Topo edge?</span><span class="zh">是否拓扑边</span></th>
+  <th><span class="en">deps.py site</span><span class="zh">deps.py 位置</span></th>
+</tr></thead>
+<tbody>
+<tr><td><code>reads/writes</code></td><td><code>read_slot.batch_offset</code></td><td><span class="en">Yes if writer.batch_offset == read_slot.batch_offset; else ring-rotated</span><span class="zh">writer.batch_offset == read_slot.batch_offset 时是；否则走 ring 旋转</span></td><td><code>deps.py:341-348</code></td></tr>
+<tr><td><code>depends_on</code> (producer.la == consumer.la)</td><td><code>consumer.batch_offset</code></td><td><span class="en">Yes</span><span class="zh">是</span></td><td><code>deps.py:350-390</code></td></tr>
+<tr><td><code>depends_on</code> (producer.la &gt; consumer.la)</td><td><code>consumer.batch_offset</code> (after diff ring advances)</td><td><span class="en">No (ring rotation)</span><span class="zh">否（依赖 ring 旋转）</span></td><td><code>deps.py:350-390</code></td></tr>
+<tr><td><code>cross_iter_depends_on=((X,-N))</code></td><td><code>consumer.batch_offset + neg_offset</code></td><td><span class="en">No (ring rotation across N progresses)</span><span class="zh">否（跨 N 次 progress 的 ring 旋转）</span></td><td><code>deps.py:399-463</code></td></tr>
+<tr><td><code>same_progress_sync</code></td><td><code>producer.batch_offset</code></td><td><span class="en">Yes (no rotation between producer and consumer)</span><span class="zh">是（producer 与 consumer 间无 ring 旋转）</span></td><td><code>deps.py:476-487</code></td></tr>
+</tbody>
+</table>
+
+<p class="meta">
+<span class="en">Common structure: producer always records its event at <code>ring.at(producer.batch_offset)</code> (<code>executor.py:165</code>) in <em>its own</em> progress call. The consumer's <code>slot_offset</code> answer is "where has that slot rotated to by the time consumer runs" — and the four formulas above are just the four answers when ring rotation count is 0 (same_progress_sync), <code>X.la − consumer.la</code> (depends_on cross-la), <code>N + X.la − consumer.la</code> (cross_iter), or directly given by <code>read_slot.batch_offset</code> (reads/writes).</span>
+<span class="zh">共同结构：producer 永远在<em>本次</em> progress 调用中往 <code>ring.at(producer.batch_offset)</code>（<code>executor.py:165</code>）录 event。consumer 的 <code>slot_offset</code> 答案就是"那个 slot 在 consumer 跑的时候已经转到哪儿"——上面四个公式分别是 ring 旋转次数 = 0（same_progress_sync）、<code>X.la − consumer.la</code>（depends_on 跨 la）、<code>N + X.la − consumer.la</code>（cross_iter）、由 <code>read_slot.batch_offset</code> 直接给出（reads/writes）这四种场景。</span>
+</p>
+</section>
+
+<section id="same-progress-sync-uses">
+<h3><span class="en">3.7 <code>same_progress_sync</code> — when to use it</span><span class="zh">3.7 <code>same_progress_sync</code> 的使用场景</span></h3>
+
+<p>
+<span class="en">Reads as: "this task must wait for X's work in <em>this same</em> progress() call to finish, regardless of which batches X and self are processing." Engine guarantees:</span>
+<span class="zh">语义："本 task 等 X <em>这同一次</em> progress() 内的工作做完，不管 X 和自己处理的是哪个 batch。"引擎承诺：</span>
+</p>
+<ul>
+  <li><span class="en">Adds a topo-DAG edge X → self (X is guaranteed to fire before self within the progress).</span><span class="zh">加一条 topo-DAG 边 X → self（保证 X 在 progress 内先于 self 触发）。</span></li>
+  <li><span class="en">For threaded execution, adds a CPU-side <code>threading.Event</code> wait (cross-thread case).</span><span class="zh">线程执行时跨线程加一条 CPU 端 <code>threading.Event</code> 等待。</span></li>
+  <li><span class="en">For cross-stream, emits <code>wait_event</code> at <code>slot[producer.la]</code>; same-stream relies on CUDA stream FIFO.</span><span class="zh">跨流时在 <code>slot[producer.la]</code> emit <code>wait_event</code>；同流靠 CUDA stream FIFO 保序。</span></li>
+</ul>
+
+<p>
+<span class="en">Three known use cases:</span>
+<span class="zh">三种已知用法：</span>
+</p>
+
+<table>
+<thead><tr>
+  <th>#</th>
+  <th><span class="en">Use case</span><span class="zh">用法</span></th>
+  <th><span class="en">Example</span><span class="zh">例子</span></th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>(a)</td>
+  <td><span class="en"><strong>Stream coherency on out-of-slot mutable state.</strong> Two tasks touch a shared object NOT declared in any <code>reads</code>/<code>writes</code> slot (e.g. dynamicemb cache, torchrec module attribute, global counter). Engine cannot infer a dataflow edge → use <code>same_progress_sync</code> to make the wait explicit. This is the original / canonical use; mirrors the legacy <code>default_stream.wait_stream(prefetch_stream)</code> pattern.</span><span class="zh"><strong>slot 之外可变状态的 stream 协同。</strong>两个 task 都触碰一个 <code>reads</code>/<code>writes</code> 没声明的对象（dynamicemb cache、torchrec module 属性、全局计数器等）。引擎看不见数据流边 → 用 <code>same_progress_sync</code> 把这条等待写出来。这是原始的、典型的用法；对应遗留代码的 <code>default_stream.wait_stream(prefetch_stream)</code> 模式。</span></td>
+  <td><span class="en"><code>backward.same_progress_sync=("prefetch_embeddings",)</code> in HSTU prefetch variant — drains prefetch's GPU work before backward / before the next progress.</span><span class="zh">HSTU prefetch 变体里的 <code>backward.same_progress_sync=("prefetch_embeddings",)</code> —— 在 backward / 下次 progress 之前把 prefetch 的 GPU 工作排空。</span></td>
+</tr>
+<tr>
+  <td>(b)</td>
+  <td><span class="en"><strong>Explicit form of the $\Delta = 0$ <code>cross_iter_depends_on</code>.</strong> When the user's mental model is "this la=c task waits for that la=p task's current-progress output" with $c = p + N$ ($N&gt;0$), they may equivalently write <code>same_progress_sync=(X,)</code> for clarity, OR write <code>cross_iter_depends_on=((X, -N),)</code> with the batch-flow phrasing — the engine auto-promotes the latter to the same mechanical contract (same topo edge, same slot lookup, same CPU edge). Use <code>same_progress_sync</code> when the ordering intent is naturally "wait for X in this progress, regardless of batch."</span><span class="zh"><strong>$\Delta = 0$ <code>cross_iter_depends_on</code> 的显式写法。</strong>当用户思维是"我这个 la=c 的 task 等那个 la=p 的 task 在本次 progress 的输出"，$c = p + N$ ($N>0$)，可以等价地用 <code>same_progress_sync=(X,)</code>（更清晰）或 <code>cross_iter_depends_on=((X, -N),)</code>（batch-flow 措辞）——引擎将后者自动提升为前者的机理（相同 topo 边、相同 slot 查询、相同 CPU 边）。当顺序意图自然就是"在本 progress 内等 X 完成、不管 batch"时用 <code>same_progress_sync</code>。</span></td>
+  <td><span class="en"><code>forward.same_progress_sync=("update",)</code> when fwd.la=1, update.la=0 — fwd uses post-update weights from the same progress. See <code>tests/commons/test_engine_same_progress_sync_correctness.py</code> for verified GPU equivalence to a manual la=1-pipelined SGD baseline.</span><span class="zh"><code>forward.same_progress_sync=("update",)</code>，fwd.la=1, update.la=0 —— fwd 用本次 progress update 后的 weight。<code>tests/commons/test_engine_same_progress_sync_correctness.py</code> 在 GPU 上验证了与手动 la=1 流水线 SGD baseline 完全等价。</span></td>
+</tr>
+<tr>
+  <td>(c)</td>
+  <td><span class="en"><strong>Same-progress logging / metric aggregation.</strong> A consumer (e.g. metric writer) wants the producer's current-progress event for coherent measurement, even if the two don't share any slot or out-of-slot state. Less common; aux statistics tasks typically.</span><span class="zh"><strong>同 progress 内的 logging / 指标汇总。</strong>consumer（如 metric writer）想拿到 producer 本次 progress 的 event 做一致性测量，即使两者没共享 slot 或其它状态。比较少见；多见于辅助统计任务。</span></td>
+  <td><span class="en">Hypothetical <code>metric_writer.same_progress_sync=("forward",)</code> for capturing forward stats per-progress.</span><span class="zh">假想 <code>metric_writer.same_progress_sync=("forward",)</code> 用于按 progress 抓取 forward 的统计量。</span></td>
+</tr>
+<tr>
+  <td>(d)</td>
+  <td><span class="en"><strong>Implicit, via <code>cross_iter_depends_on</code> Δ=0 auto-promotion.</strong> If the user's mental model is batch-flow ("I want X's work for batch K−N"), they may write <code>cross_iter_depends_on=((X, -N),)</code> directly. When the lookahead math gives Δ=0 (<code>consumer.la == producer.la + N</code>), the engine auto-promotes the declaration to the same_progress_sync mechanical contract — same topo edge, same CPU edge, same slot[producer.la] event lookup. The user does not need to know <code>same_progress_sync</code> as a separate field; it works either way.</span><span class="zh"><strong>通过 <code>cross_iter_depends_on</code> Δ=0 自动提升隐式触发。</strong>用户思维如果是 batch-flow（"我要 X 在 batch K−N 的工作"），可以直接写 <code>cross_iter_depends_on=((X, -N),)</code>。当 lookahead 数学给出 Δ=0（<code>consumer.la == producer.la + N</code>），引擎自动把这个声明转成 same_progress_sync 的机理——相同的 topo 边、相同的 CPU 边、相同的 slot[producer.la] event 查询。用户不需要知道 <code>same_progress_sync</code> 是独立字段；两种写法效果完全一致。</span></td>
+  <td><span class="en"><code>forward.cross_iter_depends_on=(("update", -1),)</code> with fwd.la=1, update.la=0 → Δ=0 auto-promoted. Equivalent to use case (b) but using the cross_iter syntax. See <code>SPEC_cross_iter_delta0_autoconvert.md</code>.</span><span class="zh"><code>forward.cross_iter_depends_on=(("update", -1),)</code>，fwd.la=1, update.la=0 → Δ=0 自动提升。与 (b) 等价，但用 cross_iter 语法。详见 <code>SPEC_cross_iter_delta0_autoconvert.md</code>。</span></td>
+</tr>
+</tbody>
+</table>
+
+<p>
+<span class="en"><strong>Direction convention.</strong> The field lives on the <em>consumer</em> side; <code>X.same_progress_sync=()</code> always lists <em>producers</em> the consumer is waiting on. <code>producer.la</code> and <code>consumer.la</code> may differ — the field is la-agnostic (in contrast to <code>depends_on</code> which requires <code>producer.la ≥ consumer.la</code> to avoid future-read).</span>
+<span class="zh"><strong>方向约定。</strong>字段写在 <em>consumer</em> 一侧；<code>X.same_progress_sync=()</code> 列的都是 X 等待的 <em>producer</em>。<code>producer.la</code> 与 <code>consumer.la</code> 可以不相等——这个字段对 lookahead 不敏感（区别于 <code>depends_on</code> 必须 <code>producer.la ≥ consumer.la</code> 以避免 future-read）。</span>
+</p>
+
+<p>
+<span class="en"><strong>Distinguishing from <code>depends_on</code> and <code>cross_iter_depends_on</code>:</strong></span>
+<span class="zh"><strong>与 <code>depends_on</code> 和 <code>cross_iter_depends_on</code> 的区别：</strong></span>
+</p>
+<ul>
+  <li><span class="en"><code>depends_on=("X",)</code> — same-batch logical wait. Both must process the same batch K. Constrained by <code>producer.la ≥ consumer.la</code>.</span><span class="zh"><code>depends_on=("X",)</code> —— 同 batch 逻辑等待。两者必须处理同一个 batch K。约束 <code>producer.la ≥ consumer.la</code>。</span></li>
+  <li><span class="en"><code>cross_iter_depends_on=((X, -N),)</code> — different-batch wait. "Consumer on batch K waits for X on batch K−N." Strictly cross-progress (Δ ≥ 1; Δ=0 rejected, use <code>same_progress_sync</code> instead).</span><span class="zh"><code>cross_iter_depends_on=((X, -N),)</code> —— 跨 batch 等待。"consumer 在 batch K 时等 X 在 batch K−N 的工作"。严格跨 progress（Δ ≥ 1；Δ=0 被拒，改用 <code>same_progress_sync</code>）。</span></li>
+  <li><span class="en"><code>same_progress_sync=("X",)</code> — same-progress wait, batch-agnostic. The two ARE allowed to process different batches; what matters is X completes its current-progress GPU work before consumer reads.</span><span class="zh"><code>same_progress_sync=("X",)</code> —— 同 progress 等待，不关心 batch。两者<em>允许</em>处理不同 batch；重点是 X 在本次 progress 的 GPU 工作完成后 consumer 才读。</span></li>
+</ul>
 </section>
 </section>
 
@@ -715,8 +1036,8 @@ commons.pipeline.hstu_pipeline
 <section id="exec-cpu-deps">
 <h3><span class="en">4.2 CPU dependency computation</span><span class="zh">4.2 CPU 依赖计算</span></h3>
 <p>
-<span class="en"><code>_compute_cpu_deps</code> builds a dict <code>{task_name → [predecessor_completion_events]}</code> by walking the active task list and adding three edge types:</span>
-<span class="zh"><code>_compute_cpu_deps</code> 构造 <code>{task_name → [predecessor_completion_events]}</code> 字典，遍历活跃任务并添加三类边：</span>
+<span class="en"><code>_compute_cpu_deps</code> builds a dict <code>{task_name → [predecessor_completion_events]}</code> by walking the topo-sorted active task list and adding four edge types:</span>
+<span class="zh"><code>_compute_cpu_deps</code> 沿拓扑序遍历活跃任务，构造 <code>{task_name → [predecessor_completion_events]}</code> 字典，添加四类边：</span>
 </p>
 <ol>
   <li>
@@ -725,14 +1046,19 @@ commons.pipeline.hstu_pipeline
     <span class="zh">该任务所读 slot 的任意 writer（自己除外）。</span>
   </li>
   <li>
-    <strong><span class="en">Explicit</span><span class="zh">显式</span></strong>:
-    <span class="en">every <code>task.depends_on</code> name that is in active.</span>
-    <span class="zh"><code>task.depends_on</code> 中且在活跃集合中的所有任务名。</span>
+    <strong><span class="en">Same-batch logical (<code>depends_on</code>)</span><span class="zh">同 batch 逻辑（<code>depends_on</code>）</span></strong>:
+    <span class="en">every <code>task.depends_on</code> name with matching <code>lookahead</code> that is in active. Cross-lookahead names go through ring rotation as a cross-stream wait, not a CPU edge.</span>
+    <span class="zh"><code>task.depends_on</code> 中且 <code>lookahead</code> 相等、又在活跃集合中的任务名。跨 lookahead 的名字走 ring 平移变成跨流 wait，不进 CPU 边。</span>
+  </li>
+  <li>
+    <strong><span class="en">Same-progress sync (<code>same_progress_sync</code>)</span><span class="zh">同 progress 协同（<code>same_progress_sync</code>）</span></strong>:
+    <span class="en">every <code>task.same_progress_sync</code> name that is in active — same-progress GPU coherency wait, regardless of lookahead.</span>
+    <span class="zh"><code>task.same_progress_sync</code> 中且在活跃集合中的任务名 —— 同一次 progress 内的 GPU 协同等待，与 lookahead 无关。</span>
   </li>
   <li>
     <strong><span class="en">Same-stream FIFO</span><span class="zh">同流 FIFO</span></strong>:
-    <span class="en">the most recent task on the same stream in declaration order — preserves CUDA stream FIFO semantics when <code>thread_map</code> splits same-stream tasks across threads.</span>
-    <span class="zh">声明顺序中同一个流上的最近一个任务 —— 当 <code>thread_map</code> 把同流任务拆到不同线程时，这条边保住了 CUDA 流的 FIFO 语义。</span>
+    <span class="en">the most recent task on the same stream in topological order — preserves CUDA stream FIFO semantics when <code>thread_map</code> splits same-stream tasks across threads.</span>
+    <span class="zh">拓扑序中同一个流上的最近一个任务 —— 当 <code>thread_map</code> 把同流任务拆到不同线程时，这条边保住了 CUDA 流的 FIFO 语义。</span>
   </li>
 </ol>
 <p>
@@ -744,8 +1070,8 @@ commons.pipeline.hstu_pipeline
 <section id="exec-nccl-lock">
 <h3><span class="en">4.3 NCCL ordered lock</span><span class="zh">4.3 NCCL 顺序锁</span></h3>
 <p>
-<span class="en">Tasks tagged <code>nccl=True</code> acquire a ticket-based lock that guarantees declaration-order execution across all ranks. Without this, a multi-threaded executor on different ranks may submit collectives in different orders → mismatched NCCL calls → deadlock.</span>
-<span class="zh">标了 <code>nccl=True</code> 的任务要获取一把基于票据的锁，保证所有 rank 都按声明顺序执行集合通信。如果没有它，多线程执行器在不同 rank 上可能以不同顺序提交集合操作 → NCCL 调用错配 → 死锁。</span>
+<span class="en">Tasks tagged <code>nccl=True</code> acquire a ticket-based lock that guarantees topological-order execution across all ranks. Tickets are assigned by the topo-sorted task tuple (deterministic across ranks because the schedule and tie-break are deterministic). Without this, a multi-threaded executor on different ranks may submit collectives in different orders → mismatched NCCL calls → deadlock.</span>
+<span class="zh">标了 <code>nccl=True</code> 的任务要获取一把基于票据的锁，保证所有 rank 都按拓扑序执行集合通信。票据由拓扑排序后的任务元组分配（schedule 与 tie-break 都是确定性的，所以各 rank 一致）。如果没有它，多线程执行器在不同 rank 上可能以不同顺序提交集合操作 → NCCL 调用错配 → 死锁。</span>
 </p>
 
 <figure><div class="svg-wrap">
@@ -845,15 +1171,15 @@ commons.pipeline.hstu_pipeline
 <section id="hstu-tasks">
 <h3><span class="en">5.1 14 tasks</span><span class="zh">5.1 14 个任务</span></h3>
 <p>
-<span class="en"><code>HSTUPipeline._build_schedule</code> assembles a single-stage schedule from these task factories. Order matters: tasks within a stage are declared in the order they should fire when their masks both qualify.</span>
-<span class="zh"><code>HSTUPipeline._build_schedule</code> 用这些任务工厂拼出一个单 stage 的 schedule。顺序很重要：当掩码都成立时，stage 内的任务按声明顺序触发。</span>
+<span class="en"><code>HSTUPipeline._build_schedule</code> assembles a single-stage schedule from these task factories. Author declaration order is just a tie-break for incomparable tasks — actual execution order is decided by <code>topological_sort</code> over <code>reads</code>/<code>writes</code> + <code>depends_on</code> + <code>same_progress_sync</code>.</span>
+<span class="zh"><code>HSTUPipeline._build_schedule</code> 用这些任务工厂拼出一个单 stage 的 schedule。作者的声明顺序只在不可比的任务之间作为 tie-break 用；真正的执行顺序由 <code>topological_sort</code> 基于 <code>reads</code>/<code>writes</code> + <code>depends_on</code> + <code>same_progress_sync</code> 决定。</span>
 </p>
 
 <table>
 <thead><tr>
   <th>#</th>
   <th><span class="en">Task</span><span class="zh">任务</span></th>
-  <th>batch_offset</th>
+  <th>lookahead</th>
   <th>stream</th>
   <th>nccl</th>
   <th><span class="en">Purpose</span><span class="zh">用途</span></th>
@@ -877,8 +1203,8 @@ commons.pipeline.hstu_pipeline
 </table>
 
 <p class="meta">
-<span class="en">np = non-prefetch variant, pf = prefetch variant. Both keep <code>max_offset = 2</code> at <code>prefetch_depth=1</code> (matches legacy 3-batch in-flight). For prefetch_depth=K, <code>max_offset = K+1</code>.</span>
-<span class="zh">np = 无 prefetch 变体，pf = prefetch 变体。两者在 <code>prefetch_depth=1</code> 时都是 <code>max_offset = 2</code>（与遗留的 3 批在飞匹配）。<code>prefetch_depth=K</code> 时 <code>max_offset = K+1</code>。</span>
+<span class="en">np = non-prefetch variant, pf = prefetch variant. Both keep <code>max_lookahead = 2</code> at <code>prefetch_depth=1</code> (matches legacy 3-batch in-flight). For prefetch_depth=K, <code>max_lookahead = K+1</code>; <code>in_flight_batches = max_lookahead + 1</code>.</span>
+<span class="zh">np = 无 prefetch 变体，pf = prefetch 变体。两者在 <code>prefetch_depth=1</code> 时都是 <code>max_lookahead = 2</code>（与遗留的 3 批在飞匹配）。<code>prefetch_depth=K</code> 时 <code>max_lookahead = K+1</code>；<code>in_flight_batches = max_lookahead + 1</code>。</span>
 </p>
 </section>
 
@@ -909,8 +1235,8 @@ commons.pipeline.hstu_pipeline
 
 <div class="warn">
   <strong><span class="en">Why two threads, not many</span><span class="zh">为什么是两个线程而不是更多</span></strong>:
-  <span class="en"><code>start_input_dist</code> temporarily mutates each <code>postproc.set_context(ctx)</code>; <code>forward</code> calls <code>module.forward.set_context(ctx)</code> + <code>postproc.set_context(ctx)</code>. Both write the same shared module attribute. Splitting them across threads would race. Pinning to one thread serializes them by construction. <code>HSTUPipeline._validate_set_context_colocation</code> rejects custom thread_maps that violate this.</span>
-  <span class="zh"><code>start_input_dist</code> 会暂时修改每个 <code>postproc.set_context(ctx)</code>；<code>forward</code> 又调 <code>module.forward.set_context(ctx)</code> + <code>postproc.set_context(ctx)</code>。两者写的是同一个共享 module 属性。把它们放到不同线程会发生竞争。绑定到同一线程在构造时就把它们串行化了。<code>HSTUPipeline._validate_set_context_colocation</code> 会拒绝违反这一约束的自定义 thread_map。</span>
+  <span class="en">Two threads (not many) lets H2D / shuffle on <code>"io"</code> overlap NCCL + GPU compute on <code>"compute"</code>, without paying the per-task pool dispatch overhead of full thread-per-task. <code>forward</code> is the only writer of the shared <code>module.forward._context</code> attribute, and runs as a single task on <code>"compute"</code>, so there is no cross-thread race to defend against.</span>
+  <span class="zh">分两线程（而非更多）是为了让 <code>"io"</code> 上的 H2D / shuffle 与 <code>"compute"</code> 上的 NCCL + GPU 计算重叠，又不付 thread-per-task 的调度开销。共享属性 <code>module.forward._context</code> 的唯一写者是 <code>forward</code> 这一个 task，固定跑在 <code>"compute"</code> 线程上，没有跨线程竞态需要防。</span>
 </div>
 </section>
 
@@ -941,14 +1267,18 @@ commons.pipeline.hstu_pipeline
 </p>
 
 <p>
-<strong><span class="en">Critical ordering</span><span class="zh">关键顺序</span></strong>:
-<span class="en">in the schedule, <code>prefetch_embeddings</code> is declared <em>after</em> <code>forward</code>, not before. Reason: dynamicemb's <code>_prefetch_outstanding_keys</code> counter is incremented by <code>prefetch()</code> and decremented at end of <code>forward</code>. Same-iter order:</span>
-<span class="zh">schedule 中 <code>prefetch_embeddings</code> 声明在 <code>forward</code> <em>之后</em>，不能在前面。原因：dynamicemb 的 <code>_prefetch_outstanding_keys</code> 计数器在 <code>prefetch()</code> 时加，在 <code>forward</code> 结束时减。同迭代顺序：</span>
+<strong><span class="en">Critical ordering (within one progress)</span><span class="zh">关键顺序（同一次 progress 内）</span></strong>:
+<span class="en"><code>prefetch_embeddings</code> must run <em>after</em> <code>forward</code> in every progress, not before. Reason: dynamicemb's <code>_prefetch_outstanding_keys</code> counter is incremented by <code>prefetch()</code> and decremented at end of <code>forward</code>. The ordering is enforced by <code>backward.same_progress_sync=("prefetch_embeddings",)</code>: backward (and therefore this progress's whole compute chain after forward) waits for prefetch's GPU work in the <em>same</em> progress to finish — a stream coherency wait, not a batch dependency. Within one progress:</span>
+<span class="zh"><code>prefetch_embeddings</code> 必须在每次 progress 中跑在 <code>forward</code> <em>之后</em>，不能反过来。原因：dynamicemb 的 <code>_prefetch_outstanding_keys</code> 计数器在 <code>prefetch()</code> 时加，在 <code>forward</code> 结束时减。这一顺序由 <code>backward.same_progress_sync=("prefetch_embeddings",)</code> 强制：backward（以及由此 progress 中 forward 之后的整条计算链）等本次 progress 内 prefetch 的 GPU 工作完成 —— 是 stream 协同等待，不是 batch 依赖。同一次 progress 内：</span>
 </p>
 <ul>
   <li><strong><span class="en">forward → prefetch (correct)</span><span class="zh">forward → prefetch（正确）</span></strong>: <span class="en">forward consumes prev-iter's prefetched data first (counter decremented), then this-iter's prefetch adds new keys. Steady-state outstanding ≈ 1 batch.</span><span class="zh">forward 先消费上一轮 prefetch 的数据（计数减），然后本轮 prefetch 新增 key。稳态在飞 ≈ 1 个 batch。</span></li>
   <li><strong><span class="en">prefetch → forward (wrong)</span><span class="zh">prefetch → forward（错误）</span></strong>: <span class="en">prefetch adds new keys before forward consumes prev's. Steady-state outstanding ≈ 2 batches → cache overflow.</span><span class="zh">prefetch 在 forward 消费前一轮之前就加新 key。稳态在飞 ≈ 2 个 batch → cache 溢出。</span></li>
 </ul>
+<p>
+<span class="en">Why <code>same_progress_sync</code> and not <code>depends_on</code>? <code>prefetch_embeddings</code> has <code>lookahead=1</code> (it pre-loads next batch K+1) while <code>backward</code> has <code>lookahead=0</code> (consumes batch K). They process <em>different batches</em>, so a same-batch <code>depends_on</code> would be incorrect; what we actually need is "drain prefetch's GPU work in this progress before the next progress starts" — exactly the same-progress GPU coherency intent.</span>
+<span class="zh">为什么用 <code>same_progress_sync</code> 而不是 <code>depends_on</code>？<code>prefetch_embeddings</code> 的 <code>lookahead=1</code>（提前为 K+1 batch 加载），而 <code>backward</code> 的 <code>lookahead=0</code>（消费 batch K）。两者处理的是<em>不同 batch</em>，写 <code>depends_on</code>（同 batch 等待）语义就错了；真正要表达的是"在本次 progress 结束前，把 prefetch 的 GPU 工作排空" —— 正好是同 progress 的 GPU 协同意图。</span>
+</p>
 </section>
 </section>
 
@@ -1013,10 +1343,6 @@ commons.pipeline.hstu_pipeline
   <line x1="220" y1="180" x2="540" y2="180" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
   <text x="260" y="172" class="uml-text">_build_schedule()  → (schedule, pool)</text>
   <rect x="536" y="180" width="8" height="20" class="uml-activation"/>
-
-  <!-- 4. validate co-location -->
-  <path d="M 224,210 Q 250,210 250,222 Q 250,234 224,234" class="uml-msg-sync" fill="none" marker-end="url(#arrSeq)"/>
-  <text x="260" y="225" class="uml-text">_validate_set_context_colocation()</text>
 
   <!-- 5. H2D on pool's memcpy stream -->
   <line x1="220" y1="260" x2="540" y2="260" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
@@ -1154,7 +1480,7 @@ commons.pipeline.hstu_pipeline
 
   <text x="564" y="446" class="uml-text-em">start_input_dist → wait_input_dist → ... → forward</text>
   <text x="564" y="460" class="uml-text-mute">(serial within thread; nccl tasks acquire tickets 2,3 from _NcclLock)</text>
-  <text x="564" y="476" class="uml-text-em">backward (nccl) — depends_on=("prefetch_embeddings",) [pf only]</text>
+  <text x="564" y="476" class="uml-text-em">backward (nccl) — same_progress_sync=("prefetch_embeddings",) [pf only]</text>
   <line x1="564" y1="482" x2="830" y2="482" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
   <text x="600" y="475" class="uml-text">wait_stream(prefetch); DDP AllReduce</text>
   <text x="564" y="510" class="uml-text-em">finalize_model_grads → optimizer.step → watchdog</text>
@@ -1164,8 +1490,8 @@ commons.pipeline.hstu_pipeline
   <text x="90" y="548" class="uml-text-mute">barrier: future.result() on every chain</text>
 </svg>
 </div><figcaption>
-<span class="en">The <code>par</code> fragment marks parallel execution: io chain and compute chain run concurrently. Within each chain, tasks fire in declaration order. NCCL-tagged tasks acquire tickets from <code>_NcclOrderedLock</code> in declaration order (0, 1, 2, 3 here), guaranteeing deterministic submission order across ranks.</span>
-<span class="zh"><code>par</code> 片段标记并行执行：io 链与 compute 链并发跑。链内任务按声明顺序触发。带 NCCL 标记的任务按声明顺序从 <code>_NcclOrderedLock</code> 取票（这里是 0、1、2、3），从而在所有 rank 上保证确定的提交顺序。</span>
+<span class="en">The <code>par</code> fragment marks parallel execution: io chain and compute chain run concurrently. Within each chain, tasks fire in topological order (declaration order is the tie-break). NCCL-tagged tasks acquire tickets from <code>_NcclOrderedLock</code> in that same topological order (0, 1, 2, 3 here), guaranteeing deterministic submission order across ranks.</span>
+<span class="zh"><code>par</code> 片段标记并行执行：io 链与 compute 链并发跑。链内任务按拓扑序触发（声明顺序作 tie-break）。带 NCCL 标记的任务按相同拓扑序从 <code>_NcclOrderedLock</code> 取票（这里是 0、1、2、3），从而在所有 rank 上保证确定的提交顺序。</span>
 </figcaption></figure>
 </section>
 
@@ -1225,8 +1551,8 @@ commons.pipeline.hstu_pipeline
   <text x="430" y="312" class="uml-text">release()  [next_ticket=3, notify_all]</text>
 </svg>
 </div><figcaption>
-<span class="en">Tickets 0 and 1 are issued to NCCL tasks declared first (on io thread); ticket 2 went to a NCCL task declared later (on compute thread). The lock guarantees ticket 0 → 1 → 2 submission order across ranks even though the threads run concurrently.</span>
-<span class="zh">票据 0 和 1 发给最早声明的 NCCL 任务（在 io 线程）；票据 2 给的是后声明的 NCCL 任务（在 compute 线程）。即使两个线程并发执行，锁仍保证所有 rank 上的提交顺序为 0 → 1 → 2。</span>
+<span class="en">Tickets 0 and 1 are issued to NCCL tasks earlier in topological order (on io thread); ticket 2 went to a NCCL task later in topological order (on compute thread). The lock guarantees ticket 0 → 1 → 2 submission order across ranks even though the threads run concurrently.</span>
+<span class="zh">票据 0 和 1 发给拓扑序较早的 NCCL 任务（在 io 线程）；票据 2 给的是拓扑序较晚的 NCCL 任务（在 compute 线程）。即使两个线程并发执行，锁仍保证所有 rank 上的提交顺序为 0 → 1 → 2。</span>
 </figcaption></figure>
 
 </section>
@@ -1319,8 +1645,8 @@ commons.pipeline.hstu_pipeline
   <text x="450" y="270" text-anchor="middle" class="uml-text-mute">prefill absorbs 2 iters; 4 batches in flight at iter ≥ 2 if M is large</text>
 </svg>
 </div><figcaption>
-<span class="en">Each column is one <code>progress()</code>-internal iteration. Rows show what runs at each batch_offset. After 2 prefill iters, 3 batches are in flight simultaneously (different stages on different streams via the io/compute split). The <code>progress()</code> return tracks offset 0's <code>step_result</code>.</span>
-<span class="zh">每列是一次 <code>progress()</code> 内部迭代。各行表示在不同 batch_offset 上跑的内容。经过 2 轮预热后，3 个 batch 同时在飞（io/compute 拆分让不同阶段落在不同流上）。<code>progress()</code> 的返回值对应 offset 0 的 <code>step_result</code>。</span>
+<span class="en">Each column is one <code>progress()</code>-internal iteration. Rows show what runs at each lookahead. After 2 prefill iters, 3 batches are in flight simultaneously (different stages on different streams via the io/compute split). The <code>progress()</code> return tracks lookahead=0's <code>step_result</code>.</span>
+<span class="zh">每列是一次 <code>progress()</code> 内部迭代。各行表示在不同 lookahead 上跑的内容。经过 2 轮预热后，3 个 batch 同时在飞（io/compute 拆分让不同阶段落在不同流上）。<code>progress()</code> 的返回值对应 lookahead=0 的 <code>step_result</code>。</span>
 </figcaption></figure>
 </section>
 </section>
@@ -1372,19 +1698,21 @@ commons.pipeline.hstu_pipeline
 
   <!-- Task + DataSlot -->
   <g>
-    <rect x="320" y="160" width="200" height="200" class="uml-box-fill"/>
-    <line x1="320" y1="188" x2="520" y2="188" stroke="#1f2328"/>
-    <line x1="320" y1="290" x2="520" y2="290" stroke="#1f2328"/>
-    <text x="420" y="180" text-anchor="middle" class="uml-text-em">Task</text>
+    <rect x="320" y="160" width="240" height="210" class="uml-box-fill"/>
+    <line x1="320" y1="188" x2="560" y2="188" stroke="#1f2328"/>
+    <line x1="320" y1="314" x2="560" y2="314" stroke="#1f2328"/>
+    <text x="440" y="180" text-anchor="middle" class="uml-text-em">Task</text>
     <text x="330" y="204" class="uml-text">+ name: str</text>
     <text x="330" y="218" class="uml-text">+ stream: str</text>
-    <text x="330" y="232" class="uml-text">+ batch_offset: int</text>
+    <text x="330" y="232" class="uml-text">+ lookahead: int</text>
     <text x="330" y="246" class="uml-text">+ reads, writes: Tuple[DataSlot]</text>
     <text x="330" y="260" class="uml-text">+ depends_on: Tuple[str]</text>
-    <text x="330" y="274" class="uml-text">+ nccl: bool</text>
-    <text x="330" y="306" class="uml-text">+ run(ctx) → None</text>
-    <text x="330" y="320" class="uml-text">+ init(ctx) → None</text>
-    <text x="330" y="334" class="uml-text">+ from_fn(name, fn, ...)</text>
+    <text x="330" y="274" class="uml-text">+ cross_iter_depends_on: Tuple[(str,int)]</text>
+    <text x="330" y="288" class="uml-text">+ same_progress_sync: Tuple[str]</text>
+    <text x="330" y="302" class="uml-text">+ nccl: bool</text>
+    <text x="330" y="330" class="uml-text">+ run(ctx) → None</text>
+    <text x="330" y="344" class="uml-text">+ init(ctx) → None</text>
+    <text x="330" y="358" class="uml-text">+ from_fn(name, fn, ...)</text>
   </g>
   <g>
     <rect x="560" y="160" width="180" height="80" class="uml-box-fill"/>
@@ -1497,7 +1825,7 @@ commons.pipeline.hstu_pipeline
 <tr><td><code>list() → List[str]</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Enumerate registered names.</span><span class="zh">列出已注册名称。</span></td></tr>
 <tr><td colspan="4"><strong><span class="en">Pre-registered variants</span><span class="zh">预注册变体</span></strong>: <code>"hstu_sparse_dist"</code> (native), <code>"hstu_prefetch_sparse_dist"</code> (prefetch).</td></tr>
 <tr><td rowspan="3"><code>PipelineState</code></td><td><code>model, optimizer, device, batch_shuffler</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">Captured at construction.</span><span class="zh">构造时捕获。</span></td></tr>
-<tr><td><code>pipelined_modules, pipelined_postprocs</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">Populated by <code>_rewrite_model</code>.</span><span class="zh">由 <code>_rewrite_model</code> 填充。</span></td></tr>
+<tr><td><code>pipelined_modules</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">Populated by <code>_rewrite_model</code>.</span><span class="zh">由 <code>_rewrite_model</code> 填充。</span></td></tr>
 <tr><td><code>create_torchrec_ctx() → TrainPipelineContext</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">v1 only — asserts <code>ctx.version == 1</code>.</span><span class="zh">仅 v1 —— 断言 <code>ctx.version == 1</code>。</span></td></tr>
 </tbody>
 </table>
@@ -1607,7 +1935,7 @@ pipe = <span class="ty">SchedulablePipeline</span>.basic(
 <span class="kw">class</span> <span class="ty">CountTokensTask</span>(<span class="ty">Task</span>):
     name = <span class="st">"count_tokens"</span>
     stream = <span class="st">"default"</span>
-    batch_offset = 0
+    lookahead = 0
     reads = (<span class="ty">DataSlot</span>(<span class="st">"batch_gpu"</span>, 0),)
     writes = (<span class="ty">DataSlot</span>(<span class="st">"token_count"</span>, 0),)
 
@@ -1701,6 +2029,155 @@ pipe = <span class="ty">SchedulablePipeline</span>(schedule, pool, executor=<spa
   <span class="zh">（提交 <code>338f0c46</code>，<code>ipp1-2028</code> 上 4-GPU）：25 passed、16 xfailed（全部为 adam）、0 failed。抗抖动模式：连跑 2 次、50 步长程漂移检查、≥2 线程利用率探针、NCCL 死锁回归守卫。</span>
 </div>
 
+</section>
+
+<!-- =========================================================== -->
+<section id="appendix-delta">
+<h2><span class="en">Appendix A. Δ in <code>cross_iter_depends_on</code></span><span class="zh">附录 A. <code>cross_iter_depends_on</code> 中的 Δ</span></h2>
+
+<p>
+<span class="en">Δ is the engine's internal name for the "progress lag" between when a producer records its event and when a consumer reads it via a <code>cross_iter_depends_on=((X, -N),)</code> edge. Defined and bounded entirely by lookaheads and N; it never appears in the user-facing API but governs which configurations are accepted at <code>SchedulablePipeline.__init__</code>.</span>
+<span class="zh">Δ 是引擎内部用来描述 <code>cross_iter_depends_on=((X, -N),)</code> 这条边上"producer 录 event 到 consumer 读 event 之间的 progress 延迟"的量。完全由 lookahead 和 N 决定；用户接口里不出现，但决定了 <code>SchedulablePipeline.__init__</code> 时哪些配置会被接受。</span>
+</p>
+
+<section id="appendix-delta-def">
+<h3><span class="en">A.1 Definition</span><span class="zh">A.1 定义</span></h3>
+<p>
+<span class="en"><strong>Δ is primitively defined</strong> as the progress lag between two task submissions — equivalently, the number of <code>ring.advance()</code> calls (one per <code>progress()</code>) elapsed between when a producer records an event and when a consumer reads it back:</span>
+<span class="zh"><strong>Δ 的本质定义</strong>是两次任务提交之间的 progress 跨度——等价地，producer 录 event 到 consumer 读 event 之间 <code>ring.advance()</code>（每次 <code>progress()</code> 调一次）调用的次数：</span>
+</p>
+<p style="text-align:center;">$$\Delta \;\stackrel{\text{def}}{=}\; q_c - q_p$$</p>
+<p>
+<span class="en">where $q_c$ is the progress() index in which consumer reads the event and $q_p$ is the progress() index in which producer recorded it. This definition is universal — it applies to any cross-progress wait, independent of which sync field the user declared. cross-iter requires $q_p &lt; q_c$, i.e. $\Delta \ge 1$.</span>
+<span class="zh">其中 $q_c$ 是 consumer 读 event 时所在的 progress() 编号，$q_p$ 是 producer 录 event 时所在的 progress() 编号。这个定义是普适的——任何跨 progress 等待都适用，与用户用了哪种 sync 字段无关。cross-iter 要求 $q_p &lt; q_c$，即 $\Delta \ge 1$。</span>
+</p>
+
+<p>
+<span class="en"><strong>Closed-form value in the cross_iter case.</strong> When the wait is declared via <code>consumer.cross_iter_depends_on=(("X", -N),)</code> with $N&nbsp;&gt;&nbsp;0$, the lookahead mechanics determine $q_c$ and $q_p$ uniquely; working through them (see §A.2) gives:</span>
+<span class="zh"><strong>cross_iter 场景下的闭式取值。</strong>当依赖通过 <code>consumer.cross_iter_depends_on=(("X", -N),)</code> ($N&nbsp;&gt;&nbsp;0$) 声明时，lookahead 机制把 $q_c$ 和 $q_p$ 唯一确定下来；按 §A.2 的推导，可以算出：</span>
+</p>
+<p style="text-align:center;">$$\Delta \;=\; X.\mathrm{la} + N - \mathrm{consumer.la} \quad\text{(cross\_iter only)}$$</p>
+<p>
+<span class="en">This is a derived equality, not a definition — it holds in the cross_iter context because of how lookahead pins down which batch each task processes. Other sync types would yield different closed forms (e.g. <code>same_progress_sync</code> always has $\Delta = 0$ since both tasks are in the same progress).</span>
+<span class="zh">这是个推导出来的等式，不是定义——在 cross_iter 上下文里成立，是因为 lookahead 把每个 task 处理的 batch 钉死了。其他 sync 类型会有不同的闭式（例如 <code>same_progress_sync</code> 永远 $\Delta = 0$，因为两个 task 在同一次 progress 内）。</span>
+</p>
+
+<p>
+<span class="en"><strong>Useful decomposition</strong>: $\Delta = N + (X.\mathrm{la} - \mathrm{consumer.la})$. When producer and consumer have equal lookahead, $\Delta = N$ exactly (the user's literal "wait for N batches ago"); when producer is deeper in the ring ($X.\mathrm{la} &gt; \mathrm{consumer.la}$), $\Delta &gt; N$ (extra rotations to bring the slot down to consumer's view).</span>
+<span class="zh"><strong>有用的分解</strong>：$\Delta = N + (X.\mathrm{la} - \mathrm{consumer.la})$。producer 与 consumer lookahead 相等时 $\Delta = N$（即用户字面理解的"N 个 batch 前"）；producer 在 ring 更深处 ($X.\mathrm{la} &gt; \mathrm{consumer.la}$) 时 $\Delta &gt; N$（slot 需要多平移几步才到 consumer 视角）。</span>
+</p>
+</section>
+
+<section id="appendix-delta-derivation">
+<h3><span class="en">A.2 Derivation of Δ in the cross_iter case</span><span class="zh">A.2 cross_iter 场景下 Δ 的推导</span></h3>
+<p>
+<span class="en">Goal: take the primitive Δ definition $q_c - q_p$ from §A.1 and reduce it to a closed-form expression in $X.\mathrm{la}$, $N$, and $\mathrm{consumer.la}$ when the wait is declared as <code>cross_iter_depends_on=(("X", -N),)</code>.</span>
+<span class="zh">目标：把 §A.1 给出的本质定义 $\Delta = q_c - q_p$，在 <code>cross_iter_depends_on=(("X", -N),)</code> 这种声明下化简成只含 $X.\mathrm{la}$、$N$、$\mathrm{consumer.la}$ 的闭式。</span>
+</p>
+<p>
+<span class="en">Convention: in <code>P_n</code> (the n-th call to <code>progress()</code>, 0-indexed), a task with lookahead <code>k</code> processes batch <code>B_(n+k)</code> and records its event at <code>slot[k]</code>. Equivalently, <code>slot[k]</code> in <code>P_n</code> currently holds <code>B_(n+k)</code>.</span>
+<span class="zh">约定：在 <code>P_n</code>（第 n 次调用 <code>progress()</code>，0-indexed）里，lookahead 为 <code>k</code> 的 task 处理 batch <code>B_(n+k)</code>，并在 <code>slot[k]</code> 记录 event。等价地，<code>P_n</code> 里 <code>slot[k]</code> 当前装着 <code>B_(n+k)</code>。</span>
+</p>
+<p>
+<span class="en">Consumer at <code>P_n = q_c</code> processes <code>B_(n + consumer.la)</code>. The cross_iter declaration says it waits for X's work on <code>B_(n + consumer.la − N)</code>. The progress in which X processes <code>B_(n + consumer.la − N)</code> is <code>P_(n + consumer.la − N − X.la)</code>:</span>
+<span class="zh">consumer 在 <code>P_n = q_c</code> 处理 <code>B_(n + consumer.la)</code>。cross_iter 要等 X 在 <code>B_(n + consumer.la − N)</code> 上的工作。而处理 batch <code>B_(n + consumer.la − N)</code> 的 progress 是在 <code>P_(n + consumer.la − N − X.la)</code>：</span>
+</p>
+<p style="text-align:center;">$$
+\begin{aligned}
+q_p &= n + \mathrm{consumer.la} - N - X.\mathrm{la} \\
+\Delta &= q_c - q_p \\
+       &= n - (n + \mathrm{consumer.la} - N - X.\mathrm{la}) \\
+       &= X.\mathrm{la} + N - \mathrm{consumer.la}
+\end{aligned}
+$$</p>
+<p>
+<span class="en"><strong>Where consumer actually looks up the event.</strong> Producer recorded its event at $\mathrm{slot}[X.\mathrm{la}]$ in its own progress $P_{q_p}$. Each <code>ring.advance()</code> uniformly shifts every slot by $-1$. After $\Delta$ advances, the slot that was at offset $X.\mathrm{la}$ has rotated to offset $X.\mathrm{la} - \Delta$ in consumer's progress $P_{q_c}$. The engine's consumer-side ring index is exactly this:</span>
+<span class="zh"><strong>consumer 实际去查的 slot。</strong>producer 在自己的 progress $P_{q_p}$ 里把 event 录在 $\mathrm{slot}[X.\mathrm{la}]$；每次 <code>ring.advance()</code> 把所有 slot 整体 $-1$ 平移，经过 $\Delta$ 次 advance 后那个 slot 在 consumer 的 progress $P_{q_c}$ 里已经落到偏移 $X.\mathrm{la} - \Delta$。这个偏移就是引擎在 consumer 端实际查询的 ring index：</span>
+</p>
+<p style="text-align:center;">$$\mathrm{slot\_offset} \;\stackrel{\text{def}}{=}\; X.\mathrm{la} - \Delta$$</p>
+<p>
+<span class="en">$X.\mathrm{la}$ does appear in $\Delta$, but it cancels when we substitute:</span>
+<span class="zh">$\Delta$ 里其实带着 $X.\mathrm{la}$，代入展开后两个 $X.\mathrm{la}$ 相消：</span>
+</p>
+<p style="text-align:center;">$$\mathrm{slot\_offset} \;=\; X.\mathrm{la} - (X.\mathrm{la} + N - \mathrm{consumer.la}) \;=\; \mathrm{consumer.la} - N$$</p>
+<p>
+<span class="en">That is why the consumer-side lookup index depends only on $\mathrm{consumer.la}$ and $N$, not on the producer's lookahead — ring rotation is uniform, so producer.la is fully absorbed into $\Delta$. The slot_offset formula in <code>deps.py</code> writes this directly as <code>consumer.batch_offset + neg_offset</code> (where <code>neg_offset = -N</code>).</span>
+<span class="zh">这就是为什么 consumer 端实际查询的 slot 编号只跟 $\mathrm{consumer.la}$ 和 $N$ 有关，与 producer 的 lookahead 无关——ring 旋转是整体均匀平移，producer.la 的信息全部被 $\Delta$ 吸收。<code>deps.py</code> 里直接写成 <code>consumer.batch_offset + neg_offset</code>（其中 <code>neg_offset = -N</code>）。</span>
+</p>
+</section>
+
+<section id="appendix-delta-constraints">
+<h3><span class="en">A.3 Validity constraints</span><span class="zh">A.3 合法性约束</span></h3>
+<table>
+<thead><tr>
+  <th><span class="en">Condition</span><span class="zh">条件</span></th>
+  <th><span class="en">Requirement</span><span class="zh">要求</span></th>
+  <th><span class="en">Why / engine response</span><span class="zh">原因 / 引擎反应</span></th>
+</tr></thead>
+<tbody>
+<tr><td>$\Delta &lt; 0$</td><td>$\mathrm{consumer.la} &gt; X.\mathrm{la} + N$</td><td><span class="en">Future-read: producer hasn't yet processed $B_{K-N}$ by consumer's progress. <code>deps.py</code> raises at construction.</span><span class="zh">future-read：producer 在 consumer 的 progress 时还没处理过 $B_{K-N}$。<code>deps.py</code> 构造时直接 raise。</span></td></tr>
+<tr><td>$\Delta = 0$</td><td>$\mathrm{consumer.la} = X.\mathrm{la} + N$</td><td><span class="en">Same-progress, no ring rotation. <strong>Auto-promoted to <code>same_progress_sync</code> semantics</strong>: engine adds the topo-DAG edge X → consumer, the cross-thread CPU edge, and emits <code>wait_event</code> at <code>slot[X.la]</code>. The user-facing declaration stays as written; the engine handles the dispatch. (Earlier versions raised here, instructing the user to rewrite as <code>same_progress_sync</code>; that step is now optional. See <code>SPEC_cross_iter_delta0_autoconvert.md</code>.)</span><span class="zh">同 progress、无 ring 旋转。<strong>自动提升为 <code>same_progress_sync</code> 语义</strong>：引擎加 topo-DAG 边 X → consumer、跨线程 CPU 边，跨 stream 时在 <code>slot[X.la]</code> emit <code>wait_event</code>。用户层声明保持原样，引擎自动派发。（早期版本会在此 raise 并要求重写为 <code>same_progress_sync</code>；该步骤现在可选。详见 <code>SPEC_cross_iter_delta0_autoconvert.md</code>。）</span></td></tr>
+<tr><td>$\Delta \ge 1$</td><td>$\mathrm{consumer.la} \le X.\mathrm{la} + N - 1$</td><td><span class="en">Strictly cross-progress — accepted.</span><span class="zh">严格跨 progress —— 接受。</span></td></tr>
+<tr><td colspan="2"><span class="en">Additional (cross-stream only): $\mathrm{slot\_offset} \ge 0$</span><span class="zh">额外（仅 cross-stream）：$\mathrm{slot\_offset} \ge 0$</span></td><td><span class="en">$\mathrm{consumer.la} \ge N$ — slot still in ring; otherwise event has been recycled. Same-stream skips this check (CUDA stream FIFO orders submissions without needing the event lookup).</span><span class="zh">$\mathrm{consumer.la} \ge N$ —— slot 仍在 ring 内；否则 event 已被回收。同 stream 跳过此检查（CUDA stream FIFO 直接保序，不需要查 event）。</span></td></tr>
+</tbody>
+</table>
+
+<p>
+<span class="en">Combined cross-stream interval:</span>
+<span class="zh">cross-stream 合并区间：</span>
+</p>
+<p style="text-align:center;">$$N \;\le\; \mathrm{consumer.la} \;\le\; X.\mathrm{la} + N - 1 \quad\Longleftrightarrow\quad 1 \;\le\; \Delta \;\le\; X.\mathrm{la}$$</p>
+<p>
+<span class="en">Same-stream relaxes to just Δ ≥ 1.</span>
+<span class="zh">同 stream 放宽为只需 Δ ≥ 1。</span>
+</p>
+
+<p>
+<span class="en"><strong>Validator code</strong>: <a href="../../engine/deps.py#L437"><code>deps.py</code> lines 437-501</a> (Δ=0 / Δ&lt;0), and <a href="../../engine/deps.py#L515"><code>deps.py</code> line 515</a> (slot_offset&lt;0).</span>
+<span class="zh"><strong>校验代码</strong>：<a href="../../engine/deps.py#L437"><code>deps.py</code> 437-501 行</a>（Δ=0 / Δ&lt;0），<a href="../../engine/deps.py#L515"><code>deps.py</code> 515 行</a>（slot_offset&lt;0）。</span>
+</p>
+</section>
+
+<section id="appendix-delta-plain">
+<h3><span class="en">A.4 Plain-language summary</span><span class="zh">A.4 通俗解释</span></h3>
+<p>
+<span class="en">Read <code>cross_iter_depends_on=(("X", -N),)</code> as: "the consumer task, when running on batch $K$, needs X's GPU work for batch $K - N$ to be already finished and recorded into the ring." $\Delta$ tells the engine <em>how stale</em> X's record will be by the time consumer reads it — measured in progress() calls.</span>
+<span class="zh">把 <code>cross_iter_depends_on=(("X", -N),)</code> 读作："consumer 在 batch $K$ 上跑时，需要 X 在 batch $K - N$ 上的 GPU 工作已经做完并录进 ring。"$\Delta$ 告诉引擎：等 consumer 真正读这条 event 时，它在 ring 里待机了多少个 progress() 步。</span>
+</p>
+<ul>
+  <li><span class="en"><strong>$\Delta = 1$</strong>: producer ran in the immediately preceding progress. Most common case.</span><span class="zh"><strong>$\Delta = 1$</strong>：producer 在紧邻的上一次 progress 跑完。最常见。</span></li>
+  <li><span class="en"><strong>$\Delta = 2, 3, \ldots$</strong>: producer ran further back. Engine still finds the event in the ring as long as $\Delta \le X.\mathrm{la}$ (the slot hasn't rotated out yet).</span><span class="zh"><strong>$\Delta = 2, 3, \ldots$</strong>：producer 在更早的 progress 跑完。只要 $\Delta \le X.\mathrm{la}$（slot 还没被旋转出去），引擎仍能在 ring 里找到 event。</span></li>
+  <li><span class="en"><strong>$\Delta = 0$</strong>: producer and consumer are both in the same progress. Engine <strong>auto-promotes</strong> the declaration to <code>same_progress_sync</code> semantics — same topo edge, same CPU edge, same <code>slot[producer.la]</code> event lookup. Equivalent to writing <code>same_progress_sync=(X,)</code> directly; the cross_iter syntax just lets users keep a batch-flow mental model.</span><span class="zh"><strong>$\Delta = 0$</strong>：producer 和 consumer 在同一次 progress 里。引擎<strong>自动提升</strong>这条声明为 <code>same_progress_sync</code> 语义——相同的 topo 边、CPU 边、<code>slot[producer.la]</code> event 查询。与直接写 <code>same_progress_sync=(X,)</code> 等价；cross_iter 语法只是让 batch-flow 思维的用户少改一行。</span></li>
+  <li><span class="en"><strong>$\Delta &lt; 0$</strong>: consumer would be asking for something producer hasn't computed yet. Logically impossible.</span><span class="zh"><strong>$\Delta &lt; 0$</strong>：consumer 在等 producer 还没算出来的东西。逻辑上不可能。</span></li>
+</ul>
+
+<p>
+<span class="en"><strong>Quick mnemonic</strong>: if you wrote <code>cross_iter_depends_on=(("X", -1),)</code>, you usually mean "wait for last progress's X". That works exactly when $\Delta = 1$, which forces $X.\mathrm{la} = \mathrm{consumer.la}$. Any la mismatch causes $\Delta$ to drift and may collide with one of the boundary checks above.</span>
+<span class="zh"><strong>速记</strong>：写 <code>cross_iter_depends_on=(("X", -1),)</code> 通常是想表达"等上一次 progress 的 X"。这恰好对应 $\Delta = 1$，强制 $X.\mathrm{la} = \mathrm{consumer.la}$。任何 la 不一致都会让 $\Delta$ 偏离，可能撞上上面的边界检查。</span>
+</p>
+</section>
+
+<section id="appendix-delta-examples">
+<h3><span class="en">A.5 Worked examples</span><span class="zh">A.5 实例</span></h3>
+<table>
+<thead><tr>
+  <th>$X.\mathrm{la}$</th>
+  <th>$\mathrm{consumer.la}$</th>
+  <th>$N$</th>
+  <th>$\Delta$</th>
+  <th>$\mathrm{slot\_offset}$</th>
+  <th><span class="en">Verdict</span><span class="zh">判定</span></th>
+</tr></thead>
+<tbody>
+<tr><td>0</td><td>0</td><td>1</td><td>1</td><td>−1</td><td><span class="en">cross-stream: REJECTED (slot rotated out). same-stream: OK (FIFO).</span><span class="zh">cross-stream：拒（slot 出 ring）。same-stream：通过（FIFO 保序）。</span></td></tr>
+<tr><td>1</td><td>1</td><td>1</td><td>1</td><td>0</td><td><span class="en">OK. "Wait for last progress's X on same lookahead."</span><span class="zh">通过。"等上一 progress 的 X，同 lookahead。"</span></td></tr>
+<tr><td>2</td><td>2</td><td>2</td><td>2</td><td>0</td><td><span class="en">OK. "Wait for X two progresses back, same lookahead."</span><span class="zh">通过。"等 2 个 progress 前的 X，同 lookahead。"</span></td></tr>
+<tr><td>3</td><td>2</td><td>2</td><td>3</td><td>0</td><td><span class="en">OK. X is deeper, so its slot needs 3 advances to reach consumer's view; ring depth 4 holds it.</span><span class="zh">通过。X 在更深处，slot 需要旋转 3 次才到 consumer 视角；ring 深度 4 装得下。</span></td></tr>
+<tr><td>0</td><td>1</td><td>1</td><td>0</td><td>0</td><td><span class="en">OK — Δ=0 auto-promoted. Engine adds topo edge X → consumer; emits <code>wait_event</code> at <code>slot[0]</code> (cross-stream) or relies on FIFO + topo order (same-stream). Equivalent to <code>same_progress_sync=(X,)</code>.</span><span class="zh">通过 —— Δ=0 自动提升。引擎加 topo 边 X → consumer；跨流时 <code>slot[0]</code> emit <code>wait_event</code>，同流靠 FIFO + topo 顺序。等价于 <code>same_progress_sync=(X,)</code>。</span></td></tr>
+<tr><td>0</td><td>3</td><td>1</td><td>−2</td><td>2</td><td><span class="en">REJECTED — future-read (Δ&lt;0). Producer hasn't run yet at consumer's progress.</span><span class="zh">拒 —— future-read (Δ&lt;0)。consumer 的 progress 时 producer 还没跑过这个 batch。</span></td></tr>
+</tbody>
+</table>
+</section>
 </section>
 
 <hr>
