@@ -325,19 +325,55 @@ def test_rule6_unresolved_depends_on_rejected() -> None:
         validate(schedule, _pool("default"))
 
 
-def test_rule6_forward_depends_on_rejected() -> None:
-    """depends_on must reference a task STRICTLY EARLIER in declaration
-    order. Self-reference and forward references rejected."""
+def test_rule6_forward_depends_on_now_accepted() -> None:
+    """``depends_on`` no longer requires strict declaration-order
+    precedence. The engine sorts tasks topologically by within-progress
+    DAG edges (see ``deps.topological_sort``) so a producer declared
+    after its consumer is reordered to run first.
+
+    Cycles are still caught by rule 7 (acyclic DAG).
+    """
     a = Task.from_fn(
         name="a",
         fn=_noop,
-        depends_on=("b",),  # b comes AFTER a
+        depends_on=("b",),  # b declared after a — engine will reorder
         stream="default",
     )
     b = Task.from_fn(name="b", fn=_noop, stream="default")
     schedule = Schedule(stages=(Stage(tasks=(a, b)),), stream_slots=("default",))
+    # Should not raise — declaration order no longer matters.
+    validate(schedule, _pool("default"))
+
+
+def test_rule6_unknown_cross_iter_dep_rejected() -> None:
+    """Unknown producer name in ``cross_iter_depends_on`` raises."""
+    a = Task.from_fn(
+        name="a",
+        fn=_noop,
+        cross_iter_depends_on=(("ghost", -1),),
+        stream="default",
+    )
+    schedule = Schedule(stages=(Stage(tasks=(a,)),), stream_slots=("default",))
     with pytest.raises(
-        ScheduleValidationError, match=r"\[rule 6\].*NOT strictly earlier"
+        ScheduleValidationError,
+        match=r"\[rule 6\].*cross_iter_depends_on.*ghost",
+    ):
+        validate(schedule, _pool("default"))
+
+
+def test_rule6_unknown_same_progress_sync_rejected() -> None:
+    """Unknown producer name in ``same_progress_sync`` raises (without
+    this check, a typo would silently drop the coherency wait)."""
+    a = Task.from_fn(
+        name="a",
+        fn=_noop,
+        same_progress_sync=("typo",),
+        stream="default",
+    )
+    schedule = Schedule(stages=(Stage(tasks=(a,)),), stream_slots=("default",))
+    with pytest.raises(
+        ScheduleValidationError,
+        match=r"\[rule 6\].*same_progress_sync.*typo",
     ):
         validate(schedule, _pool("default"))
 
@@ -490,3 +526,157 @@ def test_smoke_valid_single_stream_schedule_passes() -> None:
     t = Task.from_fn(name="t", fn=_noop, stream="default")
     schedule = Schedule(stages=(Stage(tasks=(t,)),), stream_slots=("default",))
     validate(schedule, _pool("default"))
+
+
+# ----------------------------------------------------------------------
+# Gap D — Rule 7 acyclic via topological_sort
+# ----------------------------------------------------------------------
+#
+# Rule 7 wraps ``deps.topological_sort``'s cycle detection in the
+# validator's typed exception. Each test below builds a cycle from a
+# specific edge source and confirms the rule 7 message surfaces.
+
+
+def test_rule7_depends_on_only_cycle() -> None:
+    """A cycle made entirely of ``depends_on`` edges with matching
+    lookaheads (so they DO form within-progress topo edges)
+    triggers rule 7."""
+    a = Task.from_fn(
+        name="a",
+        fn=_noop,
+        depends_on=("b",),
+        stream="default",
+    )
+    b = Task.from_fn(
+        name="b",
+        fn=_noop,
+        depends_on=("a",),
+        stream="default",
+    )
+    schedule = Schedule(
+        stages=(Stage(tasks=(a, b)),),
+        stream_slots=("default",),
+    )
+    with pytest.raises(ScheduleValidationError, match=r"\[rule 7\]"):
+        validate(schedule, _pool("default"))
+
+
+def test_rule7_same_progress_sync_only_cycle() -> None:
+    """A cycle made entirely of ``same_progress_sync`` edges
+    triggers rule 7 (these always add within-progress edges,
+    regardless of lookahead)."""
+    a = Task.from_fn(
+        name="a",
+        fn=_noop,
+        same_progress_sync=("b",),
+        stream="default",
+    )
+    b = Task.from_fn(
+        name="b",
+        fn=_noop,
+        same_progress_sync=("a",),
+        stream="default",
+    )
+    schedule = Schedule(
+        stages=(Stage(tasks=(a, b)),),
+        stream_slots=("default",),
+    )
+    with pytest.raises(ScheduleValidationError, match=r"\[rule 7\]"):
+        validate(schedule, _pool("default"))
+
+
+def test_rule7_mixed_depends_on_and_same_progress_sync_cycle() -> None:
+    """A cycle composed of one ``depends_on`` edge + one
+    ``same_progress_sync`` edge triggers rule 7."""
+    a = Task.from_fn(
+        name="a",
+        fn=_noop,
+        depends_on=("b",),  # b → a edge
+        stream="default",
+    )
+    b = Task.from_fn(
+        name="b",
+        fn=_noop,
+        same_progress_sync=("a",),  # a → b edge → cycle
+        stream="default",
+    )
+    schedule = Schedule(
+        stages=(Stage(tasks=(a, b)),),
+        stream_slots=("default",),
+    )
+    with pytest.raises(ScheduleValidationError, match=r"\[rule 7\]"):
+        validate(schedule, _pool("default"))
+
+
+def test_rule7_cross_lookahead_depends_on_would_be_cycle_passes() -> None:
+    """``depends_on`` with producer.la > consumer.la does NOT add a
+    within-progress edge, so a configuration that would cycle if it
+    did is still acyclic. The validator must accept it (rule 7 must
+    not fire)."""
+    # consumer (la=0) depends_on producer (la=2). If the edge were
+    # added (producer → consumer), and we also add a depends_on going
+    # back the other way at MATCHING lookahead, we'd cycle. Using
+    # cross-lookahead in one direction breaks the cycle even though
+    # lexically two depends_on edges exist.
+    consumer = Task.from_fn(
+        name="cons",
+        fn=_noop,
+        lookahead=0,
+        depends_on=("prod",),  # cross-la=2 — no topo edge
+        stream="default",
+    )
+    producer = Task.from_fn(
+        name="prod",
+        fn=_noop,
+        lookahead=2,
+        # No back edge — without the suppressed topo edge, this is
+        # just two unrelated tasks. Verifies rule 7 doesn't false-
+        # positive on cross-lookahead depends_on.
+        stream="default",
+    )
+    schedule = Schedule(
+        stages=(Stage(tasks=(consumer, producer)),),
+        stream_slots=("default",),
+    )
+    # Must not raise — cross-lookahead doesn't form within-progress
+    # cycles by construction.
+    validate(schedule, _pool("default"))
+
+
+# ----------------------------------------------------------------------
+# Gap E — Rule 6 future-read reject
+# ----------------------------------------------------------------------
+#
+# ``depends_on=("X",)`` with X.lookahead < self.lookahead is a
+# "future-read": the producer's same-batch work hasn't run by the
+# consumer's iteration, so the wait is unsatisfiable. Rule 6 catches
+# this. (Cross_iter_depends_on positive/zero offsets are caught at
+# Task.__init__ time and covered by existing
+# ``test_engine_task_lookahead.py`` tests.)
+
+
+def test_rule6_future_read_via_depends_on_rejected() -> None:
+    """``depends_on=("X",)`` where X.lookahead < self.lookahead is
+    a future-read — the producer hasn't processed the consumer's
+    batch yet by the consumer's iteration. Rule 6 rejects."""
+    producer = Task.from_fn(
+        name="prod",
+        fn=_noop,
+        lookahead=0,  # ran on this iter's batch K = 0; future-batches K=1,2 untouched
+        stream="default",
+    )
+    consumer = Task.from_fn(
+        name="cons",
+        fn=_noop,
+        lookahead=2,  # consumer is processing batch K=2 in this progress
+        depends_on=(
+            "prod",
+        ),  # asks to wait for prod to have processed K=2 — impossible
+        stream="default",
+    )
+    schedule = Schedule(
+        stages=(Stage(tasks=(producer, consumer)),),
+        stream_slots=("default",),
+    )
+    with pytest.raises(ScheduleValidationError, match=r"\[rule 6\]"):
+        validate(schedule, _pool("default"))
