@@ -53,67 +53,158 @@ def _normalize_slot_refs(
     return tuple(out)
 
 
-# `depends_on` entries: SPEC_p4 v2 §5 allows
-#   - bare task name "X"      → within-iter ordering, equivalent to ("X", 0)
-#   - tuple ("X", -N)         → cross-iter pure-control dependency, this
-#                               task must wait for `X` from `N` iters ago.
-# Positive offsets are rejected. The constructor splits the user-provided
-# entries into two engine-internal tuples: ``depends_on`` (within-iter,
-# bare names) and ``cross_iter_depends_on`` (list of (name, -N)).
-DependsOnRef = Union[str, Tuple[str, int]]
+# Three distinct user-facing fields express three distinct ordering
+# semantics, framed in terms of the user's logical batch flow (not
+# engine implementation details). They are NOT interchangeable, and
+# each is validated separately:
+#
+#   ``depends_on=("X", "Y", ...)``                          (Tuple[str, ...])
+#       **same-batch logical dependency**: "this task processing
+#       batch K must wait for X to have processed batch K". The
+#       engine maps this to a ring-rotated wait_event lookup at
+#       slot offset=consumer.batch_offset, finding X's event from
+#       whichever progress() call X processed batch K in (which may
+#       be the current progress, if X.lookahead == self.lookahead,
+#       or an earlier progress, if X.lookahead > self.lookahead and
+#       the ring has rotated X's event into the consumer's slot).
+#       Future-read (X.lookahead < self.lookahead) is rejected at
+#       construction time.
+#
+#   ``cross_iter_depends_on=("X", ("Y", -2), ...)``
+#       **different-batch logical dependency**: "this task processing
+#       batch K must wait for X to have processed batch K-N". Two
+#       equivalent author syntaxes:
+#         - Bare name ``"X"`` is shorthand for ``("X", -1)`` — the
+#           common "wait for prev batch's X" case.
+#         - Tuple ``("X", -N)`` for N != 1 — wait for X from N batches
+#           ago. Positive / zero offsets are rejected (use
+#           ``depends_on`` for same-progress wait).
+#       Engine reads X's event from a ring-history slot N iters
+#       earlier than same-batch staging would give. Currently rare in
+#       HSTU (no task uses it); reserved for future authors who need
+#       to depend on a strictly earlier batch's output, e.g. streaming
+#       statistics.
+#
+#   ``same_progress_sync=("X", "Y", ...)``                          (Tuple[str, ...])
+#       **same-progress wait**: "this task must wait for X's work in
+#       *this same* progress() call to finish, regardless of which
+#       batches X and self are processing."
+#
+#       Engine contract:
+#         - Adds a topological-sort edge X → self (so X is guaranteed
+#           to fire before self within the progress).
+#         - For threaded execution, adds a CPU-side ``threading.Event``
+#           wait (cross-thread case only).
+#         - For cross-stream, emits ``wait_event`` at slot offset=
+#           ``producer.batch_offset`` (where X recorded its event in
+#           *this* progress). Same-stream relies on CUDA stream FIFO.
+#
+#       Three known uses:
+#
+#       (a) Stream coherency on out-of-slot mutable state. When
+#           consumer and producer touch a shared object that is NOT
+#           declared in any reads/writes slot (e.g. dynamicemb cache,
+#           a torchrec module attribute, a global counter) and they
+#           run on different streams, the engine cannot infer a
+#           dataflow edge. ``same_progress_sync`` makes the wait
+#           explicit. Mirrors the legacy
+#           ``default_stream.wait_stream(prefetch_stream)`` pattern.
+#           HSTU prefetch variant uses this for
+#           ``backward.same_progress_sync=("prefetch_embeddings",)``
+#           — drains prefetch's GPU work before backward / before
+#           the next progress kicks off.
+#
+#       (b) Explicit form of the Δ=0 cross_iter_depends_on. When the
+#           user's mental model is "this la=c task waits for that
+#           la=p task's current-progress output" with c = p + N for
+#           some positive N, they may write either
+#           ``same_progress_sync=(X,)`` (clearer when the intent is
+#           explicitly same-progress) OR
+#           ``cross_iter_depends_on=((X, -N),)`` with the batch-flow
+#           phrasing — the engine auto-promotes the latter to the
+#           same mechanical contract (same topo edge, same slot
+#           lookup, same CPU edge). See SPEC_cross_iter_delta0_autoconvert.md.
+#           Concrete example: la=1 forward wants to use post-update
+#           weights from la=0 update in the same progress → either
+#           ``forward.same_progress_sync=("update",)`` or
+#           ``forward.cross_iter_depends_on=(("update", -1),)`` works.
+#           See ``test_engine_same_progress_sync_correctness.py``
+#           (parametrized over both forms).
+#
+#       (c) Producer/consumer in same progress on different batches
+#           with NO sharing of out-of-slot state, but where the
+#           consumer wants the producer's current-progress event for
+#           coherent measurement / logging / metric aggregation. (Less
+#           common; aux statistics tasks etc.)
+#
+#       Direction convention: ``X.same_progress_sync=()`` is empty;
+#       declarations live on the consumer side. ``X.la`` and
+#       ``consumer.la`` may differ — the field is la-agnostic.
 
 
-def _normalize_depends_on(
-    refs: Optional[Iterable[DependsOnRef]],
-) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, int], ...]]:
-    """Split user-facing depends_on into (within_iter, cross_iter)."""
+def _validate_bare_name_refs(
+    refs: Optional[Iterable[str]],
+    field_name: str,
+) -> Tuple[str, ...]:
+    """Validate a tuple-of-bare-task-names field (``depends_on`` /
+    ``same_progress_sync``)."""
     if refs is None:
-        return (), ()
-    within: list = []
-    cross: list = []
+        return ()
+    out: list = []
     for r in refs:
         if isinstance(r, str):
-            within.append(r)
-        elif isinstance(r, tuple) and len(r) == 2:
-            name, offset = r
-            if not isinstance(name, str) or not isinstance(offset, int):
-                raise TypeError(
-                    f"depends_on tuple entries must be (str, int), got "
-                    f"({type(name).__name__}, {type(offset).__name__}): {r!r}"
-                )
-            if offset > 0:
-                raise ValueError(
-                    f"depends_on tuple ({name!r}, {offset}): positive "
-                    f"iteration offset is not allowed. Use negative for "
-                    f"cross-iter ('wait for X from N iters ago'); use 0 "
-                    f"or the bare string {name!r} for within-iter."
-                )
-            if offset == 0:
-                within.append(name)
-            else:
-                cross.append((name, offset))
+            out.append(r)
         else:
             raise TypeError(
-                f"depends_on entries must be str or (str, int) tuple, got "
-                f"{type(r).__name__}: {r!r}"
+                f"{field_name} entries must be bare task-name strings; "
+                f"got {type(r).__name__}: {r!r}."
             )
+    return tuple(out)
 
-    # SPEC_p4 v2 §5 strictness: a single producer name cannot appear
-    # both as within-iter and as cross-iter on the same consumer. If
-    # the user truly wants two independent edges they should use
-    # distinct producer names; mixing the two forms on the same name
-    # is treated as a likely mistake.
-    overlap = set(within) & {n for (n, _) in cross}
-    if overlap:
-        raise ValueError(
-            f"depends_on lists the same producer name(s) "
-            f"{sorted(overlap)!r} both as within-iter (bare string or "
-            f"(name, 0)) and as cross-iter ((name, -N)). Pick one "
-            f"semantic per producer; if you really want two ordering "
-            f"edges to that producer, give them distinct names."
-        )
 
-    return tuple(within), tuple(cross)
+def _validate_cross_iter_depends_on(
+    refs: Optional[Iterable[Union[str, Tuple[str, int]]]],
+) -> Tuple[Tuple[str, int], ...]:
+    """Validate ``cross_iter_depends_on=`` entries.
+
+    Two equivalent author syntaxes:
+      - Bare task name ``"X"`` is shorthand for ``("X", -1)`` —
+        "wait for X from 1 iter ago" (the most common case).
+      - Tuple ``("X", -N)`` for N != 1 — "wait for X from N iters ago".
+
+    Both forms are normalized to the ``(name, neg_int)`` internal
+    representation. Positive / zero offsets are rejected.
+    """
+    if refs is None:
+        return ()
+    out: list = []
+    for r in refs:
+        if isinstance(r, str):
+            # Bare-name shorthand → (name, -1)
+            out.append((r, -1))
+            continue
+        if not (isinstance(r, tuple) and len(r) == 2):
+            raise TypeError(
+                f"cross_iter_depends_on entries must be a bare task "
+                f"name (shorthand for N=1) or a (name, -N) tuple; "
+                f"got {type(r).__name__}: {r!r}."
+            )
+        name, offset = r
+        if not isinstance(name, str) or not isinstance(offset, int):
+            raise TypeError(
+                f"cross_iter_depends_on tuple entries must be (str, "
+                f"int), got ({type(name).__name__}, "
+                f"{type(offset).__name__}): {r!r}"
+            )
+        if offset >= 0:
+            raise ValueError(
+                f"cross_iter_depends_on=({name!r}, {offset}): offset "
+                f"must be negative ('wait for X from N iters ago'). "
+                f"For same-progress wait, use bare name in "
+                f"``depends_on`` instead."
+            )
+        out.append((name, offset))
+    return tuple(out)
 
 
 class DataSlot:
@@ -177,6 +268,35 @@ class Task:
     constructor raises ``ValueError``. New code should prefer
     ``lookahead``; ``batch_offset`` is kept for the imperative
     `Schedule` API and existing call sites.
+
+    --------------------------------------------------------------------
+    Communication discipline (read this before writing a new task!)
+    --------------------------------------------------------------------
+    The first-class channel for cross-task data is ``ctx.slots[name]``,
+    declared in ``reads`` / ``writes`` so the engine's DAG can see it.
+
+    Tasks MAY also share other state — module instance attributes
+    (e.g. ``module.forward._context``), ``PipelineState`` fields,
+    global Python singletons. Sharing alone is fine; what kills you
+    is **concurrent** read/write. The engine inserts CPU-side
+    ``threading.Event`` waits ONLY for edges it can see: ``reads`` /
+    ``writes`` on the same slot, or an explicit ``depends_on``. So:
+    if two tasks touch the same out-of-slot object AND the engine has
+    no DAG edge between them (different slots, no ``depends_on``) —
+    including **cross-iter pipelined** overlap (iter K of one task
+    racing iter K+1 of another) — the author must colocate them on
+    one thread via ``thread_map``. Within a single thread, sequential
+    execution serializes them automatically.
+
+    Convention only — no runtime check. Past offender: torchrec's
+    ``set_context()`` was called from ``start_input_dist`` and
+    ``forward``, both writing shared ``module.forward._context``.
+    Same-iter ordering was implicit (``forward`` reads the
+    ``torchrec_ctx`` slot that ``start_input_dist`` writes), but the
+    cross-iter pipelined edge — iter K's ``forward`` overlapping iter
+    K+1's ``start_input_dist`` — had no shared slot. The colocation
+    was once enforced by a now-deleted runtime check; the underlying
+    mutation was removed entirely in the PostProc cleanup.
     """
 
     # Defaults so subclasses can override as class attributes.
@@ -189,6 +309,7 @@ class Task:
     writes: Tuple[DataSlot, ...] = ()
     depends_on: Tuple[str, ...] = ()
     cross_iter_depends_on: Tuple[Tuple[str, int], ...] = ()
+    same_progress_sync: Tuple[str, ...] = ()
     nvtx_tag: Optional[str] = None
     nccl: bool = False
 
@@ -202,7 +323,9 @@ class Task:
         lookahead: Optional[int] = None,
         reads: Optional[Tuple[DataSlot, ...]] = None,
         writes: Optional[Tuple[DataSlot, ...]] = None,
-        depends_on: Optional[Iterable[DependsOnRef]] = None,
+        depends_on: Optional[Iterable[str]] = None,
+        cross_iter_depends_on: Optional[Iterable[Union[str, Tuple[str, int]]]] = None,
+        same_progress_sync: Optional[Iterable[str]] = None,
         nvtx_tag: Optional[str] = None,
         nccl: Optional[bool] = None,
     ) -> None:
@@ -234,16 +357,48 @@ class Task:
             self.reads = _normalize_slot_refs(reads, self.batch_offset)
         if writes is not None:
             self.writes = _normalize_slot_refs(writes, self.batch_offset)
+        # Stash raw kwarg values onto self before normalization so the
+        # normalize step below uses the kwarg if provided, otherwise
+        # whatever the subclass set as a class attribute.
         if depends_on is not None:
-            # Accept SPEC_p4 v2 union form: bare names are within-iter,
-            # ("X", -N) tuples are cross-iter pure-control. Split into
-            # the two engine-internal tuples; existing engine code
-            # (deps.py, executor.py) reads `self.depends_on` for the
-            # within-iter set as before.
-            within, cross = _normalize_depends_on(depends_on)
-            self.depends_on = within
-            if cross:
-                self.cross_iter_depends_on = cross
+            self.depends_on = depends_on  # type: ignore[assignment]
+        if cross_iter_depends_on is not None:
+            self.cross_iter_depends_on = cross_iter_depends_on  # type: ignore[assignment]
+        if same_progress_sync is not None:
+            self.same_progress_sync = same_progress_sync  # type: ignore[assignment]
+
+        # Normalize unconditionally — covers both constructor kwargs
+        # AND subclass class attributes. Without this, a subclass that
+        # writes ``cross_iter_depends_on = ("X",)`` (bare-name shorthand)
+        # would never get normalized into ``(("X", -1),)`` because the
+        # constructor's kwarg branch only fires when an explicit kwarg
+        # is passed.
+        self.depends_on = _validate_bare_name_refs(self.depends_on, "depends_on")
+        self.cross_iter_depends_on = _validate_cross_iter_depends_on(
+            self.cross_iter_depends_on
+        )
+        self.same_progress_sync = _validate_bare_name_refs(
+            self.same_progress_sync, "same_progress_sync"
+        )
+
+        # Sanity: a single producer name appearing in multiple of
+        # the three dependency fields is almost certainly an
+        # authoring mistake — they express different semantics.
+        within_names = set(self.depends_on)
+        cross_names = {n for (n, _) in self.cross_iter_depends_on}
+        sync_names = set(self.same_progress_sync)
+        for a_name, a_set, b_name, b_set in [
+            ("depends_on", within_names, "cross_iter_depends_on", cross_names),
+            ("depends_on", within_names, "same_progress_sync", sync_names),
+            ("cross_iter_depends_on", cross_names, "same_progress_sync", sync_names),
+        ]:
+            overlap = a_set & b_set
+            if overlap:
+                raise ValueError(
+                    f"Task {self.name!r} lists producer name(s) "
+                    f"{sorted(overlap)!r} in both ``{a_name}`` and "
+                    f"``{b_name}``. Pick one semantic per producer."
+                )
         if nvtx_tag is not None:
             self.nvtx_tag = nvtx_tag
         if nccl is not None:
@@ -299,16 +454,26 @@ class Task:
         lookahead: Optional[int] = None,
         reads: Iterable[SlotRef] = (),
         writes: Iterable[SlotRef] = (),
-        depends_on: Iterable[DependsOnRef] = (),
+        depends_on: Iterable[str] = (),
+        cross_iter_depends_on: Iterable[Union[str, Tuple[str, int]]] = (),
+        same_progress_sync: Iterable[str] = (),
         nvtx_tag: Optional[str] = None,
         nccl: bool = False,
     ) -> "Task":
         """Factory for the lambda-style authoring form.
 
-        ``reads`` and ``writes`` may be a tuple of bare slot names
+        ``reads`` / ``writes`` may be a tuple of bare slot names
         (auto-tagged with the task's lookahead) or explicit ``DataSlot``
-        objects (legacy imperative form). Returns a ``Task`` instance
-        whose ``run(ctx)`` dispatches to ``fn(ctx)``.
+        objects.
+
+        ``depends_on`` is a tuple of bare task names — each producer's
+        completion event is awaited *in this same progress() call*
+        (same-progress wait).
+
+        ``cross_iter_depends_on`` is a tuple of ``(name, -N)`` pairs —
+        each names a producer whose output from N iters ago is
+        consumed; engine emits a wait_event on the ring slot at
+        offset=producer.lookahead+(-N).
 
         SPEC_p4 v2 §7 Phase C removed the legacy ``batch_offset=``
         keyword — call sites must use ``lookahead=``.
@@ -323,6 +488,8 @@ class Task:
             reads=reads,
             writes=writes,
             depends_on=depends_on,
+            cross_iter_depends_on=cross_iter_depends_on,
+            same_progress_sync=same_progress_sync,
             nvtx_tag=nvtx_tag,
             nccl=nccl,
         )

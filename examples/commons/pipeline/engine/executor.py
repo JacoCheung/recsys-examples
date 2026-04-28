@@ -233,9 +233,46 @@ def _compute_cpu_deps(
             if writer_name and writer_name != task.name:
                 dep_names.add(writer_name)
 
-        # Explicit depends_on edges
+        # ``depends_on`` (same-batch logical) edges — engine emits
+        # ring-rotated GPU wait_event; CPU-side, the consumer thread
+        # still needs the producer's host enqueue to be complete in
+        # this same progress() call before continuing. (For same-
+        # lookahead producer/consumer, this is straightforward;
+        # for cross-lookahead, the producer's host enqueue happens
+        # earlier in this progress for the consumer's batch K.)
         for dep_name in task.depends_on or ():
             if dep_name in active_names:
+                dep_names.add(dep_name)
+
+        # ``same_progress_sync`` (same-progress GPU coherency) edges —
+        # consumer waits for the producer's current-iter completion
+        # event, regardless of which batch each is processing. Same
+        # CPU-side mechanism as ``depends_on``: cross-thread emits a
+        # threading.Event wait so the producer's host enqueue +
+        # event.record() happen before the consumer's wait_event is
+        # enqueued.
+        for dep_name in getattr(task, "same_progress_sync", ()):
+            if dep_name in active_names:
+                dep_names.add(dep_name)
+
+        # ``cross_iter_depends_on`` with Δ=0 — auto-promoted to the
+        # same_progress_sync mechanical contract (per
+        # SPEC_cross_iter_delta0_autoconvert.md). When
+        # producer.la + N == consumer.la, the producer ran in the
+        # current progress on a different batch, identical wait
+        # semantics to same_progress_sync. Emit the same CPU edge.
+        # Δ ≥ 1 entries contribute no CPU edge here — those are
+        # handled by ring-rotated wait_event in
+        # ``_apply_cross_stream_waits``.
+        for dep_name, neg_offset in getattr(task, "cross_iter_depends_on", ()):
+            if dep_name not in active_names:
+                continue
+            producer_task = next((t for t in active if t.name == dep_name), None)
+            if producer_task is None:
+                continue
+            N = -neg_offset
+            delta = producer_task.batch_offset + N - task.batch_offset
+            if delta == 0:
                 dep_names.add(dep_name)
 
         # Same-stream predecessor (declaration order) — preserves
