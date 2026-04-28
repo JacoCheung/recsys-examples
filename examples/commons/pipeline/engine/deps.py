@@ -32,17 +32,177 @@ This module is framework-agnostic: stdlib + `.task` + `.schedule`
 only. No torch import.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 from .schedule import Schedule
 from .task import DataSlot, Task
 
-__all__ = ["infer_cross_stream_waits", "infer_cross_stream_event_deps"]
+__all__ = [
+    "infer_cross_stream_waits",
+    "infer_cross_stream_event_deps",
+    "topological_sort",
+]
 
 
 def _flatten_in_order(schedule: Schedule) -> Tuple[Task, ...]:
     """Every task in declaration order (stage order × within-stage order)."""
     return schedule.all_tasks()
+
+
+def _build_same_progress_dag_edges(
+    tasks: Tuple[Task, ...],
+) -> Dict[str, Set[str]]:
+    """Build the within-progress dependency DAG.
+
+    Returns a mapping ``consumer_name -> set of producer names`` for
+    edges that constrain execution order **within a single progress()
+    call**. Edges come from:
+
+      * ``reads/writes`` exact-slot match — same offset means same
+        batch processed in the current progress, producer must run
+        before consumer.
+      * ``depends_on`` bare-name with ``producer.lookahead ==
+        consumer.lookahead`` — same-batch logical dep where producer
+        and consumer process the same batch in the current progress.
+      * ``same_progress_sync`` — by definition a same-progress GPU
+        coherency wait, so producer must run before consumer.
+      * ``cross_iter_depends_on=((X, -N),)`` with Δ=0
+        (``X.lookahead + N == consumer.lookahead``) — degenerate
+        same-progress case; the producer and consumer both run in
+        the current progress on different batches, but the wait
+        semantics are identical to ``same_progress_sync``. Auto-promoted
+        here so the user can keep the batch-flow API.
+
+    Excluded (no current-progress edge needed):
+
+      * ``reads/writes`` name match across different offsets — handled
+        by BatchRing slot rotation; producer's data was written in an
+        earlier progress.
+      * ``depends_on`` bare-name with ``producer.lookahead >
+        consumer.lookahead`` — producer processed the same batch in
+        an earlier progress.
+      * ``cross_iter_depends_on`` with Δ ≥ 1 — genuinely cross-progress
+        dep; mediated by ring rotation, producer ran in an earlier
+        progress.
+
+    Same-stream FIFO is intentionally NOT used as an edge source: if
+    two same-stream tasks have no logical dep between them, the engine
+    leaves their relative execution order unconstrained (CUDA stream
+    FIFO will serialize their GPU ops in submission order, but
+    correctness shouldn't depend on declaration order).
+    """
+    incoming: Dict[str, Set[str]] = {t.name: set() for t in tasks}
+
+    # Slot-based edges: writer of (X, k) → reader of (X, k).
+    writers: Dict[DataSlot, str] = {}
+    for task in tasks:
+        for slot in task.writes:
+            writers[slot] = task.name
+    for task in tasks:
+        for slot in task.reads:
+            writer_name = writers.get(slot)
+            if writer_name and writer_name != task.name:
+                incoming[task.name].add(writer_name)
+
+    name_to_task: Dict[str, Task] = {t.name: t for t in tasks}
+
+    # ``depends_on`` (same-batch logical) — only emit edge when
+    # producer and consumer have the same lookahead, otherwise the
+    # producer's batch K work happened in an earlier progress.
+    for task in tasks:
+        for dep_name in task.depends_on:
+            producer = name_to_task.get(dep_name)
+            if producer is None or producer.name == task.name:
+                continue
+            if producer.batch_offset == task.batch_offset:
+                incoming[task.name].add(producer.name)
+
+    # ``same_progress_sync`` (current-iter GPU coherency) — always
+    # emits a current-progress edge regardless of lookahead, since by
+    # definition both tasks are in the current progress.
+    for task in tasks:
+        for dep_name in getattr(task, "same_progress_sync", ()):
+            producer = name_to_task.get(dep_name)
+            if producer is None or producer.name == task.name:
+                continue
+            incoming[task.name].add(producer.name)
+
+    # ``cross_iter_depends_on=((X, -N),)`` with Δ=0 — auto-promoted to
+    # the same_progress_sync semantic. Δ = X.la + N - consumer.la == 0
+    # means producer ran in the *current* progress (no ring rotation
+    # between record and read), so producer must fire before consumer
+    # in this progress just like same_progress_sync does. Δ ≥ 1
+    # genuinely cross-progress entries are handled by ring rotation
+    # in infer_cross_stream_event_deps and contribute no topo edge.
+    for task in tasks:
+        for dep_name, neg_offset in getattr(task, "cross_iter_depends_on", ()):
+            producer = name_to_task.get(dep_name)
+            if producer is None or producer.name == task.name:
+                continue
+            N = -neg_offset
+            delta = producer.batch_offset + N - task.batch_offset
+            if delta == 0:
+                incoming[task.name].add(producer.name)
+
+    return incoming
+
+
+def topological_sort(schedule: Schedule) -> Tuple[Task, ...]:
+    """Return tasks ordered by within-progress DAG topological sort.
+
+    Replaces "declaration order" as the engine's execution-order
+    source. Edges are computed by ``_build_same_progress_dag_edges``;
+    tie-breaks among DAG-independent tasks fall back to declaration
+    order so author intent is preserved when the DAG is silent.
+
+    Raises ``ValueError`` if the DAG contains a cycle.
+    """
+    tasks = _flatten_in_order(schedule)
+    incoming = _build_same_progress_dag_edges(tasks)
+
+    # Outgoing adjacency for efficient propagation.
+    outgoing: Dict[str, List[str]] = {t.name: [] for t in tasks}
+    for consumer_name, producer_names in incoming.items():
+        for producer_name in producer_names:
+            outgoing[producer_name].append(consumer_name)
+
+    # In-degree count.
+    in_degree: Dict[str, int] = {t.name: len(incoming[t.name]) for t in tasks}
+
+    # Tie-break by declaration order: tasks ready at the same step are
+    # picked in their original schedule position.
+    declaration_pos: Dict[str, int] = {t.name: i for i, t in enumerate(tasks)}
+
+    ready: List[str] = sorted(
+        [t.name for t in tasks if in_degree[t.name] == 0],
+        key=lambda n: declaration_pos[n],
+    )
+    sorted_names: List[str] = []
+    while ready:
+        n = ready.pop(0)
+        sorted_names.append(n)
+        for next_name in outgoing[n]:
+            in_degree[next_name] -= 1
+            if in_degree[next_name] == 0:
+                # Insert maintaining declaration-order tie-break.
+                pos = declaration_pos[next_name]
+                inserted = False
+                for i, existing in enumerate(ready):
+                    if declaration_pos[existing] > pos:
+                        ready.insert(i, next_name)
+                        inserted = True
+                        break
+                if not inserted:
+                    ready.append(next_name)
+
+    if len(sorted_names) != len(tasks):
+        remaining = [t.name for t in tasks if t.name not in sorted_names]
+        raise ValueError(
+            f"Cyclic dependency detected among tasks: {sorted(remaining)!r}"
+        )
+
+    name_to_task = {t.name: t for t in tasks}
+    return tuple(name_to_task[n] for n in sorted_names)
 
 
 def infer_cross_stream_waits(
@@ -136,6 +296,13 @@ def infer_cross_stream_waits(
             if producer.stream != consumer.stream:
                 producer_streams.add(producer.stream)
 
+        for dep_name in getattr(consumer, "same_progress_sync", ()):
+            producer = name_to_task.get(dep_name)
+            if producer is None:
+                continue
+            if producer.stream != consumer.stream:
+                producer_streams.add(producer.stream)
+
         if producer_streams:
             waits[consumer.name] = tuple(sorted(producer_streams))
 
@@ -206,20 +373,22 @@ def infer_cross_stream_event_deps(
             producer = name_to_task.get(dep_name)
             if producer is None:
                 continue
-            # SPEC_p4 v2 §5: bare-name ``depends_on`` is interpreted as
-            # an ordering edge whose within-iter / cross-iter nature
-            # is **derived from the lookahead diff**, not authored by
-            # the user. The user writes
-            # ``depends_on=("prefetch_embeddings",)`` and the engine
-            # figures out from
-            # ``producer.batch_offset - consumer.batch_offset`` whether
-            # the producer's event has rotated through the ring or
-            # ought to be co-located at the consumer's slot.
+            # Bare-name ``depends_on=("X",)`` expresses a **same-batch
+            # logical dependency** from the user's authoring POV: "this
+            # task processing batch K must wait for X to have processed
+            # batch K". Engine maps this to a ring-rotated wait_event:
+            # X recorded its event in slot offset=X.batch_offset in the
+            # progress() call where X processed this batch K; after
+            # (X.la - consumer.la) ring advances, that slot has rotated
+            # to offset=consumer.batch_offset. That's where the
+            # consumer looks up the event.
+            #
+            # Future-read (producer has smaller lookahead than the
+            # consumer) is rejected — the user's authoring graph
+            # cannot have a same-batch edge from a stage that has not
+            # yet run.
             diff = producer.batch_offset - consumer.batch_offset
             if diff < 0:
-                # Future-read: producer has smaller lookahead than
-                # consumer, meaning the producer hasn't run yet at
-                # consumer's iteration. Rejected at construction time.
                 raise ValueError(
                     f"Task {consumer.name!r} depends_on=({dep_name!r}) "
                     f"but {dep_name!r}.lookahead={producer.batch_offset} "
@@ -228,16 +397,15 @@ def infer_cross_stream_event_deps(
                     f"by the consumer's iteration (future-read)."
                 )
             if producer.stream == consumer.stream:
-                # Same-stream ordering — within-iter or cross-iter —
-                # is implicit via CUDA stream FIFO. No explicit edge
-                # needed.
+                # Same-stream ordering is implicit via CUDA stream
+                # FIFO. No explicit edge needed.
                 continue
             # The producer recorded its completion event onto the ring
-            # slot at offset ``producer.batch_offset``; after ``diff``
-            # ring advances that slot has rotated to
-            # ``consumer.batch_offset``. That's where the executor
-            # looks up the event. (For within-iter, diff=0 and the
-            # event is at consumer.batch_offset already.)
+            # slot at offset=producer.batch_offset; after ``diff`` ring
+            # advances that slot has rotated to
+            # offset=consumer.batch_offset. That is where the executor
+            # looks up the event. (For same-lookahead, diff=0 and the
+            # event is already at consumer.batch_offset.)
             key = (producer.name, producer.stream, consumer.batch_offset)
             if key not in seen:
                 seen.add(key)
@@ -283,30 +451,111 @@ def infer_cross_stream_event_deps(
                             f"of data edges."
                         )
 
-            if producer.stream == consumer.stream:
-                # Same-stream cross-iter ordering is implicit via CUDA
-                # stream FIFO between iterations — no explicit edge
-                # needed (and it would be a no-op anyway).
+            # Slot lookup uses CONSUMER's batch_offset, not producer's,
+            # in the genuinely cross-progress case (Δ ≥ 1). User intent:
+            # "consumer processing batch K waits for producer to have
+            # processed batch K-N". Working through ring rotation:
+            # producer wrote slot offset=producer.la in its progress;
+            # consumer reads in its own progress; the progress diff
+            # Delta = producer.la + N - consumer.la, so the slot has
+            # rotated to offset=consumer.la-N by then. Hence
+            # consumer.batch_offset + neg_offset.
+            #
+            # Three Δ regimes:
+            #
+            #   (Δ < 0) future-read — producer hasn't processed batch
+            #       K-N by the consumer's progress. Reject.
+            #   (Δ = 0) degenerate same-progress — auto-promoted to
+            #       the same_progress_sync semantic: emit at
+            #       slot[producer.la] (where producer just recorded
+            #       this progress's event), and rely on the topo-DAG
+            #       edge added in _build_same_progress_dag_edges to
+            #       guarantee producer-before-consumer ordering.
+            #       Per SPEC_cross_iter_delta0_autoconvert.md.
+            #   (Δ ≥ 1) genuine cross-progress — slot_offset =
+            #       consumer.la - N must be ≥ 0 (event still in ring).
+            N = -neg_offset  # neg_offset < 0, so N > 0
+            delta = producer.batch_offset + N - consumer.batch_offset
+            if delta == 0:
+                # Auto-promoted same-progress wait. Same emission as
+                # the same_progress_sync handler below: slot index =
+                # producer.batch_offset (where producer recorded its
+                # event in *this* progress). Same-stream short-circuits
+                # without emitting a triple — CUDA stream FIFO orders
+                # the submissions, and the topo edge in
+                # _build_same_progress_dag_edges ensures producer is
+                # submitted first.
+                if producer.stream == consumer.stream:
+                    continue
+                key = (producer.name, producer.stream, producer.batch_offset)
+                if key not in seen:
+                    seen.add(key)
+                    triples.append(key)
                 continue
-            slot_offset = producer.batch_offset + neg_offset  # neg_offset < 0
-            if slot_offset < 0:
-                # The producer's event would already have been rotated
-                # out of the ring by the time this consumer runs (or:
-                # the ring is too shallow to keep N iterations of
-                # history for this producer). Engine cannot emit a
-                # wait_event in this case. Surface at construction
-                # time rather than letting the consumer silently miss
-                # the dependency.
+            if delta < 0:
                 raise ValueError(
                     f"Task {consumer.name!r} declares cross_iter_depends_on="
-                    f"({dep_name!r}, {neg_offset}), but producer's ring offset "
-                    f"after rotation would be {slot_offset} (= "
-                    f"producer.batch_offset {producer.batch_offset} + "
+                    f"({dep_name!r}, {neg_offset}) but "
+                    f"consumer.lookahead={consumer.batch_offset} > "
+                    f"producer.lookahead={producer.batch_offset} + |neg_offset|={N} "
+                    f"= {producer.batch_offset + N}. The producer has not yet "
+                    f"processed batch K-N by the consumer's progress "
+                    f"(future-read across iterations). Either reduce "
+                    f"consumer.lookahead, increase |neg_offset|, or pick "
+                    f"a higher-lookahead producer."
+                )
+            # Δ ≥ 1 from here — genuine cross-progress relationship.
+            if producer.stream == consumer.stream:
+                # Same-stream cross-iter: stream FIFO orders all
+                # submissions on the single stream. With Δ ≥ 1, the
+                # producer ran in an earlier progress, so by the time
+                # consumer's progress submits its work the producer's
+                # work has already been committed to the stream. No
+                # explicit wait_event triple needed (and slot_offset
+                # might fall outside the ring without harm — the
+                # event isn't being looked up).
+                continue
+            # Cross-stream: emit a wait_event triple at slot_offset.
+            slot_offset = consumer.batch_offset + neg_offset  # neg_offset < 0
+            if slot_offset < 0:
+                # The producer's event would already have been rotated
+                # out of the ring by the time this consumer runs.
+                # Surface at construction time rather than letting the
+                # consumer silently miss the dependency.
+                raise ValueError(
+                    f"Task {consumer.name!r} declares cross_iter_depends_on="
+                    f"({dep_name!r}, {neg_offset}), but consumer's ring offset "
+                    f"after N advances would be {slot_offset} (= "
+                    f"consumer.batch_offset {consumer.batch_offset} + "
                     f"{neg_offset}). The event has rotated out of the ring. "
-                    f"Either reduce |N|, increase the producer's lookahead, "
+                    f"Either reduce |N|, increase the consumer's lookahead, "
                     f"or rely on same-stream FIFO ordering between iterations."
                 )
             key = (producer.name, producer.stream, slot_offset)
+            if key not in seen:
+                seen.add(key)
+                triples.append(key)
+
+        # ``same_progress_sync=("X", ...)``: same-progress GPU coherency wait.
+        # Not a logical data-flow edge — used when consumer and
+        # producer process different batches in the same progress
+        # call but still need stream-level synchronization (e.g.
+        # backward reading dynamicemb cache that prefetch is writing
+        # for the next batch).
+        #
+        # Engine emits wait_event at slot offset=producer.batch_offset
+        # (producer's OWN slot, where it just recorded its event in
+        # this same progress call) — NOT at consumer.batch_offset
+        # (which would be a ring-rotated stale event).
+        for dep_name in getattr(consumer, "same_progress_sync", ()):
+            producer = name_to_task.get(dep_name)
+            if producer is None:
+                continue
+            if producer.stream == consumer.stream:
+                # Same-stream FIFO already serializes — no explicit
+                # wait_event needed.
+                continue
+            key = (producer.name, producer.stream, producer.batch_offset)
             if key not in seen:
                 seen.add(key)
                 triples.append(key)

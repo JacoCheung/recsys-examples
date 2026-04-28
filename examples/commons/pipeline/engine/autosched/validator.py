@@ -235,46 +235,43 @@ def validate(schedule: Schedule, stream_pool: Optional[StreamPool] = None) -> No
                             f"the reader."
                         )
 
-    # --- Rule 6: depends_on resolves to a known task ----------------
-    # `name_to_position` already computed above for rule 5.
+    # --- Rule 6: dependency fields resolve to known tasks -----------
     #
-    # SPEC_p4 v2 §5: ``depends_on=("X",)`` is an ordering edge whose
-    # within-iter / cross-iter nature is derived from the lookahead
-    # diff. For within-iter (same lookahead) the producer must precede
-    # the consumer in declaration order. For cross-iter (producer
-    # lookahead > consumer lookahead) the producer can appear later in
-    # declaration order — its event from a prior iteration carries
-    # through the ring. So the strict "earlier in declaration order"
-    # rule applies ONLY to same-lookahead pairs.
+    # The Task class has three dependency fields, each with a distinct
+    # semantic but the same "producer name must exist in the schedule"
+    # validity rule:
+    #
+    #   ``depends_on``                 — same-batch logical dep
+    #   ``cross_iter_depends_on``      — different-batch logical dep
+    #   ``same_progress_sync``         — same-progress GPU coherency
+    #
+    # Without this check, a misspelled producer name silently drops the
+    # edge (deps.py uses ``name_to_task.get(name)`` which returns None
+    # for unknown names, then ``continue``s the loop) — the consumer
+    # would silently lose the wait.
+    #
+    # NOTE on declaration order: the engine sorts tasks by within-
+    # progress DAG topological order at SchedulablePipeline
+    # construction (see ``deps.topological_sort``); declaration order
+    # only serves as a tie-breaker. Therefore this rule no longer
+    # enforces "producer declared earlier than consumer". The DAG must
+    # still be acyclic, which rule 7 below verifies.
     name_to_task: Dict[str, "Task"] = {t.name: t for t in tasks}
-    for idx, task in enumerate(tasks):
+    for task in tasks:
         for dep_name in task.depends_on:
-            if dep_name not in name_to_position:
+            if dep_name not in name_to_task:
                 raise ScheduleValidationError(
                     f"[rule 6] Task {task.name!r}.depends_on references "
                     f"{dep_name!r} which is not a task name in the "
                     f"schedule."
                 )
             producer = name_to_task[dep_name]
-            if producer.batch_offset == task.batch_offset:
-                # Within-iter — declaration order matters.
-                if name_to_position[dep_name] >= idx:
-                    raise ScheduleValidationError(
-                        f"[rule 6] Task {task.name!r}.depends_on "
-                        f"references {dep_name!r} which is NOT "
-                        f"strictly earlier in declaration order (dep "
-                        f"is at position {name_to_position[dep_name]}, "
-                        f"consumer at position {idx}). Both have "
-                        f"lookahead={task.batch_offset}, so this is a "
-                        f"within-iter edge that requires the producer "
-                        f"to run before the consumer in the same "
-                        f"iteration."
-                    )
-            elif producer.batch_offset < task.batch_offset:
-                # Future-read: producer has not yet run by the
+            if producer.batch_offset < task.batch_offset:
+                # Future-read: producer's lookahead is smaller, so it
+                # has not yet processed the consumer's batch by the
                 # consumer's iteration. Independently caught by
-                # ``deps.infer_cross_stream_event_deps`` but worth
-                # surfacing here too.
+                # ``deps.infer_cross_stream_event_deps`` but surface
+                # here too for early failure.
                 raise ScheduleValidationError(
                     f"[rule 6] Task {task.name!r}.depends_on references "
                     f"{dep_name!r} but {dep_name!r}.lookahead="
@@ -282,45 +279,39 @@ def validate(schedule: Schedule, stream_pool: Optional[StreamPool] = None) -> No
                     f"{task.batch_offset}. Cannot wait for a producer "
                     f"that has not yet run by the consumer's iteration."
                 )
-            # else: producer.batch_offset > task.batch_offset — pure
-            # cross-iter, declaration order is irrelevant (the event
-            # comes from an earlier iteration via ring rotation).
+        for dep_name, _neg in getattr(task, "cross_iter_depends_on", ()):
+            if dep_name not in name_to_task:
+                raise ScheduleValidationError(
+                    f"[rule 6] Task {task.name!r}.cross_iter_depends_on "
+                    f"references {dep_name!r} which is not a task name "
+                    f"in the schedule."
+                )
+        for dep_name in getattr(task, "same_progress_sync", ()):
+            if dep_name not in name_to_task:
+                raise ScheduleValidationError(
+                    f"[rule 6] Task {task.name!r}.same_progress_sync "
+                    f"references {dep_name!r} which is not a task name "
+                    f"in the schedule."
+                )
 
-    # --- Rule 7: intra-iter DAG acyclic ----------------------------
-    # Build adjacency: edge A → B iff B reads-slot-written-by-A with
-    # matching offset OR B depends_on A OR A,B same stream and A
-    # immediately precedes B. Only intra-iter reads (same offset) are
-    # included — cross-iter edges don't form cycles by construction.
-    adj: Dict[str, Set[str]] = {t.name: set() for t in tasks}
-    for i, a in enumerate(tasks):
-        # Same-stream adjacent-in-stage: within a stage, consecutive
-        # same-stream tasks get an edge (CPU submission order on the
-        # stream).
-        for j in range(i + 1, len(tasks)):
-            b = tasks[j]
-            # Only within the same stage — cross-stage ordering is
-            # implicit and not cyclic.
-            same_stage = _same_stage(schedule, a, b)
-            if not same_stage:
-                break
-            if a.stream == b.stream:
-                adj[a.name].add(b.name)
-                # consecutive same-stream in stage: only add edge
-                # A → B for the immediate successor; further
-                # same-stream tasks transitively reached.
-                break
-    for consumer in tasks:
-        # Intra-iter slot edges
-        for read_slot in consumer.reads:
-            producer = slot_exact_writer.get(read_slot)
-            if producer is not None and producer.name != consumer.name:
-                adj[producer.name].add(consumer.name)
-        # depends_on edges
-        for dep_name in consumer.depends_on:
-            if dep_name in adj:
-                adj[dep_name].add(consumer.name)
+    # --- Rule 7: within-progress DAG acyclic -----------------------
+    # The engine sorts tasks topologically by within-progress edges
+    # (reads/writes exact-slot match, depends_on with matching
+    # lookahead, same_progress_sync). A cycle in those edges makes
+    # topological_sort impossible. Run it here for early failure.
+    #
+    # Cross-iter / different-batch edges (cross_iter_depends_on, or
+    # reads/writes with differing offsets) do NOT participate in the
+    # within-progress DAG — they're handled by BatchRing slot rotation
+    # and cannot form cycles by construction.
+    from ..deps import topological_sort
 
-    _raise_if_cyclic(adj)
+    try:
+        topological_sort(schedule)
+    except ValueError as e:
+        raise ScheduleValidationError(
+            f"[rule 7] Within-progress DAG is not acyclic: {e}"
+        ) from e
 
     # --- Rule 8: cross-stream wait inference runs without error ----
     # Safety net (rules 4's sub-checks already cover every known
@@ -336,46 +327,3 @@ def validate(schedule: Schedule, stream_pool: Optional[StreamPool] = None) -> No
         raise ScheduleValidationError(
             f"[rule 8] Cross-stream wait inference rejected the " f"schedule: {e}"
         ) from e
-
-
-def _same_stage(schedule: Schedule, a: Task, b: Task) -> bool:
-    """True iff `a` and `b` belong to the same `Stage`. Used for
-    rule 7's same-stream adjacency check."""
-    for stage in schedule.stages:
-        contains_a = a in stage.tasks
-        contains_b = b in stage.tasks
-        if contains_a and contains_b:
-            return True
-        if contains_a or contains_b:
-            return False
-    return False
-
-
-def _raise_if_cyclic(adj: Dict[str, Set[str]]) -> None:
-    """DFS cycle detection on a directed graph. Raises
-    `ScheduleValidationError` on the first cycle found, citing the
-    cycle's nodes."""
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color: Dict[str, int] = {name: WHITE for name in adj}
-    stack: List[str] = []
-
-    def _visit(node: str) -> None:
-        if color[node] == GRAY:
-            cycle_start = stack.index(node)
-            cycle = stack[cycle_start:] + [node]
-            raise ScheduleValidationError(
-                f"[rule 7] Cycle detected in intra-iter task DAG: "
-                f"{' -> '.join(cycle)}"
-            )
-        if color[node] == BLACK:
-            return
-        color[node] = GRAY
-        stack.append(node)
-        for nxt in adj.get(node, ()):
-            _visit(nxt)
-        stack.pop()
-        color[node] = BLACK
-
-    for name in adj:
-        if color[name] == WHITE:
-            _visit(name)
