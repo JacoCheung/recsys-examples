@@ -233,9 +233,21 @@ def apply_dualchunkswap_to_jagged(
 ):
     """Return (jd_local, local_to_global) — the DualChunkSwap shard of `jd`.
 
-    `jd` is a `modules.jagged_data.JaggedData` (forward-declared here to keep
-    the wrapper file independent of training-side imports — runtime checks
-    via duck-typing on the fields we read).
+    `jd` must be a `modules.jagged_data.JaggedData` instance. We do a
+    real `isinstance` check rather than duck-typing because the
+    constructor we use to build `jd_local` is the JaggedData class
+    itself, so accepting anything else would just defer the same
+    failure into the constructor with a less useful error message.
+
+    The `from modules.jagged_data import` is done lazily (inside the
+    function body) so the wrapper module can be imported in
+    environments that do not have the training-side `modules.*` tree
+    on `sys.path` (e.g. the smoke tests under
+    `examples/hstu/test/cp/test_cp_api_smoke.py` which only need the
+    `hstu_attn_varlen_cp_func` Q/K/V path). Production callers
+    that already use JaggedData necessarily have the import path set
+    up; this helper trades a clear ImportError at first call for the
+    decoupling.
 
     `cp_size == 1` short-circuits to (jd, identity). For cp_size > 1 each
     sample's seqlen must be divisible by `2 * cp_size` (DualChunkSwap

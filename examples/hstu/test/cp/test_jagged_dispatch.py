@@ -243,5 +243,126 @@ def test_guard_invalid_cp_size_or_rank(cuda_device: torch.device) -> None:
 def test_guard_non_jaggeddata(cuda_device: torch.device) -> None:
     from context_parallel import GuardError, apply_dualchunkswap_to_jagged
 
-    with pytest.raises(GuardError, match="JaggedData"):
+    with pytest.raises(GuardError, match="JaggedError|JaggedData"):
         apply_dualchunkswap_to_jagged({"not": "jaggeddata"}, cp_size=2, cp_rank=0)
+
+
+# ----------------------------------------------------------------------------
+# Codex round 2 IMPORTANT #1 — bf16 fp32-promote all-reduce branch.
+#
+# The gather helper has a multi-rank branch that promotes to fp32 before
+# `dist.all_reduce(SUM)` and casts back to the local dtype. Single-process
+# tests above never exercise this path. Mock the dist primitives so we can
+# assert the call shape (op, dtype, group, in-place semantics) without
+# spinning up real NCCL.
+# ----------------------------------------------------------------------------
+def test_gather_multi_rank_uses_fp32_all_reduce_sum(cuda_device: torch.device) -> None:
+    from unittest.mock import patch
+
+    from context_parallel import gather_jagged_from_cp_rank
+
+    # Local shard: 8 bf16 tokens with 4-dim embedding. Choose dtype=bf16
+    # explicitly (vs fp32 used elsewhere) so the up/down cast is exercised.
+    local = torch.randn(
+        8,
+        4,
+        dtype=torch.bfloat16,
+        device=cuda_device,
+        generator=torch.Generator(device=cuda_device).manual_seed(7),
+    )
+    l2g = torch.tensor([0, 2, 4, 6, 8, 10, 12, 14], device=cuda_device)
+    fake_grp = object()
+
+    captured: dict = {}
+
+    def _fake_all_reduce(tensor, *, op, group):
+        # Capture the call shape; do not modify the tensor (single-rank
+        # all-reduce is a no-op so this matches the in-place SUM that real
+        # NCCL would do for cp_size=1 within the group).
+        captured["dtype"] = tensor.dtype
+        captured["op"] = op
+        captured["group"] = group
+        captured["shape"] = tuple(tensor.shape)
+
+    with patch("torch.distributed.get_world_size", return_value=2), patch(
+        "torch.distributed.all_reduce", side_effect=_fake_all_reduce
+    ):
+        out = gather_jagged_from_cp_rank(
+            local, l2g, cp_group=fake_grp, global_total_tokens=16
+        )
+
+    assert captured["dtype"] == torch.float32, "all-reduce must promote to fp32"
+    assert captured["op"] is torch.distributed.ReduceOp.SUM
+    assert captured["group"] is fake_grp
+    assert captured["shape"] == (16, 4)
+    # Output is the original local shard scattered into the global buffer
+    # (since the mocked all_reduce is a no-op): non-l2g rows are 0,
+    # l2g rows match `local`.
+    assert out.dtype == torch.bfloat16, "down-cast must restore local dtype"
+    expected = torch.zeros(16, 4, dtype=torch.bfloat16, device=cuda_device)
+    expected[l2g] = local
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_gather_single_rank_skips_all_reduce(cuda_device: torch.device) -> None:
+    """`cp_group` with `world_size==1` must NOT invoke all_reduce — the
+    scatter is a pure local op."""
+    from unittest.mock import patch
+
+    from context_parallel import gather_jagged_from_cp_rank
+
+    local = torch.ones(4, 2, dtype=torch.bfloat16, device=cuda_device)
+    l2g = torch.tensor([0, 1, 2, 3], device=cuda_device)
+    fake_grp = object()
+
+    def _boom(*a, **kw):
+        raise AssertionError("single-rank gather must not all-reduce")
+
+    with patch("torch.distributed.get_world_size", return_value=1), patch(
+        "torch.distributed.all_reduce", side_effect=_boom
+    ):
+        out = gather_jagged_from_cp_rank(
+            local, l2g, cp_group=fake_grp, global_total_tokens=4
+        )
+    assert torch.equal(out, local)
+
+
+# ----------------------------------------------------------------------------
+# Codex round 2 IMPORTANT #2 — autograd flow through dispatch.
+#
+# The earlier round-trip tests use detached fp32 tensors; an autograd-breaking
+# mutation in the gather path (e.g. accidental .detach()) would pass them
+# silently. This test runs dispatch + gather under requires_grad and checks
+# the gradient lands back at the right global rows.
+# ----------------------------------------------------------------------------
+def test_dispatch_then_gather_preserves_autograd(
+    cuda_device: torch.device,
+) -> None:
+    from context_parallel import (
+        apply_dualchunkswap_to_jagged,
+        gather_jagged_from_cp_rank,
+    )
+
+    cp_size = 4
+    seqlens = [4 * cp_size, 8 * cp_size]
+    jd = _build_jd(seqlens, hidden_dim=3, device=cuda_device)
+    # Attach a leaf with requires_grad — replacing the dataclass values
+    # field directly so the JaggedData pipes the leaf through.
+    leaf = jd.values.detach().clone().requires_grad_(True)
+    jd.values = leaf
+
+    # Dispatch on rank 0 only; sum the gathered output and call backward.
+    jd_local, l2g = apply_dualchunkswap_to_jagged(jd, cp_size=cp_size, cp_rank=0)
+    out_global = gather_jagged_from_cp_rank(
+        jd_local.values,
+        l2g,
+        cp_group=None,
+        global_total_tokens=jd.values.shape[0],
+    )
+    out_global.sum().backward()
+    assert leaf.grad is not None, "no gradient propagated through dispatch"
+    # Each row in `local_to_global` got summed into `out_global` exactly
+    # once (by definition of the partition); other rows do not contribute.
+    expected_grad = torch.zeros_like(leaf)
+    expected_grad[l2g] = 1.0
+    torch.testing.assert_close(leaf.grad, expected_grad, rtol=0, atol=0)
