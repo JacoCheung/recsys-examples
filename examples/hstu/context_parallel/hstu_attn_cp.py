@@ -50,6 +50,8 @@ __all__ = [
     "hstu_attn_varlen_cp_func",
     "get_batch_on_this_cp_rank_for_hstu",
     "gather_global_from_cp_rank",
+    "apply_dualchunkswap_to_jagged",
+    "gather_jagged_from_cp_rank",
     "GuardError",
 ]
 
@@ -201,6 +203,189 @@ def gather_global_from_cp_rank(
         shape = (global_total_tokens, *local.shape[1:])
         out = torch.zeros(shape, dtype=local.dtype, device=local.device)
     out[local_to_global] += local
+    return out
+
+
+# ----------------------------------------------------------------------------
+# T6.3 — JaggedData-level DualChunkSwap dispatch.
+#
+# The single-tensor helper above (`get_batch_on_this_cp_rank_for_hstu`) takes
+# already-projected Q/K/V. T6.3 ships the dispatcher one step earlier so the
+# input embedding `X` (single jagged tensor) gets sharded BEFORE the UVQK
+# linear projection. Each rank then runs the projection and all downstream
+# token-wise layers (LayerNorm, MLP, output projection) on its local shard
+# only — that is the memory-wall enabler.
+#
+# Caller contract: pass a JaggedData whose `values` is the global
+# (T_global, hidden_dim) embedding output. Returns a JaggedData with
+# `values=(T_local, hidden_dim)` in DualChunkSwap order, plus the
+# `local_to_global` index that the loss-side gather will need to undo the
+# permutation. Heterogeneous-mask fields (num_candidates, contextual_seqlen)
+# are NOT permuted; v0 already rejects them at the wrapper, so the helper
+# refuses to dispatch when they are non-trivial rather than silently producing
+# a wrong shard.
+# ----------------------------------------------------------------------------
+def apply_dualchunkswap_to_jagged(
+    jd,  # type: ignore[no-untyped-def]
+    *,
+    cp_size: int,
+    cp_rank: int,
+):
+    """Return (jd_local, local_to_global) — the DualChunkSwap shard of `jd`.
+
+    `jd` is a `modules.jagged_data.JaggedData` (forward-declared here to keep
+    the wrapper file independent of training-side imports — runtime checks
+    via duck-typing on the fields we read).
+
+    `cp_size == 1` short-circuits to (jd, identity). For cp_size > 1 each
+    sample's seqlen must be divisible by `2 * cp_size` (DualChunkSwap
+    requirement; same as `get_batch_on_this_cp_rank_for_hstu`).
+
+    Returns the local jagged data and an int64 index `local_to_global` such
+    that `local.values == jd.values[local_to_global]`. Pass that index to the
+    loss-side gather (`gather_jagged_from_cp_rank`).
+
+    Refuses to dispatch when v0-disallowed metadata is set:
+      - max_num_candidates > 0 (heterogeneous mask, num_candidates_offsets)
+      - contextual_max_seqlen > 0 (contextual prefix, contextual_seqlen)
+      - has_interleaved_action True (interleaved Q/K layout)
+      - padding_length > 0 (would be permuted into the live region; SP+CP
+        composition is out of v0 scope, see SPEC §2)
+    These match the v0 hard-guard rejections at the kernel wrapper; we
+    flag at the dispatcher boundary so the failure points at the trainer's
+    config rather than emerging from inside the model.
+    """
+    # Lazy local import so this file can be loaded without the training
+    # tree on PYTHONPATH (test_cp_api_smoke.py imports the wrapper module
+    # without the modules.* tree).
+    from modules.jagged_data import JaggedData  # noqa: WPS433  (intentional)
+
+    if not isinstance(jd, JaggedData):
+        raise GuardError(
+            f"apply_dualchunkswap_to_jagged expects a modules.jagged_data."
+            f"JaggedData instance; got {type(jd).__name__}"
+        )
+
+    if cp_size < 1:
+        raise GuardError(f"cp_size must be ≥ 1; got {cp_size}")
+    if not 0 <= cp_rank < cp_size:
+        raise GuardError(f"cp_rank must be in [0, {cp_size}); got {cp_rank}")
+
+    if jd.max_num_candidates > 0:
+        raise GuardError(
+            "apply_dualchunkswap_to_jagged: max_num_candidates > 0 not "
+            "supported in v0 (heterogeneous mask). See SPEC §2."
+        )
+    if jd.contextual_max_seqlen > 0:
+        raise GuardError(
+            "apply_dualchunkswap_to_jagged: contextual_max_seqlen > 0 not "
+            "supported in v0 (contextual prefix breaks DualChunkSwap balanced "
+            "sharding)."
+        )
+    if jd.has_interleaved_action:
+        raise GuardError(
+            "apply_dualchunkswap_to_jagged: has_interleaved_action=True not "
+            "supported in v0."
+        )
+    if jd.padding_length > 0:
+        raise GuardError(
+            "apply_dualchunkswap_to_jagged: padding_length > 0 not supported "
+            "in v0 — SP+CP composition is out of v0 scope (see SPEC §2). "
+            "Either disable SP for the CP run, or unpad before calling."
+        )
+
+    if cp_size == 1:
+        idx = torch.arange(
+            jd.values.shape[0], device=jd.values.device, dtype=torch.long
+        )
+        return jd, idx
+
+    chunks_per_seq = 2 * cp_size
+    own = (cp_rank, chunks_per_seq - 1 - cp_rank)
+    device = jd.values.device
+
+    seqlens_global = jd.seqlen.tolist()
+    cu_global_list = jd.seqlen_offsets.tolist()
+
+    rows: list[torch.Tensor] = []
+    local_lens: list[int] = []
+    for b, L in enumerate(seqlens_global):
+        if L % chunks_per_seq != 0:
+            raise GuardError(
+                f"sample {b} seqlen {L} is not divisible by 2*cp_size={chunks_per_seq}"
+            )
+        c_b = L // chunks_per_seq
+        base = cu_global_list[b]
+        for chunk_id in own:
+            rows.append(
+                torch.arange(
+                    base + chunk_id * c_b, base + (chunk_id + 1) * c_b, device=device
+                )
+            )
+        local_lens.append(2 * c_b)
+
+    local_to_global = torch.cat(rows)
+    values_local = jd.values[local_to_global].contiguous()
+    seqlen_local = torch.tensor(local_lens, dtype=jd.seqlen.dtype, device=device)
+    seqlen_offsets_local = (
+        torch.tensor([0] + local_lens, dtype=jd.seqlen_offsets.dtype, device=device)
+        .cumsum(0)
+        .to(jd.seqlen_offsets.dtype)
+    )
+    max_seqlen_local = max(local_lens) if local_lens else 0
+
+    jd_local = JaggedData(
+        values=values_local,
+        seqlen=seqlen_local,
+        seqlen_offsets=seqlen_offsets_local,
+        max_seqlen=max_seqlen_local,
+        # Heterogeneous-mask fields: rejected above, propagated as no-op.
+        max_num_candidates=0,
+        num_candidates=None,
+        num_candidates_offsets=None,
+        contextual_max_seqlen=0,
+        contextual_seqlen=None,
+        contextual_seqlen_offsets=None,
+        has_interleaved_action=jd.has_interleaved_action,
+        scaling_seqlen=jd.scaling_seqlen,
+        padding_length=0,
+        total_candidates_seq_len=None,
+    )
+    return jd_local, local_to_global
+
+
+def gather_jagged_from_cp_rank(
+    local_values: torch.Tensor,
+    local_to_global: torch.Tensor,
+    *,
+    cp_group: Optional["dist.ProcessGroup"] = None,
+    global_total_tokens: int,
+) -> torch.Tensor:
+    """Inverse of `apply_dualchunkswap_to_jagged` on a single rank's `values`.
+
+    For `cp_group=None` (single-process / cp_size==1), this is a local
+    scatter — equivalent to the testing-only `gather_global_from_cp_rank`.
+    For multi-rank `cp_group`, the gather is an all-reduce SUM across the
+    group: each rank scatters its shard into a globally-shaped buffer (zeros
+    elsewhere) and the all-reduce assembles the full output. Each global
+    position is owned by exactly one rank, so SUM is identity.
+
+    Returned tensor lives on the same device + dtype as `local_values`.
+    """
+    out = torch.zeros(
+        (global_total_tokens, *local_values.shape[1:]),
+        dtype=local_values.dtype,
+        device=local_values.device,
+    )
+    out[local_to_global] = local_values
+    if cp_group is not None and dist.get_world_size(cp_group) > 1:
+        # Promote to fp32 for the reduction (consistent with SPEC §2's
+        # "reduction in fp32" rule used inside the wrapper). We reduce
+        # over a dtype-converted clone so the dtype-dependent semantics
+        # of dist.all_reduce on bf16 do not bite.
+        buf32 = out.float()
+        dist.all_reduce(buf32, op=dist.ReduceOp.SUM, group=cp_group)
+        out = buf32.to(local_values.dtype)
     return out
 
 
