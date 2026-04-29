@@ -392,3 +392,199 @@ def test_full_combination_translator_matches_4tuple(
         func=func,
     )
     torch.testing.assert_close(out_func, out_4tuple, rtol=2e-2, atol=2e-2)
+
+
+# ============================================================================
+# Per-step CP localiser tests (no kernel call; pure index-arithmetic checks).
+# ============================================================================
+def _decode_func_to_bool_mask(
+    func: torch.Tensor, *, total_q: int, total_k: int
+) -> torch.Tensor:
+    """Decode a (1, NFUNC, total_q) func tensor back into a
+    (total_q, total_k) boolean allowed-mask. Used by tests to verify
+    the localiser packs the right intervals."""
+    NFUNC = func.shape[1]
+    n_pair = NFUNC // 2
+    mask = torch.zeros((total_q, total_k), dtype=torch.bool, device=func.device)
+    for q in range(total_q):
+        # First interval: [0, slot_0)
+        slot_0 = int(func[0, 0, q].item())
+        if slot_0 > 0:
+            mask[q, : min(slot_0, total_k)] = True
+        # Subsequent pairs: (slot_{2k-1}, slot_{2k}) → interval [lo, hi)
+        for pair in range(1, n_pair + 1):
+            lo = int(func[0, 2 * pair - 1, q].item())
+            hi = int(func[0, 2 * pair, q].item())
+            if lo < hi:
+                mask[q, lo : min(hi, total_k)] = True
+    return mask
+
+
+def _global_mask_for_sample(
+    *, L: int, nc: int, nt: int, g: int, window_size: tuple[int, int]
+) -> torch.Tensor:
+    """Brute-force build the (L, L) bool mask for one sample using the
+    analytical predicate. Used as the oracle for both the global builder
+    and the per-step localiser."""
+    from context_parallel._mask_func import _per_sample_intervals
+
+    intervals = _per_sample_intervals(
+        L=L,
+        nc=nc,
+        nt=nt,
+        g=g,
+        w_left=window_size[0],
+        w_right=window_size[1],
+    )
+    mask = torch.zeros((L, L), dtype=torch.bool)
+    for q in range(L):
+        for lo, hi in intervals[q]:
+            mask[q, lo:hi] = True
+    return mask
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_localiser_partitions_global_mask(
+    cuda_device: torch.device, cp_size: int
+) -> None:
+    """For a single sample of length L = 4 * 2 * cp_size, build the
+    global mask via the analytical predicate, then for every (rank,
+    step) build the localised func, decode it back to a local bool
+    mask, and verify it equals the corresponding sub-block of the
+    global mask gathered with DualChunkSwap indices."""
+    from context_parallel._mask_func import localize_func_for_cp_step
+
+    chunks_per_seq = 2 * cp_size
+    c = 4
+    L = c * chunks_per_seq
+    cu_global = torch.tensor([0, L], dtype=torch.int32, device=cuda_device)
+    nc, nt, g = 2, 4, 2
+    window_size = (-1, 0)
+    num_contexts = torch.tensor([nc], dtype=torch.int32, device=cuda_device)
+    num_targets = torch.tensor([nt], dtype=torch.int32, device=cuda_device)
+
+    # Oracle: global (L, L) mask.
+    global_mask = _global_mask_for_sample(
+        L=L, nc=nc, nt=nt, g=g, window_size=window_size
+    )
+
+    for cp_rank in range(cp_size):
+        for step in range(cp_size):
+            peer = (cp_rank - step) % cp_size
+            own_q_chunks = (cp_rank, chunks_per_seq - 1 - cp_rank)
+            own_k_chunks = (peer, chunks_per_seq - 1 - peer)
+            # Build l2g_q and l2g_k for this step.
+            l2g_q = list(range(own_q_chunks[0] * c, (own_q_chunks[0] + 1) * c)) + list(
+                range(own_q_chunks[1] * c, (own_q_chunks[1] + 1) * c)
+            )
+            l2g_k = list(range(own_k_chunks[0] * c, (own_k_chunks[0] + 1) * c)) + list(
+                range(own_k_chunks[1] * c, (own_k_chunks[1] + 1) * c)
+            )
+            l2g_q_t = torch.tensor(l2g_q, dtype=torch.int64, device=cuda_device)
+            l2g_k_t = torch.tensor(l2g_k, dtype=torch.int64, device=cuda_device)
+            # Oracle local mask: gather global_mask rows by l2g_q, cols by l2g_k.
+            oracle_local = global_mask[l2g_q_t.cpu()][:, l2g_k_t.cpu()]
+
+            func = localize_func_for_cp_step(
+                cu_seqlens_global=cu_global,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                step=step,
+                num_contexts=num_contexts,
+                num_targets=num_targets,
+                target_group_size=g,
+                window_size=window_size,
+                NFUNC=3,
+            )
+            decoded = _decode_func_to_bool_mask(func, total_q=2 * c, total_k=2 * c)
+            assert torch.equal(decoded.cpu(), oracle_local), (
+                f"cp_size={cp_size} cp_rank={cp_rank} step={step}: "
+                f"localiser mask differs from oracle"
+            )
+
+
+def test_localiser_step_zero_matches_global_self_chunks(
+    cuda_device: torch.device,
+) -> None:
+    """Sanity: at step=0 (peer=cp_rank), the local Q × local K layout
+    mirrors the diagonal `[chunk_r; chunk_(2cp-1-r)]` × itself sub-block
+    of the global mask."""
+    from context_parallel._mask_func import localize_func_for_cp_step
+
+    cp_size = 4
+    c = 4
+    L = c * 2 * cp_size  # = 32
+    cu_global = torch.tensor([0, L], dtype=torch.int32, device=cuda_device)
+    global_mask = _global_mask_for_sample(L=L, nc=0, nt=0, g=1, window_size=(-1, 0))
+    for cp_rank in range(cp_size):
+        chunks = (cp_rank, 2 * cp_size - 1 - cp_rank)
+        l2g = list(range(chunks[0] * c, (chunks[0] + 1) * c)) + list(
+            range(chunks[1] * c, (chunks[1] + 1) * c)
+        )
+        l2g_t = torch.tensor(l2g, dtype=torch.int64)
+        oracle = global_mask[l2g_t][:, l2g_t]
+        func = localize_func_for_cp_step(
+            cu_seqlens_global=cu_global,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            step=0,
+            num_contexts=None,
+            num_targets=None,
+            target_group_size=1,
+            window_size=(-1, 0),
+            NFUNC=3,
+        )
+        decoded = _decode_func_to_bool_mask(func, total_q=2 * c, total_k=2 * c)
+        assert torch.equal(decoded.cpu(), oracle), f"step=0 cp_rank={cp_rank}"
+
+
+def test_localiser_union_across_steps_equals_full_q_row(
+    cuda_device: torch.device,
+) -> None:
+    """For each Q row, the union of allowed K positions across all ring
+    steps must equal the global allowed K set for that Q row."""
+    from context_parallel._mask_func import localize_func_for_cp_step
+
+    cp_size = 4
+    c = 4
+    L = c * 2 * cp_size
+    cu_global = torch.tensor([0, L], dtype=torch.int32, device=cuda_device)
+    nc, nt, g = 2, 4, 2
+    num_contexts = torch.tensor([nc], dtype=torch.int32, device=cuda_device)
+    num_targets = torch.tensor([nt], dtype=torch.int32, device=cuda_device)
+
+    global_mask = _global_mask_for_sample(L=L, nc=nc, nt=nt, g=g, window_size=(-1, 0))
+
+    cp_rank = 1
+    own_q_chunks = (cp_rank, 2 * cp_size - 1 - cp_rank)
+    l2g_q = list(range(own_q_chunks[0] * c, (own_q_chunks[0] + 1) * c)) + list(
+        range(own_q_chunks[1] * c, (own_q_chunks[1] + 1) * c)
+    )
+    l2g_q_t = torch.tensor(l2g_q, dtype=torch.int64)
+
+    # Union mask per Q row across all steps, accumulated in global K coords.
+    union = torch.zeros((2 * c, L), dtype=torch.bool)
+    for step in range(cp_size):
+        peer = (cp_rank - step) % cp_size
+        own_k_chunks = (peer, 2 * cp_size - 1 - peer)
+        l2g_k = list(range(own_k_chunks[0] * c, (own_k_chunks[0] + 1) * c)) + list(
+            range(own_k_chunks[1] * c, (own_k_chunks[1] + 1) * c)
+        )
+        func = localize_func_for_cp_step(
+            cu_seqlens_global=cu_global,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            step=step,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=g,
+            window_size=(-1, 0),
+            NFUNC=3,
+        )
+        decoded_local = _decode_func_to_bool_mask(func, total_q=2 * c, total_k=2 * c)
+        # Map local K → global K via l2g_k.
+        for k_local, k_global in enumerate(l2g_k):
+            union[:, k_global] |= decoded_local[:, k_local].cpu()
+
+    oracle_q_rows = global_mask[l2g_q_t]
+    assert torch.equal(union, oracle_q_rows)
