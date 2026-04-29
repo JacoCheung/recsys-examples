@@ -223,11 +223,12 @@ def _bad_kw(**override) -> dict:
 @pytest.mark.parametrize(
     "override",
     [
-        dict(num_contexts="MARK_ME_TENSOR"),
-        dict(num_targets="MARK_ME_TENSOR"),
-        dict(target_group_size=2),
-        dict(window_size=(16, 0)),  # sliding-causal
-        dict(window_size=(-1, -1)),  # full attention (no causal)
+        # NOTE: het-mask params (num_contexts, num_targets, target_group_size,
+        # window_size != (-1, 0)) used to be rejected at the wrapper for
+        # cp_size>1; het-mask Step 4a (docs/cp/het_mask_design.md §8) now
+        # routes them through the arbitrary-mask CP path. They are no longer
+        # in this guard-fires list. Multi-GPU correctness coverage lives in
+        # the new torchrun tests (Step 6).
         dict(rab="MARK_ME_TENSOR"),
         dict(has_drab=True),
         dict(kv_cache="MARK_ME_TENSOR"),

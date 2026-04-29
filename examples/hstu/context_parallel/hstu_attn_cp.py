@@ -427,50 +427,24 @@ def _enforce_v0_contract(
 ) -> None:
     # 1-4. Heterogeneous mask + sliding-causal + arbitrary `func`.
     #
-    # These five mask-shaping params are SUPPORTED at cp_size == 1 (the
-    # wrapper short-circuits to the bare installed kernel which handles
-    # them natively). For cp_size > 1 they remain rejected pending the
-    # het-mask-via-`func` integration tracked in
-    # `docs/cp/het_mask_design.md`. The CP path will eventually translate
-    # 4-tuple specs (num_contexts, num_targets, target_group_size,
-    # window_size) into per-step `func` tensors and remove the hard reject
-    # below; sliding-causal-under-CP follows the same path
-    # (`docs/cp/v0.5_sliding_causal.md`).
+    # Step 4a: cp_size>1 het-mask **forward** is now supported via the
+    # arbitrary-mask path (`_multi_gpu_forward_arbitrary` builds a per-step
+    # `func` tensor from the 4-tuple spec). cp_size==1 still forwards
+    # natively. Backward under cp_size>1 het-mask raises at .backward()
+    # time (Step 4b).
+    #
+    # The explicit `func` tensor input is still rejected for cp_size>1
+    # because per-step localisation requires the analytical predicate, not
+    # an opaque tensor. Callers that need to feed a custom `func` directly
+    # would need their own slicing logic — out of scope for v0.5.
     if cp_size > 1:
-        ws = tuple(window_size)
-        if num_contexts is not None:
-            raise GuardError(
-                f"num_contexts not yet supported under CP (cp_size>1); see "
-                f"docs/cp/het_mask_design.md for the in-progress integration. "
-                f"At cp_size==1 the wrapper forwards num_contexts to the "
-                f"kernel directly. ({_SPEC_REF})"
-            )
-        if num_targets is not None:
-            raise GuardError(
-                f"num_targets not yet supported under CP (cp_size>1); see "
-                f"docs/cp/het_mask_design.md. At cp_size==1 the wrapper "
-                f"forwards num_targets to the kernel directly. ({_SPEC_REF})"
-            )
-        if target_group_size != 1:
-            raise GuardError(
-                f"target_group_size != 1 not yet supported under CP "
-                f"(cp_size>1); see docs/cp/het_mask_design.md. Got "
-                f"{target_group_size}. ({_SPEC_REF})"
-            )
-        if ws != _SUPPORTED_WINDOW_SIZE:
-            raise GuardError(
-                f"window_size={ws} not yet supported under CP (cp_size>1); "
-                f"v0 ships only causal (-1, 0). Sliding-causal-under-CP "
-                f"shares the same `func`-tensor remedy path as het-mask "
-                f"(see docs/cp/het_mask_design.md and "
-                f"docs/cp/v0.5_sliding_causal.md). ({_SPEC_REF})"
-            )
         if func is not None:
             raise GuardError(
-                f"explicit `func` tensor not yet plumbed through the CP "
-                f"path; ring P2P needs per-step func rebuild "
-                f"(docs/cp/het_mask_design.md §5). At cp_size==1 the wrapper "
-                f"forwards `func` to the kernel directly. ({_SPEC_REF})"
+                f"explicit `func` tensor not plumbed through CP — Step 4a "
+                f"only supports the 4-tuple mask spec (num_contexts, "
+                f"num_targets, target_group_size, window_size). At "
+                f"cp_size==1 the wrapper forwards `func` to the kernel "
+                f"directly. ({_SPEC_REF})"
             )
     # 5. rab / has_drab — out of v0 scope at any cp_size.
     if rab is not None:
@@ -904,6 +878,120 @@ def _multi_gpu_forward(
 
 
 # ----------------------------------------------------------------------------
+# Het-mask Step 4a — multi-GPU forward via arbitrary `func` mask.
+#
+# Replaces the 3-region (diag/lower-tri/upper-tri) tile classifier with a
+# single kernel call per ring step. Each step builds a per-step `func`
+# tensor via `localize_func_for_cp_step` that encodes the global mask
+# (causal + targets + group + contextual + sliding) projected onto the
+# (local_q × peer_k) layout. The kernel runs full local Q × full peer K
+# with `window_size=(-1, -1)` (structured mask disabled) and `func`
+# carrying every constraint.
+#
+# Net effect: the wrapper handles arbitrary HSTU mask families under CP
+# without zero-padding tricks or half-Q kernel calls. Plain-causal goes
+# through this path too (with the func encoding [0, q+1) per row), and
+# is exercised by the existing CP regression suite via Step 4 dispatch.
+# ----------------------------------------------------------------------------
+def _multi_gpu_forward_arbitrary(
+    q_local: torch.Tensor,
+    k_local: torch.Tensor,
+    v_local: torch.Tensor,
+    cu_seqlens_local: torch.Tensor,
+    cu_seqlens_global: torch.Tensor,
+    *,
+    max_seqlen_q_global: int,
+    scaling_seqlen: int,
+    alpha: float,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    target_group_size: int,
+    window_size: tuple[int, int],
+    cp_group: dist.ProcessGroup,
+    cp_global_ranks: Sequence[int],
+    cp_rank: int,
+    cp_size: int,
+    cp_stream: Optional["torch.cuda.Stream"] = None,
+) -> torch.Tensor:
+    """Multi-GPU forward via FBGEMM arbitrary-mask `func` per ring step."""
+    from ._mask_func import localize_func_for_cp_step
+
+    local_max = max_seqlen_q_global // cp_size
+
+    default_stream = torch.cuda.current_stream()
+    comm_stream = _get_cp_stream(q_local.device, cp_stream)
+
+    # Ping-pong KV buffers (same pattern as `_multi_gpu_forward`).
+    cur_k = k_local.clone()
+    cur_v = v_local.clone()
+    recv_k = torch.empty_like(k_local)
+    recv_v = torch.empty_like(v_local)
+
+    out_local = torch.zeros_like(q_local, dtype=torch.float32)
+
+    for step in range(cp_size):
+        # 1. Issue next-step KV exchange.
+        reqs: list[dist.Work] = []
+        if step < cp_size - 1:
+            comm_stream.wait_stream(default_stream)
+            reqs = _ring_send_recv_kv(
+                cur_k,
+                cur_v,
+                recv_k,
+                recv_v,
+                cp_group=cp_group,
+                cp_global_ranks=cp_global_ranks,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                comm_stream=comm_stream,
+            )
+
+        # 2. Build per-step `func` tensor and run the kernel.
+        func = localize_func_for_cp_step(
+            cu_seqlens_global=cu_seqlens_global,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            step=step,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            NFUNC=3,
+            device=q_local.device,
+        )
+        partial = hstu_attn_varlen_func(
+            q=q_local,
+            k=cur_k,
+            v=cur_v,
+            cu_seqlens_q=cu_seqlens_local,
+            cu_seqlens_k=cu_seqlens_local,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=local_max,
+            max_seqlen_k=local_max,
+            scaling_seqlen=scaling_seqlen,
+            num_contexts=None,  # `func` carries the full mask;
+            num_targets=None,  # structured layer disabled to avoid
+            target_group_size=1,  # double-application (kernel intersects
+            window_size=(-1, -1),  # structured + arbitrary).
+            alpha=alpha,
+            func=func,
+            quant_mode=-1,
+        )
+        out_local += partial.float()
+
+        # 3. Wait for P2P + swap.
+        if step < cp_size - 1:
+            for r in reqs:
+                r.wait()
+            default_stream.wait_stream(comm_stream)
+            cur_k, recv_k = recv_k, cur_k
+            cur_v, recv_v = recv_v, cur_v
+
+    return out_local.to(q_local.dtype)
+
+
+# ----------------------------------------------------------------------------
 # T4.2: multi-GPU backward. Reverse-direction ring; dQ stays local; dK/dV
 # partials ride the reverse ring back to their owning rank with copy-on-first /
 # add-after semantics.
@@ -1174,6 +1262,26 @@ def _multi_gpu_backward(
 # ----------------------------------------------------------------------------
 # Multi-GPU autograd Function. Forward (T3.3) and backward (T4.2) implemented.
 # ----------------------------------------------------------------------------
+def _is_het_mask(
+    *,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    target_group_size: int,
+    window_size: tuple[int, int],
+) -> bool:
+    """Return True iff any of the four mask params requires the
+    arbitrary-mask path (otherwise the plain-causal Step 3/4 path is used)."""
+    if num_contexts is not None:
+        return True
+    if num_targets is not None:
+        return True
+    if target_group_size != 1:
+        return True
+    if tuple(window_size) != _SUPPORTED_WINDOW_SIZE:
+        return True
+    return False
+
+
 class _HSTUVarlenCPFunc(torch.autograd.Function):
     """Multi-GPU forward+backward driver."""
 
@@ -1189,6 +1297,10 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         max_seqlen_k,
         scaling_seqlen,
         alpha,
+        num_contexts,
+        num_targets,
+        target_group_size,
+        window_size,
         cp_group,
         cp_global_ranks,
         cp_stream,
@@ -1201,20 +1313,52 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         cp_size = dist.get_world_size(cp_group)
         cp_rank = dist.get_rank(cp_group)
 
-        out = _multi_gpu_forward(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            max_seqlen_q_global=max_seqlen_q,
-            scaling_seqlen=scaling_seqlen,
-            alpha=alpha,
-            cp_group=cp_group,
-            cp_global_ranks=cp_global_ranks,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            cp_stream=cp_stream,
+        het_mask = _is_het_mask(
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
         )
+        if het_mask:
+            # Step 4a: het-mask forward via arbitrary `func` per ring step.
+            # Reconstruct global cu_seqlens from local: DualChunkSwap requires
+            # `global_L_b = local_L_b * cp_size` (each rank holds 2 chunks of
+            # size `c_b = global_L_b / (2 * cp_size)` = 2c per sample).
+            cu_seqlens_global = cu_seqlens_q * cp_size
+            out = _multi_gpu_forward_arbitrary(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_global,
+                max_seqlen_q_global=max_seqlen_q,
+                scaling_seqlen=scaling_seqlen,
+                alpha=alpha,
+                num_contexts=num_contexts,
+                num_targets=num_targets,
+                target_group_size=target_group_size,
+                window_size=tuple(window_size),
+                cp_group=cp_group,
+                cp_global_ranks=cp_global_ranks,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                cp_stream=cp_stream,
+            )
+        else:
+            out = _multi_gpu_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                max_seqlen_q_global=max_seqlen_q,
+                scaling_seqlen=scaling_seqlen,
+                alpha=alpha,
+                cp_group=cp_group,
+                cp_global_ranks=cp_global_ranks,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                cp_stream=cp_stream,
+            )
 
         # Save for backward (T4.2).
         ctx.save_for_backward(q, k, v, cu_seqlens_q, cu_seqlens_k)
@@ -1232,10 +1376,23 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         # Reuse the same comm stream across forward/backward to avoid
         # re-creating per device.
         ctx.cp_stream = cp_stream
+        # Het-mask spec is saved for backward, but Step 4a only supports
+        # the het-mask path in forward; backward will raise if het_mask
+        # was set at forward time. Step 4b lifts this restriction.
+        ctx.het_mask = het_mask
         return out
 
     @staticmethod
     def backward(ctx, dout):  # type: ignore[override]
+        if ctx.het_mask:
+            raise GuardError(
+                "Het-mask backward under CP not yet wired (Step 4a ships "
+                "forward only). Avoid calling .backward() on outputs of "
+                "hstu_attn_varlen_cp_func when num_contexts / num_targets / "
+                "target_group_size > 1 / window_size != (-1, 0) is set with "
+                "cp_size > 1, until Step 4b lands. See "
+                "docs/cp/het_mask_design.md §8."
+            )
         q, k, v, cu_seqlens_q, _cu_seqlens_k = ctx.saved_tensors
         return (
             *_multi_gpu_backward(
@@ -1255,14 +1412,19 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
             ),
             # No gradients for non-Tensor / metadata args. Forward took:
             #   q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            #   scaling_seqlen, alpha, cp_group, cp_global_ranks, cp_stream,
-            #   cp_comm_type
+            #   scaling_seqlen, alpha, num_contexts, num_targets,
+            #   target_group_size, window_size, cp_group, cp_global_ranks,
+            #   cp_stream, cp_comm_type
             None,  # cu_seqlens_q
             None,  # cu_seqlens_k
             None,  # max_seqlen_q
             None,  # max_seqlen_k
             None,  # scaling_seqlen
             None,  # alpha
+            None,  # num_contexts
+            None,  # num_targets
+            None,  # target_group_size
+            None,  # window_size
             None,  # cp_group
             None,  # cp_global_ranks
             None,  # cp_stream
@@ -1411,6 +1573,10 @@ def hstu_attn_varlen_cp_func(
         max_seqlen_k,
         scaling_seqlen,
         alpha,
+        num_contexts,
+        num_targets,
+        target_group_size,
+        window_size,
         cp_group,
         cp_global_ranks,
         cp_stream,
