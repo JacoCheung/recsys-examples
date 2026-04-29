@@ -78,6 +78,36 @@ bottleneck is batch size — DP still wins for that.
 | **Forward + backward correctness** | At `cp_size ∈ {2, 4, 8}`, output matches single-GPU baseline at `rtol=atol=2e-2` (bf16 fwd tolerance). Gradients (`q.grad / k.grad / v.grad`) match at `rtol=atol=5e-2` — looser to match the existing in-tree `assert_hstu_close` convention (multiplier 5 for bwd vs 2 for fwd; see `examples/commons/utils/hstu_assert_close.py`). |
 | **Reduction in fp32** | Partial outputs across ring steps accumulate in fp32, then cast back to the input dtype on return. This matches the validated PoC and avoids bf16 add-error pile-up. |
 
+### Deployment quirks (verified 2026-04-29 on g492-ha0-0004 / 8× A100 80GB PCIe)
+
+These are not v0 contract changes — they are environmental workarounds the
+multi-GPU test runner must apply.
+
+- **`NCCL_P2P_DISABLE=1` required on PCIe NCCL.** On A100 80GB PCIe in the
+  production container, NCCL CUMEM (CUDA-P2P) silently enqueues
+  `batch_isend_irecv` operations that never complete on the GPU stream:
+  `r.wait()` returns but `torch.cuda.synchronize()` hangs forever. Forcing
+  Socket transport unblocks. `examples/hstu/cp/run_cp_tests.sh` exports
+  this; users embedding the wrapper in their own training loop must set it
+  themselves on PCIe nodes. NVLink/SXM nodes are believed unaffected
+  (untested in v0).
+- **NCCL `batch_isend_irecv` reliably handles one send/recv pair per batch.**
+  Bundling K and V into a 4-op batch hangs on the production NCCL/torch
+  combo. The wrapper splits K and V into two 2-op batches.
+- **The wrapper imports `hstu.hstu_attn_varlen_func` from the *installed*
+  `hstu` package** (FBGEMM-style; signature has `seqused_q/k`,
+  `quant_mode`). The in-tree `corelib/hstu/hstu_attn/hstu_attn_interface.py`
+  is unavailable in the container (its `hstu_attn_2_cuda` C-extension is
+  not built). Global rule 6 (runtime authority) is preserved by
+  `test_reference.py::test_hstu_signature_pinned` which fails loudly if
+  the installed signature drifts.
+- **`hstu_attn_varlen_cp_func` divisibility guard checks LOCAL evenness,
+  not global `2*cp_size` divisibility.** The caller is responsible for
+  global divisibility before dispatch; `get_batch_on_this_cp_rank_for_hstu`
+  enforces it. The wrapper only requires each per-rank local seqlen be
+  even (so the DualChunkSwap two halves are equal). Re-checking the global
+  rule on local cu_seqlens incorrectly flags valid post-dispatch shards.
+
 ### What v0 does NOT support
 
 | Excluded | Why excluded |
@@ -417,18 +447,28 @@ gates — they ship as v0.5 / v1.
 
 ## 9. Open items requiring owner decision
 
-These are deferred from §6 of `hstu_cp_design.md` and are not blockers for
-Slice 1-2 but **must be resolved before Slice 3**:
+Status as of 2026-04-29 (post-v0 verification):
 
-1. **Padding cost on real recsys batches.** Slice 3 will need to measure
-   how much DualChunkSwap padding inflates token count on a representative
-   workload. Decision point: if > 30 % overhead, escalate to MagiAttention-
-   style chunk-dispatch (Track B in design doc) earlier than planned.
-2. **`scaling_seqlen` global vs local.** Locked: always pass the unsharded
-   global `max_seqlen` (see §7).
-3. *(Stale — moved to v0.5: sliding-causal `window_size != (-1, 0)` is
-   rejected by the v0 wrapper. Revisit when v0.5 designs per-tile
-   in-window/out-of-window classification under DualChunkSwap.)*
+1. **Padding cost on real recsys batches.** ❌ Still open. Phase 3 was
+   verified on synthetic batches; padding overhead on a representative
+   recsys distribution is unmeasured. **Action**: before Slice 6 (training
+   integration), instrument `get_batch_on_this_cp_rank_for_hstu` to log
+   `padding/total` ratio across a real epoch. Decision point: if > 30 %,
+   escalate to MagiAttention-style chunk-dispatch (Track B in design doc).
+2. **`scaling_seqlen` global vs local.** ✅ Locked: always pass the
+   unsharded global `max_seqlen` (verified across the cp ∈ {2,4,8} matrix;
+   mismatched values would scale partial outputs inconsistently and drop
+   bf16 tolerance).
+3. **Sliding-causal v0.5 design.** ⏸ Deferred. v0 wrapper rejects
+   `window_size != (-1, 0)`. Revisit when v0.5 designs per-tile
+   in-window/out-of-window classification under DualChunkSwap.
+4. **NVLink/SXM verification.** ⏸ Deferred. v0 verified only on PCIe NCCL
+   (with `NCCL_P2P_DISABLE=1` workaround). SXM nodes use NVLink P2P which
+   is believed unaffected by the CUMEM hang, but untested. **Action**:
+   re-run `bash examples/hstu/cp/run_cp_tests.sh --bwd` on a A100/H100 SXM
+   node before declaring v0 production-ready on NVLink hardware. If
+   green there without `NCCL_P2P_DISABLE=1`, document SXM as the optimal
+   topology and PCIe as the workaround-required path.
 
 ---
 

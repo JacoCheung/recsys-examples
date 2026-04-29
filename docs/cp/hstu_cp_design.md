@@ -660,6 +660,89 @@ needs:
 
 ---
 
+## 8. Real-GPU verification findings (2026-04-29)
+
+Full Phase 0-3 verification on g492-ha0-0004 (8× A100 80GB PCIe, container
+`computelab-job-1994669`). Phases 0/1 (single-GPU oracle + PoC) passed
+straight through. Phases 2/3 (real multi-GPU torchrun) needed four fixes
+that only manifest on actual NCCL/CUDA multi-process state — none of them
+caught by Codex static review. Each is a useful artifact for the next
+slice and for anyone porting to a different cluster.
+
+### 8.1 In-tree kernel module unavailable in production container
+
+`corelib/hstu/hstu_attn/hstu_attn_interface.py` calls into a
+`hstu_attn_2_cuda` C-extension built from this branch's `corelib/hstu/csrc/`.
+The production container ships a *different* `hstu` package (FBGEMM-style;
+imports register via `fbgemm_gpu_experimental_hstu.so`) without the
+`hstu_attn_2_cuda` extension. Importing the in-tree interface crashes the
+wrapper module before it loads.
+
+**Fix**: wrapper imports `from hstu import hstu_attn_varlen_func` (the
+installed kernel — runtime authority per Global rule 6). The in-tree
+interface is imported in `__init__.py` inside a `try/except ImportError`
+block so users with both packages installed still get the legacy wrappers
+exposed. The signature pin in `examples/hstu/test/cp/conftest.py::CANONICAL_HSTU_PARAMS`
+now anchors against the installed (FBGEMM-style) signature, including
+`seqused_q/k` and `quant_mode=-1`.
+
+### 8.2 NCCL `batch_isend_irecv` 4-op batch hang
+
+A single `batch_isend_irecv([isend(K), isend(V), irecv(K), irecv(V)])`
+hangs after the first request completes — both send sides successfully
+match, but the second send/recv pair never progresses. Confirmed minimal
+repro on A100 PCIe with NCCL 2.x (production container).
+
+**Fix**: in `_ring_send_recv_kv` and the reverse-ring dKV exchange in
+`_multi_gpu_backward`, K and V each go through their own 2-op
+`batch_isend_irecv` call. Caller still receives one combined `Work` list;
+no contract change. Doubles the Python-side launch overhead but is far
+below kernel time on shapes ≥ medium.
+
+### 8.3 NCCL CUMEM (CUDA-P2P) silently broken on A100 PCIe
+
+Without `NCCL_P2P_DISABLE=1`, NCCL P2P chooses CUDA-P2P (CUMEM) transport
+on A100 PCIe nodes. The transport silently enqueues operations that
+**never complete on the GPU stream**: `req.wait()` returns (the work was
+queued), but the next `torch.cuda.synchronize()` hangs forever waiting
+for the queued work. Subsequent CUDA kernels (e.g. the HSTU attention
+kernel that follows P2P) stall on the same stream.
+
+**Fix**: `examples/hstu/cp/run_cp_tests.sh` exports
+`NCCL_P2P_DISABLE=1` at the runner level. Forces NCCL to use the Socket
+transport, which is correctness-equivalent for the small KV exchanges in
+v0. NVLink/SXM nodes are believed unaffected (untested in v0).
+
+### 8.4 Wrapper divisibility guard checked the wrong scale
+
+The original guard checked `local_seqlen % (2 * cp_size) == 0` on the
+per-rank shard — but local seqlen is `global_seqlen / cp_size`, so the
+condition correctly held only when `cp_size = 1`. At cp_size ≥ 4 with
+typical input sizes (e.g. global=8, cp_size=4 → local=2), the guard
+fired on legitimate post-dispatch shards.
+
+**Fix**: the wrapper now requires `local_seqlen % 2 == 0` (so the
+DualChunkSwap two halves are equal). The stronger global rule
+`global_seqlen % (2 * cp_size) == 0` is enforced by
+`get_batch_on_this_cp_rank_for_hstu` at dispatch time. Smoke test
+`test_guard_divisibility` exercises odd local seqlens against the new
+rule.
+
+### 8.5 What was NOT a bug
+
+- `cur_k = k_local.clone()` (Codex Phase-3 round 1 BLOCKER): ping-pong
+  swap aliasing concern was real and fixed pre-verification; verification
+  confirmed no input corruption.
+- `torch.enable_grad()` in `_per_tile_partial_grads` (Codex Phase-3 round
+  1 BLOCKER): without it, backward would have errored on graph-less
+  output. Fix held; verification confirmed gradients are correct at all
+  cp_size.
+- `cp_global_ranks` ctx tuple snapshot (Codex Phase-3 round 1 IMPORTANT):
+  no caller mutated the list during testing; fix is a forward-looking
+  guard.
+
+---
+
 ## Appendix — file pointers
 
 **TransformerEngine (read order):**

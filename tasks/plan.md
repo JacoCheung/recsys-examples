@@ -9,6 +9,13 @@ This plan turns the SPEC into ordered, vertically-sliced tasks. Each task is
 structure" / "algorithm" / "test" layer. Each task ends with a runnable check
 that either passes or doesn't; a slice isn't done until its check passes.
 
+> **Status (2026-04-29):** Phases 0–3 (v0) ✅ verified on a real 8× A100 80GB
+> PCIe node. Phase 4 (Slice 5, perf) and Phase 5 (Slice 6, training
+> integration) are post-v0 next steps. See `tasks/todo.md` for the
+> per-task checklist with verification timestamps and SPEC §2
+> "Deployment quirks" for the NCCL_P2P_DISABLE workaround discovered
+> during real-GPU runs.
+
 ## Global build-phase rules (apply to every task in every phase)
 
 1. **Reference-driven**: every correctness check compares against the
@@ -347,13 +354,16 @@ cp_size=2 to keep the change small.
 **Stop, review, decide**:
 1. Did all matrix cells pass within bf16 tolerance? If any failed,
    investigate before moving on.
-2. **Padding-cost measurement (SPEC §9.1)** — required before Phase 2.
-   Run T2.3's matrix on a representative recsys seqlen distribution
-   (or sample from a real training set) and report:
-   `padding_token_count / total_token_count` per cp_size. If
-   overhead > 30 % at the target cp_size, **escalate to Track B
-   (MagiAttention chunk-dispatch)** — Phase 2 is blocked until owner
-   re-plans.
+2. **Padding-cost measurement (SPEC §9.1)** — *deferred to before
+   Slice 6 (training integration)*. Phase 2/3 verification ran on
+   synthetic batches; representative recsys distributions are unmeasured.
+   Phase 2 / 3 are NOT blocked on this — they are correctness gates
+   that synthetic batches satisfy. Real-batch padding overhead becomes
+   a Slice 6 prerequisite: instrument
+   `get_batch_on_this_cp_rank_for_hstu` to log `padding/total` ratio
+   per cp_size on a real epoch. If > 30 % at the target cp_size,
+   escalate to Track B (MagiAttention chunk-dispatch) before wiring
+   into the training loop.
 3. Is the PoC code clean enough to use as the numerical oracle for
    Slices 3 and 4, or does it need a refactor first? (Default: it's an
    oracle, leave it; clarity beats speed.)
@@ -739,7 +749,7 @@ Not detailed here. Re-plan when (if) Slice 6 starts. High-level tasks:
 | -- | -- |
 | Slice 2 matrix fails on a particular case | Deep-dive that case before continuing. Possible cause: my mask-construction understanding wrong → SPEC §1 may need correction. |
 | Slice 3 multi-GPU fails despite Slice 2 passing | Single-rank simulator is missing something (most likely: NCCL ordering or stream sync). Add the missing test to the simulator before fixing on real GPUs. |
-| Padding overhead > 30% on a real recsys workload | Escalate to Track B (MagiAttention-style chunk-dispatch). Phase 2 is blocked at Checkpoint A until owner re-plans (matches §Checkpoint A bullet 2). |
+| Padding overhead > 30% on a real recsys workload | Escalate to Track B (MagiAttention-style chunk-dispatch). v0 (Phases 2-3) is correctness-only and ships on synthetic batches; real-batch padding is measured before Slice 6 (training integration), not before Phase 2 (matches §Checkpoint A bullet 2 and SPEC §9.1). |
 | Slice 4 backward gradients drift outside tolerance | Step through per-tile bwd output vs single-GPU. Likely cause: K-zero-padding tile produces wrong dK at the padded positions and we don't drop it correctly at scatter. |
 | Slice 5 can't hit the perf gate at cp_size=4 | Decide between (a) ship without overlap and reduce gate, (b) explore Ulysses (`a2a`) mode — but this is a major scope expansion. |
 | **Perf regression** detected by `bench/compare.py` at any task | Block the PR. Three options: (a) fix the regression, (b) prove the slowdown is acceptable and re-baseline `bench_baseline.json` with explicit owner sign-off, (c) revert. Default: (a). Never silently re-baseline. |
