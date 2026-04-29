@@ -257,15 +257,20 @@ def apply_dualchunkswap_to_jagged(
     that `local.values == jd.values[local_to_global]`. Pass that index to the
     loss-side gather (`gather_jagged_from_cp_rank`).
 
-    Refuses to dispatch when v0-disallowed metadata is set:
-      - max_num_candidates > 0 (heterogeneous mask, num_candidates_offsets)
-      - contextual_max_seqlen > 0 (contextual prefix, contextual_seqlen)
-      - has_interleaved_action True (interleaved Q/K layout)
-      - padding_length > 0 (would be permuted into the live region; SP+CP
-        composition is out of v0 scope, see SPEC §2)
-    These match the v0 hard-guard rejections at the kernel wrapper; we
-    flag at the dispatcher boundary so the failure points at the trainer's
-    config rather than emerging from inside the model.
+    Refuses to dispatch when JaggedData metadata is incompatible with
+    DualChunkSwap permutation:
+      - has_interleaved_action True (interleaved Q/K layout — would
+        require half-stride permutation that v0 does not implement)
+      - padding_length > 0 (would be permuted into the live region;
+        SP+CP composition is out of v0 scope, see SPEC §2)
+
+    Het-mask metadata (`max_num_candidates`, `num_candidates`,
+    `num_candidates_offsets`, `contextual_max_seqlen`, `contextual_seqlen`,
+    `contextual_seqlen_offsets`) ARE preserved through the dispatch in
+    the het-mask track (`docs/cp/het_mask_design.md`). They are
+    per-sample fields (not per-token) so DualChunkSwap permutation does
+    not touch them; downstream `FusedHSTUAttention` consumes them via
+    the CP wrapper's arbitrary-mask path.
     """
     # Lazy local import so this file can be loaded without the training
     # tree on PYTHONPATH (test_cp_api_smoke.py imports the wrapper module
@@ -283,21 +288,10 @@ def apply_dualchunkswap_to_jagged(
     if not 0 <= cp_rank < cp_size:
         raise GuardError(f"cp_rank must be in [0, {cp_size}); got {cp_rank}")
 
-    if jd.max_num_candidates > 0:
-        raise GuardError(
-            "apply_dualchunkswap_to_jagged: max_num_candidates > 0 not "
-            "supported in v0 (heterogeneous mask). See SPEC §2."
-        )
-    if jd.contextual_max_seqlen > 0:
-        raise GuardError(
-            "apply_dualchunkswap_to_jagged: contextual_max_seqlen > 0 not "
-            "supported in v0 (contextual prefix breaks DualChunkSwap balanced "
-            "sharding)."
-        )
     if jd.has_interleaved_action:
         raise GuardError(
             "apply_dualchunkswap_to_jagged: has_interleaved_action=True not "
-            "supported in v0."
+            "supported in v0 (would require half-stride permutation)."
         )
     if jd.padding_length > 0:
         raise GuardError(
@@ -351,17 +345,20 @@ def apply_dualchunkswap_to_jagged(
         seqlen=seqlen_local,
         seqlen_offsets=seqlen_offsets_local,
         max_seqlen=max_seqlen_local,
-        # Heterogeneous-mask fields: rejected above, propagated as no-op.
-        max_num_candidates=0,
-        num_candidates=None,
-        num_candidates_offsets=None,
-        contextual_max_seqlen=0,
-        contextual_seqlen=None,
-        contextual_seqlen_offsets=None,
+        # Heterogeneous-mask fields are preserved as-is — they are
+        # per-sample (not per-token) so DualChunkSwap permutation does
+        # not change them. The downstream CP wrapper consumes them via
+        # the arbitrary-mask path (`docs/cp/het_mask_design.md`).
+        max_num_candidates=jd.max_num_candidates,
+        num_candidates=jd.num_candidates,
+        num_candidates_offsets=jd.num_candidates_offsets,
+        contextual_max_seqlen=jd.contextual_max_seqlen,
+        contextual_seqlen=jd.contextual_seqlen,
+        contextual_seqlen_offsets=jd.contextual_seqlen_offsets,
         has_interleaved_action=jd.has_interleaved_action,
         scaling_seqlen=jd.scaling_seqlen,
         padding_length=0,
-        total_candidates_seq_len=None,
+        total_candidates_seq_len=jd.total_candidates_seq_len,
     )
     return jd_local, local_to_global
 

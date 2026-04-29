@@ -275,6 +275,66 @@ def test_guard_fires(override: dict, cuda_device: torch.device) -> None:
             hstu_attn_varlen_cp_func(q=q, k=k, v=v, cp_group=grp, **kw)
 
 
+def test_guard_sliding_combined_with_num_targets_rejected(
+    cuda_device: torch.device,
+) -> None:
+    """FBGEMM kernel ABI rejects num_targets/num_contexts combined with
+    `window_size != (-1, 0)` (cuda_hstu_attention.py:614-621). Wrapper
+    must mirror that invariant at any cp_size — Codex round-1 BLOCKER
+    fix; regression-guard."""
+    q, k, v, cu = random_varlen_batch(
+        [64, 64], num_heads=2, head_dim=32, device=cuda_device, seed=0
+    )
+    nt = torch.tensor([8, 8], dtype=torch.int32, device=cuda_device)
+    with fake_cp_group(2) as grp, pytest.raises(GuardError, match="num_targets"):
+        hstu_attn_varlen_cp_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=64,
+            max_seqlen_k=64,
+            scaling_seqlen=64,
+            num_contexts=None,
+            num_targets=nt,
+            target_group_size=1,
+            window_size=(8, 0),  # sliding — incompatible with num_targets
+            alpha=1.0 / 32**0.5,
+            cp_group=grp,
+        )
+
+
+def test_guard_sliding_combined_with_num_contexts_rejected(
+    cuda_device: torch.device,
+) -> None:
+    q, k, v, cu = random_varlen_batch(
+        [64, 64], num_heads=2, head_dim=32, device=cuda_device, seed=0
+    )
+    nc = torch.tensor([4, 4], dtype=torch.int32, device=cuda_device)
+    with fake_cp_group(2) as grp, pytest.raises(GuardError, match="num_contexts"):
+        hstu_attn_varlen_cp_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=64,
+            max_seqlen_k=64,
+            scaling_seqlen=64,
+            num_contexts=nc,
+            num_targets=None,
+            target_group_size=1,
+            window_size=(8, 0),
+            alpha=1.0 / 32**0.5,
+            cp_group=grp,
+        )
+
+
 def test_guard_head_dim_unsupported(cuda_device: torch.device) -> None:
     """head_dim outside {32, 64, 128, 256} fails."""
     q = torch.randn(8, 2, 48, dtype=torch.bfloat16, device=cuda_device)  # head_dim=48

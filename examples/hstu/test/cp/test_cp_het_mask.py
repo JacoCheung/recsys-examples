@@ -153,6 +153,30 @@ HET_MASK_MATRIX_CP2 = [
         tgs=2,
         ws=(-1, 0),
     ),
+    # Sliding-causal-only (no het-mask params) routes through the same
+    # arbitrary-mask path because `_is_het_mask` returns True for any
+    # non-causal window_size. Verifies the v0.5 sliding track no longer
+    # needs separate plumbing — it shares the het-mask `func` machinery.
+    dict(
+        id="cp2_sliding_w8",
+        seqlens=[64, 64],
+        num_heads=2,
+        head_dim=32,
+        nc=None,
+        nt=None,
+        tgs=1,
+        ws=(8, 0),
+    ),
+    dict(
+        id="cp2_sliding_w16",
+        seqlens=[64, 64],
+        num_heads=2,
+        head_dim=32,
+        nc=None,
+        nt=None,
+        tgs=1,
+        ws=(16, 0),
+    ),
 ]
 HET_MASK_MATRIX_CP4 = [
     dict(
@@ -174,6 +198,16 @@ HET_MASK_MATRIX_CP4 = [
         nt=[16, 16],
         tgs=2,
         ws=(-1, 0),
+    ),
+    dict(
+        id="cp4_sliding_w16",
+        seqlens=[128, 128],
+        num_heads=2,
+        head_dim=32,
+        nc=None,
+        nt=None,
+        tgs=1,
+        ws=(16, 0),
     ),
 ]
 

@@ -173,32 +173,40 @@ def test_local_layout_is_chunk_r_then_chunk_2cp1_r(
         ), f"rank {rank} second half wrong: {second_half}"
 
 
-def test_guard_max_num_candidates(cuda_device: torch.device) -> None:
-    """Heterogeneous mask (num_candidates) must be rejected."""
-    from context_parallel import GuardError, apply_dualchunkswap_to_jagged
+def test_dispatch_preserves_num_candidates(cuda_device: torch.device) -> None:
+    """Het-mask metadata (num_candidates / num_candidates_offsets /
+    max_num_candidates) is per-sample (not per-token); the dispatcher
+    must pass it through unchanged so downstream `FusedHSTUAttention`
+    can forward it to the CP wrapper's arbitrary-mask path."""
+    from context_parallel import apply_dualchunkswap_to_jagged
 
     jd = _build_jd([8], hidden_dim=2, device=cuda_device)
-    # Mutate to set the disallowed field.
     nc = torch.tensor([4], dtype=torch.int32, device=cuda_device)
     nc_off = torch.tensor([0, 4], dtype=torch.int32, device=cuda_device)
     jd.max_num_candidates = 4
     jd.num_candidates = nc
     jd.num_candidates_offsets = nc_off
-    with pytest.raises(GuardError, match="max_num_candidates"):
-        apply_dualchunkswap_to_jagged(jd, cp_size=2, cp_rank=0)
+    jd_loc, _l2g = apply_dualchunkswap_to_jagged(jd, cp_size=2, cp_rank=0)
+    assert jd_loc.max_num_candidates == 4
+    assert torch.equal(jd_loc.num_candidates, nc)
+    assert torch.equal(jd_loc.num_candidates_offsets, nc_off)
 
 
-def test_guard_contextual_max_seqlen(cuda_device: torch.device) -> None:
-    from context_parallel import GuardError, apply_dualchunkswap_to_jagged
+def test_dispatch_preserves_contextual_seqlen(cuda_device: torch.device) -> None:
+    """Het-mask contextual prefix metadata is per-sample; dispatcher must
+    pass it through unchanged."""
+    from context_parallel import apply_dualchunkswap_to_jagged
 
     jd = _build_jd([8], hidden_dim=2, device=cuda_device)
+    cs = torch.tensor([4], dtype=torch.int32, device=cuda_device)
+    cs_off = torch.tensor([0, 4], dtype=torch.int32, device=cuda_device)
     jd.contextual_max_seqlen = 4
-    jd.contextual_seqlen = torch.tensor([4], dtype=torch.int32, device=cuda_device)
-    jd.contextual_seqlen_offsets = torch.tensor(
-        [0, 4], dtype=torch.int32, device=cuda_device
-    )
-    with pytest.raises(GuardError, match="contextual_max_seqlen"):
-        apply_dualchunkswap_to_jagged(jd, cp_size=2, cp_rank=0)
+    jd.contextual_seqlen = cs
+    jd.contextual_seqlen_offsets = cs_off
+    jd_loc, _l2g = apply_dualchunkswap_to_jagged(jd, cp_size=2, cp_rank=0)
+    assert jd_loc.contextual_max_seqlen == 4
+    assert torch.equal(jd_loc.contextual_seqlen, cs)
+    assert torch.equal(jd_loc.contextual_seqlen_offsets, cs_off)
 
 
 def test_guard_padding_length(cuda_device: torch.device) -> None:

@@ -19,11 +19,17 @@ Use CP when you hit either:
 Don't use CP when:
 - You can already fit single-GPU at your target seqlen — pure
   data-parallel scales better and has no CP comm overhead.
-- Your training uses heterogeneous mask params (`num_contexts`,
-  `num_targets`, `target_group_size > 1`). v0 CP rejects these
-  (DualChunkSwap is balanced-chunk; heterogeneous mask breaks load
-  balance). Track B (MagiAttention-style chunk dispatch) is the
-  follow-on; not in v0.
+- Lookahead `window_size=(w_left, w_right > 0)` — only causal limit
+  (`w_right == 0`) is supported.
+
+CP **does** now support heterogeneous mask (`num_contexts`,
+`num_targets`, `target_group_size > 1`) and sliding-causal
+(`window_size=(w, 0)`) end-to-end via the FBGEMM kernel's
+arbitrary-mask `func` facility — see `docs/cp/het_mask_design.md`.
+Requires the kernel to be built with `HSTU_ARBITRARY_NFUNC ≥ 3`
+(Makefile default is 0, which disables arbitrary-mask; rebuild via
+`HSTU_ARBITRARY_NFUNC=3 pip install --user
+third_party/FBGEMM/fbgemm_gpu/experimental/hstu/`).
 
 ---
 
@@ -166,12 +172,12 @@ on NVLink/SXM the verification is pending (see tasks/todo.md
 
 | Error                                                                 | Cause                                                  | Fix                                                                          |
 | --                                                                    | --                                                     | --                                                                           |
-| `GuardError: window_size != (-1, 0) not supported in v0`              | sliding-window CP                                      | drop CP, or wait for v0.5 (`docs/cp/v0.5_sliding_causal.md`)                  |
+| `RuntimeError: This hstu attention build does not support arbitrary mask` | kernel built with `HSTU_ARBITRARY_NFUNC=0` (default) | rebuild kernel with `HSTU_ARBITRARY_NFUNC=3 pip install --user third_party/FBGEMM/.../hstu/` |
+| `GuardError: window_size != (-1, 0)` combined with `num_contexts`/`num_targets` | sliding+het-mask combo (kernel ABI rejects this) | drop sliding when using het-mask, or drop het-mask when using sliding |
 | `GuardError: head_dim N not in {32,64,128,256}`                       | unsupported head dim                                   | reshape, or drop CP                                                          |
 | `GuardError: per-rank seqlen must be even`                            | `seqlen % (2*cp_size) != 0` after dispatch              | check the dispatcher input; the global rule is `seqlen % (2*cp_size) == 0`   |
 | Hang at `r.wait()` on PCIe                                            | NCCL CUMEM bug                                         | `export NCCL_P2P_DISABLE=1`                                                  |
 | Hang at `cuda.synchronize()` after a P2P                              | same bug, different surface                            | same fix                                                                     |
-| `ValueError: heterogeneous mask params`                               | `num_contextuals != None` or `num_candidates` or `target_group_size > 1` | drop those for the CP path; full support comes via Track B                   |
 | `ValueError: Context Parallelism currently requires the CUTLASS …`    | combined CP + Triton/Torch backend                     | switch `kernel_backend=KernelBackend.CUTLASS`                                |
 
 ---

@@ -1,11 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, Tuple
+import dataclasses
+from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from commons.datasets.hstu_batch import HSTUBatch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
+from megatron.core import parallel_state
 from megatron.core.transformer.module import MegatronModule
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
@@ -42,6 +45,28 @@ class HSTUBlock(MegatronModule):
             is_inference=config.is_inference, sequence_parallel=config.sequence_parallel
         )
 
+        # Slice 6 T6.4: capture CP plumbing if active. CP is only wired
+        # through the NATIVE HSTU layer (uses `create_hstu_attention(...)`
+        # → `FusedHSTUAttention` which routes to `hstu_attn_varlen_cp_func`).
+        # The FUSED layer uses `fused_hstu_op` (separate triton fusion) and
+        # the DEBUG layer doesn't yet thread CP plumbing through; both are
+        # rejected explicitly so the failure points at the config rather
+        # than at a silent-no-op layer call.
+        self._cp_size: int = config.context_parallel_size
+        self._cp_group: Optional[dist.ProcessGroup] = None
+        self._cp_global_ranks: Optional[Tuple[int, ...]] = None
+        if self._cp_size > 1:
+            if config.hstu_layer_type != HSTULayerType.NATIVE:
+                raise ValueError(
+                    "Context Parallelism (cp_size > 1) is only wired through "
+                    f"HSTULayerType.NATIVE in v0; got {config.hstu_layer_type}. "
+                    "Switch to NATIVE or set context_parallel_size=1."
+                )
+            self._cp_group = parallel_state.get_context_parallel_group()
+            self._cp_global_ranks = tuple(
+                parallel_state.get_context_parallel_global_ranks()
+            )
+
         HSTULayerImpl = (
             FusedHSTULayer
             if config.hstu_layer_type == HSTULayerType.FUSED
@@ -70,6 +95,10 @@ class HSTUBlock(MegatronModule):
             JaggedData: The output jagged data.
         """
         jd = self._preprocessor(embeddings, batch)
+        # Capture GLOBAL metadata BEFORE the CP dispatch so the second
+        # return-tuple is consistent across cp_size>1 and the legacy path.
+        # Downstream callers consume these for loss masking and target
+        # extraction; both must reflect the unsharded sample shape.
         seqlen_after_preprocessor = jd.seqlen
         num_contextuals_after_preprocessor = (
             jd.contextual_seqlen
@@ -81,8 +110,63 @@ class HSTUBlock(MegatronModule):
             if jd.num_candidates is not None
             else torch.zeros_like(seqlen_after_preprocessor)
         )
+
+        # Slice 6 T6.4: when CP is active, shard the embedding output to
+        # this rank's DualChunkSwap chunks before the layer stack, then
+        # gather back to the global shape before the postprocessor.
+        # `apply_dualchunkswap_to_jagged` permutes `values` and rebuilds
+        # `seqlen` / `seqlen_offsets` / `max_seqlen` for the local layout;
+        # heterogeneous-mask metadata (`num_candidates`,
+        # `contextual_seqlen`) are per-sample (not per-token) and must
+        # ride through the dispatch unchanged so each layer's
+        # `FusedHSTUAttention` can pass them to the CP wrapper which
+        # builds the per-step `func` tensor (het-mask track, see
+        # `docs/cp/het_mask_design.md`).
+        cp_active = self._cp_size > 1 and self._cp_group is not None
+        local_to_global: Optional[torch.Tensor] = None
+        global_jd_template: Optional[JaggedData] = None
+        if cp_active:
+            assert self._cp_group is not None  # for type-checker
+            from context_parallel import (
+                apply_dualchunkswap_to_jagged,
+                gather_jagged_from_cp_rank,
+            )
+
+            cp_rank = dist.get_rank(self._cp_group)
+            global_jd_template = jd
+            jd, local_to_global = apply_dualchunkswap_to_jagged(
+                jd, cp_size=self._cp_size, cp_rank=cp_rank
+            )
+            # The CP wrapper (`hstu_attn_varlen_cp_func`) expects the
+            # `max_seqlen_q` argument to be the GLOBAL value — it divides
+            # internally by cp_size to get the kernel-local max. The
+            # dispatcher rewrites `jd.max_seqlen` to local; restore it to
+            # global so the downstream layer call (which forwards
+            # `jd.max_seqlen` straight to the wrapper) is correct. Local
+            # `seqlen` and `seqlen_offsets` stay as the dispatcher
+            # produced them — they describe the local jagged layout that
+            # the CP wrapper consumes.
+            jd = dataclasses.replace(jd, max_seqlen=global_jd_template.max_seqlen)
+
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
+
+        if cp_active:
+            assert global_jd_template is not None
+            assert local_to_global is not None
+            global_total_tokens = global_jd_template.values.shape[0]
+            global_values = gather_jagged_from_cp_rank(
+                jd.values,
+                local_to_global,
+                cp_group=self._cp_group,
+                global_total_tokens=global_total_tokens,
+            )
+            # Rebuild a JaggedData carrying the post-attention values in
+            # global shape with the original metadata (which the
+            # postprocessor reads to split candidates / contextual prefix
+            # / etc.).
+            jd = dataclasses.replace(global_jd_template, values=global_values)
+
         return self._postprocessor(jd), (
             seqlen_after_preprocessor.detach(),
             num_contextuals_after_preprocessor.detach(),
