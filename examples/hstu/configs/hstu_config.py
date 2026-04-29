@@ -217,9 +217,18 @@ def get_hstu_config(
         pipeline_model_parallel_size=parallel_state.get_pipeline_model_parallel_world_size()
         if not is_inference
         else 1,
-        context_parallel_size=parallel_state.get_pipeline_model_parallel_world_size()
-        if not is_inference
-        else 1,
+        # Pre-CP, this field was a copy-paste of pipeline_model_parallel_size.
+        # CP integration (Slice 6) consumes the actual CP group size from
+        # Megatron `parallel_state` if available; on builds without a CP
+        # group initialised, it falls back to 1 (no CP).
+        context_parallel_size=(
+            parallel_state.get_context_parallel_world_size()
+            if (
+                not is_inference
+                and hasattr(parallel_state, "get_context_parallel_world_size")
+            )
+            else 1
+        ),
         sequence_parallel=sequence_parallel,
         fp16=is_fp16,
         is_causal=is_causal,

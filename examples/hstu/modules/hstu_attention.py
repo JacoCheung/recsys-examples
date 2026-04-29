@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import torch
+import torch.distributed as dist
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import KernelBackend
 from hstu import hstu_attn_varlen_func
@@ -231,6 +232,14 @@ class FusedHSTUAttention(HSTUAttention):
         attention_dim (int): Dimension of the attention.
         linear_dim (int): Dimension of the linear layer.
         is_causal (bool): Whether the attention is causal.
+        cp_group: Optional Megatron / torch.distributed CP process group. When
+            provided and `world_size(cp_group) > 1`, the forward dispatches to
+            `hstu_attn_varlen_cp_func` (the multi-GPU CP wrapper). When None or
+            world_size == 1, behaviour is identical to the pre-CP module.
+        cp_global_ranks: Sequence of global ranks belonging to `cp_group` (in
+            ring order). Required when `cp_group` is multi-rank.
+        cp_stream: Optional secondary CUDA stream for ring P2P; defaults to a
+            module-cached stream. See SPEC §2 / Slice 5.
     """
 
     def __init__(
@@ -239,15 +248,29 @@ class FusedHSTUAttention(HSTUAttention):
         attention_dim: int,
         linear_dim: int,
         is_causal: bool,
+        *,
+        cp_group: Optional["dist.ProcessGroup"] = None,
+        cp_global_ranks: Optional[Sequence[int]] = None,
+        cp_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.attention_dim = attention_dim
         self.linear_dim = linear_dim
         self.is_causal = is_causal
+        self.cp_group = cp_group
+        self.cp_global_ranks = (
+            tuple(cp_global_ranks) if cp_global_ranks is not None else None
+        )
+        self.cp_stream = cp_stream
         assert (
             self.linear_dim == self.attention_dim
         ), "only support linear_dim and attention_dim"
+        if self.cp_group is not None and self.cp_global_ranks is None:
+            raise ValueError(
+                "cp_global_ranks is required when cp_group is provided "
+                "(needed for ring P2P routing in hstu_attn_varlen_cp_func)"
+            )
 
     @output_nvtx_hook(nvtx_tag="FusedHSTUAttn")
     def forward(
@@ -293,6 +316,56 @@ class FusedHSTUAttention(HSTUAttention):
         if scaling_seqlen == -1:
             scaling_seqlen = max_seqlen
 
+        cp_size = dist.get_world_size(self.cp_group) if self.cp_group is not None else 1
+        if cp_size > 1:
+            # CP wrapper enforces v0 contract: pure causal, no rab, no
+            # heterogeneous mask, head_dim ∈ {32,64,128,256}. Reject
+            # incompatible inputs here (rather than inside the wrapper) so
+            # the failure points at the module config rather than at a
+            # generic GuardError.
+            if not self.is_causal:
+                raise ValueError(
+                    "FusedHSTUAttention with cp_size>1 requires is_causal=True "
+                    "(v0 contract; sliding-causal lands in v0.5; see SPEC §2)"
+                )
+            if (
+                num_contextuals is not None
+                or (
+                    isinstance(num_candidates, torch.Tensor)
+                    and num_candidates.numel() > 0
+                )
+                or target_group_size != 1
+            ):
+                raise ValueError(
+                    "FusedHSTUAttention with cp_size>1 does not support "
+                    "heterogeneous mask params (num_contextuals, num_candidates, "
+                    "target_group_size>1) — those break DualChunkSwap balanced "
+                    "sharding (v0 contract, see SPEC §2). Disable CP for this "
+                    "config or wait for the heterogeneous-mask CP extension."
+                )
+            from context_parallel import hstu_attn_varlen_cp_func
+
+            return hstu_attn_varlen_cp_func(
+                q=tq.view(-1, self.num_heads, self.attention_dim),
+                k=tk.view(-1, self.num_heads, self.attention_dim),
+                v=tv.view(-1, self.num_heads, self.linear_dim),
+                cu_seqlens_q=offsets.to(torch.int32),
+                cu_seqlens_k=offsets.to(torch.int32),
+                seqused_q=None,
+                seqused_k=None,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                scaling_seqlen=scaling_seqlen,
+                num_contexts=None,
+                num_targets=None,
+                target_group_size=1,
+                window_size=(-1, 0),
+                alpha=1.0 / (self.attention_dim**0.5),
+                cp_group=self.cp_group,
+                cp_global_ranks=self.cp_global_ranks,
+                cp_stream=self.cp_stream,
+            ).view(-1, self.num_heads * self.linear_dim)
+
         return hstu_attn_varlen_func(
             tq.view(-1, self.num_heads, self.attention_dim),
             tk.view(-1, self.num_heads, self.attention_dim),
@@ -320,6 +393,10 @@ def create_hstu_attention(
     attention_dim: int,
     linear_dim: int,
     is_causal: bool,
+    *,
+    cp_group: Optional["dist.ProcessGroup"] = None,
+    cp_global_ranks: Optional[Sequence[int]] = None,
+    cp_stream: Optional[torch.cuda.Stream] = None,
 ) -> HSTUAttention:
     """
     Factory function to create an HSTUAttention module based on the kernel backend.
@@ -330,6 +407,11 @@ def create_hstu_attention(
         attention_dim (int): Dimension of the attention.
         linear_dim (int): Dimension of the linear layer.
         is_causal (bool): Whether the attention is causal.
+        cp_group, cp_global_ranks, cp_stream: Context-parallel plumbing. When
+            `cp_group` is non-None and multi-rank, the CUTLASS path dispatches
+            to `hstu_attn_varlen_cp_func`. The Triton and Torch backends
+            currently raise on multi-rank CP (no CP wrapper for those paths
+            yet — Slice 6+ extension).
 
     Returns:
         HSTUAttention: The created HSTUAttention module.
@@ -337,6 +419,7 @@ def create_hstu_attention(
     Raises:
         ValueError: If the kernel backend is not supported.
     """
+    cp_active = cp_group is not None and dist.get_world_size(cp_group) > 1
     attn: HSTUAttention
     if kernel_backend == KernelBackend.CUTLASS:
         sm_major_version = torch.cuda.get_device_properties(0).major
@@ -346,8 +429,18 @@ def create_hstu_attention(
                 attention_dim,
                 linear_dim,
                 is_causal,
+                cp_group=cp_group,
+                cp_global_ranks=cp_global_ranks,
+                cp_stream=cp_stream,
             )
         else:
+            if cp_active:
+                raise ValueError(
+                    "Context Parallelism currently requires the CUTLASS "
+                    "FusedHSTUAttention backend (SM 8/9). The Torch fallback "
+                    "does not have a CP wrapper. Use is_causal=True with "
+                    "head_dim ∈ {32,64,128,256} on A100/H100/H20."
+                )
             print(
                 "CUTLASS backend only support H100, H20 and A100/Ada series, fallback to PyTorch backend"
             )
@@ -358,6 +451,12 @@ def create_hstu_attention(
                 is_causal,
             )
     elif kernel_backend == KernelBackend.TRITON:
+        if cp_active:
+            raise ValueError(
+                "Context Parallelism is only wired through the CUTLASS "
+                "FusedHSTUAttention backend in v0; the Triton backend has no "
+                "CP wrapper yet. Switch kernel_backend to 'cutlass'."
+            )
         if is_causal:
             attn = TritonHSTUAttention(
                 num_heads,
@@ -376,6 +475,12 @@ def create_hstu_attention(
                 is_causal,
             )
     else:
+        if cp_active:
+            raise ValueError(
+                "Context Parallelism is only wired through the CUTLASS "
+                "FusedHSTUAttention backend in v0; the Torch backend has no "
+                "CP wrapper. Switch kernel_backend to 'cutlass'."
+            )
         attn = TorchHSTUAttention(
             num_heads,
             attention_dim,
