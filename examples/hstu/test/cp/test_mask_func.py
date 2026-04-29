@@ -555,16 +555,18 @@ def test_intervals_to_slots_nfunc_overflow_raises(
 def test_global_builder_nfunc_overflow_raises(cuda_device: torch.device) -> None:
     """If the global mask requires more intervals than NFUNC supports,
     `build_global_mask_func` must raise.  Constructed by deliberately
-    passing NFUNC=1 (single implicit interval [0, slot_0)) with a target Q
-    that needs 2 intervals (history-band + target-group-band)."""
+    passing NFUNC=1 (single implicit interval [0, slot_0)) with target Q
+    rows that require 2 disjoint intervals (history-band +
+    target-group-band)."""
     from context_parallel._mask_func import build_global_mask_func
 
     cu = torch.tensor([0, 16], dtype=torch.int32, device=cuda_device)
     num_targets = torch.tensor([4], dtype=torch.int32, device=cuda_device)
-    # Target Q at q=12 needs 2 intervals: [0, 12) (history) and [12, 13)
-    # (group of size 1 ending at self).  Already exercised in
-    # test_targets_g1_translator_matches_4tuple at NFUNC=3; with NFUNC=1
-    # we can't fit both, so the builder must raise.
+    # Target rows q ∈ {12, 13, 14, 15} (last 4 of L=16, target_group_size=1).
+    # `_per_sample_intervals` produces:
+    #   q=12: [(0, 12)] then [(12, 13)] — adjacent, merges to [(0, 13)] (1 interval, fits NFUNC=1).
+    #   q=13: [(0, 12)] then [(13, 14)] — non-adjacent, stays 2 disjoint intervals.
+    # So the overflow fires at q=13 (or any later target row), not q=12.
     with pytest.raises(ValueError, match="NFUNC"):
         build_global_mask_func(
             cu_seqlens_q=cu,
