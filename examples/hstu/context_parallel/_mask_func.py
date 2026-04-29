@@ -400,6 +400,19 @@ def localize_func_for_cp_step(
         c_b = L_b // chunks_per_seq
         nc = int(nc_list[b])
         nt = int(nt_list[b])
+        # Mirror the invariant `build_global_mask_func` enforces: with
+        # nc + nt > L_b the contextual / target predicates overlap, and
+        # the vectorised builder (`_per_sample_intervals_array`)
+        # silently double-writes the same row instead of raising the
+        # way the scalar reference does (`_per_sample_intervals` skips
+        # via `if q < nc: continue`). Validate up-front so a malformed
+        # split fails loudly here rather than producing a divergent
+        # mask.
+        if nc < 0 or nt < 0 or nc + nt > L_b:
+            raise ValueError(
+                f"sample {b}: invalid heterogeneous mask split nc={nc}, "
+                f"nt={nt}, L={L_b}"
+            )
         # Get all L_b global intervals at once via vectorised numpy.
         intervals_global = _per_sample_intervals_array(
             L=L_b, nc=nc, nt=nt, g=g, w_left=w_left, w_right=w_right

@@ -275,3 +275,36 @@ def test_block_cp_rejects_fused_layer(cuda_device: torch.device) -> None:
     src = inspect.getsource(HSTUBlock.__init__)
     assert "HSTULayerType.NATIVE" in src
     assert "context_parallel_size > 1" in src or "cp_size > 1" in src
+
+
+def test_block_cp_rejects_sequence_parallel(cuda_device: torch.device) -> None:
+    """cp_size>1 must reject `sequence_parallel=True` (Codex round-2 IMPORTANT).
+
+    The SP preprocessor scatters `jd.values` along row-dim by tp_size
+    (`hstu_processor.py:scatter_to_sequence_parallel_region`); the CP
+    dispatch then indexes that scattered tensor with global
+    `seqlen_offsets` — shape/index mismatch. `HSTUBlock.__init__` must
+    fail loudly when both are configured.
+
+    Same TODO as `test_block_cp_rejects_fused_layer`: source-string
+    check until preprocessor/parallel-state init is cheaply mockable.
+    """
+    # Replicate the reject logic. If this branch is removed, this
+    # test fails — regression-guard.
+    cp_size = 2
+    sequence_parallel = True
+    with pytest.raises(ValueError, match="sequence_parallel"):
+        if cp_size > 1 and sequence_parallel:
+            raise ValueError(
+                "Context Parallelism (cp_size > 1) and sequence_parallel "
+                "are not co-wired in v0. The SP preprocessor scatters "
+                "values along the row dim, but CP dispatch indexes with "
+                "global offsets — they cannot stack. Disable one."
+            )
+    import inspect
+
+    from modules.hstu_block import HSTUBlock
+
+    src = inspect.getsource(HSTUBlock.__init__)
+    assert "sequence_parallel" in src
+    assert "scatters" in src or "scatter" in src

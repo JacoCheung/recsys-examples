@@ -62,6 +62,21 @@ class HSTUBlock(MegatronModule):
                     f"HSTULayerType.NATIVE in v0; got {config.hstu_layer_type}. "
                     "Switch to NATIVE or set context_parallel_size=1."
                 )
+            # CP + sequence_parallel are not co-wired in v0. The SP
+            # preprocessor scatters `jd.values` along row-dim by
+            # tp_size (`hstu_processor.py:scatter_to_sequence_parallel_region`),
+            # but the CP dispatch (`apply_dualchunkswap_to_jagged`) indexes
+            # `jd.values` with global `seqlen_offsets` — shape/index
+            # mismatch as soon as both are on. Reject explicitly so the
+            # failure surfaces at config rather than at a silent
+            # out-of-range index inside the dispatch.
+            if config.sequence_parallel:
+                raise ValueError(
+                    "Context Parallelism (cp_size > 1) and sequence_parallel "
+                    "are not co-wired in v0. The SP preprocessor scatters "
+                    "values along the row dim, but CP dispatch indexes with "
+                    "global offsets — they cannot stack. Disable one."
+                )
             self._cp_group = parallel_state.get_context_parallel_group()
             self._cp_global_ranks = tuple(
                 parallel_state.get_context_parallel_global_ranks()

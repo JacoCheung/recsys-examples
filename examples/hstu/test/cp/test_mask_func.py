@@ -552,6 +552,57 @@ def test_intervals_to_slots_nfunc_overflow_raises(
         _intervals_to_slots(too_many, NFUNC=3)
 
 
+def test_localiser_rejects_invalid_nc_nt_split(cuda_device: torch.device) -> None:
+    """`localize_func_for_cp_step` must raise when nc + nt > L for any
+    sample (Codex round-2 IMPORTANT regression-guard).
+
+    The vectorised predicate (`_per_sample_intervals_array`) writes
+    contextual rows AND target rows independently using `q < nc` /
+    `q >= L - nt` masks. When `nc + nt > L` those masks overlap and
+    target writes silently overwrite contextual rows, diverging from
+    the scalar reference (`_per_sample_intervals`, which has an
+    explicit `if q < nc: ... continue` guard). The localiser must
+    reject malformed splits up-front rather than build a divergent
+    mask. Mirrors the same invariant `build_global_mask_func`
+    enforces.
+    """
+    from context_parallel._mask_func import localize_func_for_cp_step
+
+    # cp_size=2, L=16: nc=10, nt=10 → nc+nt=20 > L=16 → must raise.
+    cu = torch.tensor([0, 16], dtype=torch.int32, device=cuda_device)
+    num_contexts = torch.tensor([10], dtype=torch.int32, device=cuda_device)
+    num_targets = torch.tensor([10], dtype=torch.int32, device=cuda_device)
+    with pytest.raises(ValueError, match="invalid heterogeneous mask split"):
+        localize_func_for_cp_step(
+            cu_seqlens_global=cu,
+            cp_size=2,
+            cp_rank=0,
+            step=0,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=1,
+            window_size=(-1, 0),
+            NFUNC=3,
+            device=cuda_device,
+        )
+
+    # Negative nc must also raise.
+    bad_nc = torch.tensor([-1], dtype=torch.int32, device=cuda_device)
+    with pytest.raises(ValueError, match="invalid heterogeneous mask split"):
+        localize_func_for_cp_step(
+            cu_seqlens_global=cu,
+            cp_size=2,
+            cp_rank=0,
+            step=0,
+            num_contexts=bad_nc,
+            num_targets=None,
+            target_group_size=1,
+            window_size=(-1, 0),
+            NFUNC=3,
+            device=cuda_device,
+        )
+
+
 def test_global_builder_nfunc_overflow_raises(cuda_device: torch.device) -> None:
     """If the global mask requires more intervals than NFUNC supports,
     `build_global_mask_func` must raise.  Constructed by deliberately
