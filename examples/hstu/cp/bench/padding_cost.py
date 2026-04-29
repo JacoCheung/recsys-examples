@@ -26,7 +26,7 @@ deferred to before Slice 6"). No GPU required; pure CPU.
 
 Usage:
     python examples/hstu/cp/bench/padding_cost.py
-    python examples/hstu/cp/bench/padding_cost.py --distribution kuairand
+    python examples/hstu/cp/bench/padding_cost.py --distribution kuairand_1k_approx_pow2
     python examples/hstu/cp/bench/padding_cost.py --custom 16,32,64,128,256
 """
 
@@ -113,9 +113,16 @@ def _measure(seqlens: Sequence[int], cp_size: int) -> dict:
     cp_size == 1 has no DualChunkSwap (pre-CP path; padding is
     whatever the underlying kernel needs, which is independent of
     CP). Report 0% padding for cp=1 to keep the verdict honest.
+
+    cp_size <= 0 is rejected: it is not a meaningful CP world size.
     """
+    if cp_size < 1:
+        raise ValueError(
+            f"cp_size must be a positive integer (got {cp_size}). "
+            "DualChunkSwap requires at least one rank."
+        )
     raw = sum(seqlens)
-    if cp_size <= 1:
+    if cp_size == 1:
         return {
             "cp_size": cp_size,
             "raw_tokens": raw,
@@ -187,6 +194,9 @@ def main() -> None:
         dist_label = args.distribution
 
     cp_sizes = [int(c) for c in args.cp_sizes.split(",")]
+    bad = [c for c in cp_sizes if c < 1]
+    if bad:
+        parser.error(f"--cp-sizes entries must be positive integers; got {bad}")
 
     print(f"Distribution: {dist_label}")
     print(_seqlen_summary(seqlens))
