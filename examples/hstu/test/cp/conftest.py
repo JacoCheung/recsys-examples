@@ -18,10 +18,24 @@ Used by `test_reference.py` and (later) by Slice 3 / 4 multi-GPU CP tests.
 from __future__ import annotations
 
 import inspect
+import sys
+from pathlib import Path
 from typing import Sequence
 
 import pytest
 import torch
+
+# Make `from context_parallel import ...` resolve.
+#
+# Two constraints:
+#  1. We must avoid PYTHONPATH so the path entry does not bleed into
+#     subprocesses that share this shell.
+#  2. Inside the pytest process, `examples/hstu/` must come *after* any
+#     installed-package entries on sys.path. Otherwise `examples/hstu/utils/`
+#     would shadow third-party bare-`import utils` (e.g. FBGEMM
+#     `hstu_blackwell/mask.py`). `context_parallel` is unique to this repo,
+#     so appending still resolves it correctly.
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 # The installed `hstu` package — runtime authority per plan §Global rule 6.
 hstu_attn_varlen_func = pytest.importorskip("hstu").hstu_attn_varlen_func

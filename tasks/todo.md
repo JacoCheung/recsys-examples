@@ -64,7 +64,7 @@ checkpoint is signed.
 ## Phase 2 — Multi-GPU forward (Slice 3)
 
 - [x] **T3.1**: Public API skeleton + hard guards + cp=1 passthrough
-  - File: `corelib/hstu/hstu_attn/hstu_attn_cp.py` (new)
+  - File: `examples/hstu/context_parallel/hstu_attn_cp.py` (new)
   - Acceptance: cp=1 path bit-exact match; each rejected input → documented `ValueError`
 - [x] **T3.2**: `get_batch_on_this_cp_rank_for_hstu` helper (pure permutation)
   - Acceptance: round-trip identity; per-rank shard size balanced at cp ∈ {2,4,8}

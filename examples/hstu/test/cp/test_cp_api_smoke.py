@@ -26,13 +26,13 @@ from unittest.mock import patch
 import pytest
 import torch
 from conftest import random_varlen_batch
-from hstu import hstu_attn_varlen_func
-from hstu_attn import (
+from context_parallel import (
     GuardError,
     gather_global_from_cp_rank,
     get_batch_on_this_cp_rank_for_hstu,
     hstu_attn_varlen_cp_func,
 )
+from hstu import hstu_attn_varlen_func
 
 
 # ----------------------------------------------------------------------------
@@ -168,7 +168,7 @@ def test_cp1_passthrough_does_not_invoke_distributed(cuda_device: torch.device) 
 
     with patch("torch.distributed.batch_isend_irecv", side_effect=_boom), patch(
         "torch.distributed.get_rank", side_effect=_boom
-    ), patch("hstu_attn.hstu_attn_cp._multi_gpu_forward", side_effect=_boom):
+    ), patch("context_parallel.hstu_attn_cp._multi_gpu_forward", side_effect=_boom):
         hstu_attn_varlen_cp_func(
             q=q,
             k=k,
@@ -414,7 +414,9 @@ def test_cp_backward_implemented_calls_helper(cuda_device: torch.device) -> None
     """
     import inspect
 
-    from hstu_attn.hstu_attn_cp import _HSTUVarlenCPFunc  # type: ignore[attr-defined]
+    from context_parallel.hstu_attn_cp import (
+        _HSTUVarlenCPFunc,  # type: ignore[attr-defined]
+    )
 
     src = inspect.getsource(_HSTUVarlenCPFunc.backward)
     assert (

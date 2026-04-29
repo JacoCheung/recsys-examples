@@ -28,6 +28,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
+# `context_parallel` is made importable for pytest via the cp/conftest.py
+# sys.path injection (see run_cp_tests.sh for the rationale; we keep
+# PYTHONPATH out of this shell so subprocesses don't see a shadowed `utils`).
+
 CP_TEST_DIR="examples/hstu/test/cp"
 BASELINE_JSON="tasks/bench_baseline.json"
 TMP_BENCH="${TMP_BENCH:-/tmp/cp_bench_$$.json}"

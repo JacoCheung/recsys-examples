@@ -31,7 +31,10 @@ import pytest
 import torch
 import torch.distributed as dist
 from conftest import random_varlen_batch, single_gpu_baseline_fwd_bwd
-from hstu_attn import get_batch_on_this_cp_rank_for_hstu, hstu_attn_varlen_cp_func
+from context_parallel import (
+    get_batch_on_this_cp_rank_for_hstu,
+    hstu_attn_varlen_cp_func,
+)
 
 
 def _alpha_for(head_dim: int) -> float:

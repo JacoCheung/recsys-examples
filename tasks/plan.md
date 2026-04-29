@@ -50,9 +50,9 @@ that either passes or doesn't; a slice isn't done until its check passes.
 6. **Runtime authority**: the *installed* `hstu` package's
    `hstu_attn_varlen_func` signature is the source of truth for kernel
    calls (it is what runs in production). The in-tree
-   `corelib/hstu/hstu_attn/hstu_attn_interface.py` source can lag the
-   installed package signature; T0.1 records the installed signature
-   and tests pin to it.
+   `corelib/hstu/hstu_attn/hstu_attn_interface.py` is **deprecated**
+   (kernel migrated to FBGEMM); its signature can lag the installed
+   package. T0.1 records the installed signature and tests pin to it.
 
 ---
 
@@ -387,7 +387,7 @@ any comm. If `cp_size == 1`, the function short-circuits to
 test, and it keeps the cp=1 perf overhead near zero.
 
 **Deliverable**:
-- New file `corelib/hstu/hstu_attn/hstu_attn_cp.py`.
+- New file `examples/hstu/context_parallel/hstu_attn_cp.py`.
 - Public `hstu_attn_varlen_cp_func` whose signature **mirrors the
   installed `hstu_attn_varlen_func` exactly**, plus four CP arguments at
   the end. The mirror includes every argument the user might supply,
@@ -438,8 +438,8 @@ test, and it keeps the cp=1 perf overhead near zero.
 - `__init__.py` exports the new symbol.
 
 **Files**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (new, ~150 lines).
-- `corelib/hstu/hstu_attn/__init__.py` (one new export).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (new, ~150 lines).
+- `examples/hstu/context_parallel/__init__.py` (re-export CP symbols).
 
 **Acceptance**:
 - `cp_size == 1` (or `cp_group is None`): bit-exact match with
@@ -472,7 +472,7 @@ test, and it keeps the cp=1 perf overhead near zero.
   raises `ValueError`.
 
 **Files**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (extend, +~80 lines).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (extend, +~80 lines).
 
 **Acceptance**:
 - Round-trip: `gather(scatter(global)) == global` for any varlen batch
@@ -504,7 +504,7 @@ test, and it keeps the cp=1 perf overhead near zero.
     return local shard so the caller decides — match TE pattern).
 
 **Files**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (extend).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (extend).
 - `examples/hstu/test/cp/test_cp_forward.py` (new, torchrun-based pytest).
 
 **Acceptance**:
@@ -605,7 +605,7 @@ forward simulator was the oracle for Slice 3.
   zero-padded positions are dropped at scatter time.
 
 **Files**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (extend).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (extend).
 - `examples/hstu/test/cp/test_cp_backward.py` (new).
 
 **Acceptance**:
@@ -671,7 +671,7 @@ per-token throughput` at cp_size=4.
 - Sync via `torch.cuda.Event`s between corrections.
 
 **Files**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (refactor ring loop).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (refactor ring loop).
 
 **Acceptance**:
 - Correctness regression: full Slice 4 matrix still PASS.
@@ -708,7 +708,7 @@ per-token throughput` at cp_size=4.
   node. (See SPEC §3 Slice 5.)
 
 **Files**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (incremental tuning).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (incremental tuning).
 
 **Acceptance**:
 - `bench_cp.py` numbers meet the gate.

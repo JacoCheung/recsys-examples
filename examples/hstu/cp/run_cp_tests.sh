@@ -17,6 +17,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
+# `context_parallel` is made importable for pytest by
+# `examples/hstu/test/cp/conftest.py`, which prepends `examples/hstu/` to
+# sys.path inside the pytest process only. We deliberately do NOT export
+# that path via PYTHONPATH here, because doing so would also shadow other
+# bare `import utils` / `import model` resolutions in any subprocess that
+# inherits this shell (notably, FBGEMM `hstu_blackwell/mask.py` does a
+# bare `import utils`).
+
 # Workaround for NCCL CUDA-P2P (CUMEM) hang on A100 PCIe in this image.
 # Without this, batch_isend_irecv enqueues but never completes on the GPU
 # stream, deadlocking the ring loop. Forces NCCL to use Socket transport,

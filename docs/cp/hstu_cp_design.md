@@ -24,13 +24,14 @@ The exercise is two-step:
 
 ### v0 scope (locked)
 
-* **Kernel**: the **CUTLASS** fused HSTU kernel under
-  `corelib/hstu/csrc/hstu_attn/`, called via
-  `corelib/hstu/hstu_attn/hstu_attn_interface.py::hstu_attn_varlen_func`.
-  We do **not** use the PT reference (`pt_hstu_attention.py`) or Triton
-  paths in the production CP path or in oracles — the **single-GPU
-  CUTLASS call** itself is the numerical oracle (per SPEC §6 / plan
-  Phase 0). PT and Triton stay as exploratory debug aids only.
+* **Kernel**: the **CUTLASS** fused HSTU kernel, called via
+  `from hstu import hstu_attn_varlen_func` — i.e. the installed
+  FBGEMM-style `hstu` package (kernel migrated to FBGEMM; the in-tree
+  `corelib/hstu/hstu_attn/` is deprecated). We do **not** use the PT
+  reference (`pt_hstu_attention.py`) or Triton paths in the production
+  CP path or in oracles — the **single-GPU CUTLASS call** itself is the
+  numerical oracle (per SPEC §6 / plan Phase 0). PT and Triton stay as
+  exploratory debug aids only.
 * **No mask tensor.** The CUTLASS kernel constructs the mask on-the-fly from
   `(window_size_left, window_size_right, cu_seqlens_q, cu_seqlens_k)`. We do not
   materialise a `[B,N,N]` `valid_attn_mask`, do not slice / replicate one across
@@ -387,8 +388,10 @@ entries to 0 *after* SiLU. No `-inf` games.
 
 ### 3.3 Layout
 
-Jagged THD throughout. Public CUDA-kernel signature
-(`corelib/hstu/hstu_attn/hstu_attn_interface.py:209-233`):
+Jagged THD throughout. Public CUDA-kernel signature (installed
+FBGEMM-style `hstu` package; matches the now-deprecated
+`corelib/hstu/hstu_attn/hstu_attn_interface.py:209-233` plus FBGEMM-only
+`seqused_q/k`, `quant_mode` fields):
 
 ```python
 hstu_attn_varlen_func(
@@ -418,7 +421,10 @@ metadata.
   helpers in `examples/commons/.../collective_ops.py`
   (`split/gather_along_first_dim`, `gatherv_along_first_dim`) are
   TP/DP/SP utilities; no ring/all-to-all-v scheduling. **The CP wrapper
-  in `corelib/hstu/hstu_attn/hstu_attn_cp.py` is what we add at Slice 3.**
+  in `examples/hstu/context_parallel/hstu_attn_cp.py` is what we add at Slice 3.**
+  (We do not extend `corelib/hstu/`: the in-tree HSTU subtree is being
+  deprecated as the kernel migrates to the installed FBGEMM-style `hstu`
+  package.)
 
 ### 3.5 DSPA sibling
 
@@ -569,8 +575,8 @@ The kernel-side new code is enumerated under Track A. The Python/wrapper side
 needs:
 
 1. **HSTU-CP public wrapper** in a new module
-   `corelib/hstu/hstu_attn/hstu_attn_cp.py` (per SPEC §4 / plan T3.1; this
-   keeps the existing `hstu_attn_interface.py` untouched and lets users
+   `examples/hstu/context_parallel/hstu_attn_cp.py` (per SPEC §4 / plan T3.1;
+   sits outside the deprecated `corelib/hstu/` subtree and lets users
    import `hstu_attn_varlen_cp_func` from the package alongside the
    single-GPU symbol). Signature mirrors `hstu_attn_varlen_func` plus
    `(cp_group, cp_global_ranks, cp_stream, cp_comm_type)`. Internally an
@@ -679,11 +685,12 @@ imports register via `fbgemm_gpu_experimental_hstu.so`) without the
 wrapper module before it loads.
 
 **Fix**: wrapper imports `from hstu import hstu_attn_varlen_func` (the
-installed kernel — runtime authority per Global rule 6). The in-tree
-interface is imported in `__init__.py` inside a `try/except ImportError`
-block so users with both packages installed still get the legacy wrappers
-exposed. The signature pin in `examples/hstu/test/cp/conftest.py::CANONICAL_HSTU_PARAMS`
-now anchors against the installed (FBGEMM-style) signature, including
+installed kernel — runtime authority per Global rule 6). The CP wrapper
+now lives at `examples/hstu/context_parallel/hstu_attn_cp.py` rather
+than under `corelib/hstu/`, so the deprecated subtree's `__init__.py`
+no longer needs special-casing the missing C-extension. The signature
+pin in `examples/hstu/test/cp/conftest.py::CANONICAL_HSTU_PARAMS` now
+anchors against the installed (FBGEMM-style) signature, including
 `seqused_q/k` and `quant_mode=-1`.
 
 ### 8.2 NCCL `batch_isend_irecv` 4-op batch hang
@@ -773,9 +780,11 @@ rule.
 
 **HSTU (this repo):**
 
-* `corelib/hstu/README.md` — math + mask types reference.
-* `corelib/hstu/hstu_attn/hstu_attn_interface.py:185-279` — kernel public API.
+* `corelib/hstu/README.md` — math + mask types reference (deprecated subtree).
+* `corelib/hstu/hstu_attn/hstu_attn_interface.py:185-279` — kernel public API
+  (deprecated; FBGEMM-style installed `hstu` package is the runtime authority).
 * `examples/hstu/ops/pt_ops/pt_hstu_attention.py` — PT reference math (L176-191).
+* `examples/hstu/context_parallel/hstu_attn_cp.py` — production CP wrapper.
 * `examples/hstu/modules/hstu_attention.py` — module wrapper (L84-138, 253-314).
 * `examples/hstu/ops/triton_ops/triton_hstu_attention.py` — triton kernel
   (3103 lines; only the entry signatures are relevant for CP wrapping).

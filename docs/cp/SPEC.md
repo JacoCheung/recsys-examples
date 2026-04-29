@@ -97,8 +97,8 @@ multi-GPU test runner must apply.
 - **The wrapper imports `hstu.hstu_attn_varlen_func` from the *installed*
   `hstu` package** (FBGEMM-style; signature has `seqused_q/k`,
   `quant_mode`). The in-tree `corelib/hstu/hstu_attn/hstu_attn_interface.py`
-  is unavailable in the container (its `hstu_attn_2_cuda` C-extension is
-  not built). Global rule 6 (runtime authority) is preserved by
+  is **deprecated** (kernel migrated to FBGEMM); this wrapper does not
+  depend on it. Global rule 6 (runtime authority) is preserved by
   `test_reference.py::test_hstu_signature_pinned` which fails loudly if
   the installed signature drifts.
 - **`hstu_attn_varlen_cp_func` divisibility guard checks LOCAL evenness,
@@ -194,7 +194,7 @@ for the lower-triangle case) on the smallest non-trivial input.
 **Goal**: ship a real multi-GPU CP forward callable users can adopt.
 
 **Deliverables**:
-- New module `corelib/hstu/hstu_attn/hstu_attn_cp.py` exporting
+- New module `examples/hstu/context_parallel/hstu_attn_cp.py` exporting
   `hstu_attn_varlen_cp_func(...)` — same kernel-side signature as
   `hstu_attn_varlen_func` plus `(cp_group, cp_global_ranks, cp_stream=None,
   cp_comm_type="p2p")`. (`cp_stream` is unused in this slice but reserved.)
@@ -215,8 +215,8 @@ for the lower-triangle case) on the smallest non-trivial input.
   shard + per-tile metadata. Pure permutation; no comm.
 
 **Files touched**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (new, ~400 lines).
-- `corelib/hstu/hstu_attn/__init__.py` (export the new symbol).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (new, ~1000 lines).
+- `examples/hstu/context_parallel/__init__.py` (export the new symbols).
 - `examples/hstu/test/cp/test_cp_forward.py` (new pytest, multi-GPU).
 
 **Acceptance**:
@@ -254,7 +254,7 @@ for the lower-triangle case) on the smallest non-trivial input.
   the zero-padded slots' grads are dropped at scatter time.
 
 **Files touched**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (extend).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (extend).
 - `examples/hstu/test/cp/test_cp_backward.py` (new pytest).
 - `examples/hstu/cp/poc_dualrank_sim.py` (extend with autograd backward path
   to keep the single-rank oracle parity).
@@ -283,7 +283,7 @@ for the lower-triangle case) on the smallest non-trivial input.
   bare isend/irecv and `batch_isend_irecv`.
 
 **Files touched**:
-- `corelib/hstu/hstu_attn/hstu_attn_cp.py` (refactor ring loop).
+- `examples/hstu/context_parallel/hstu_attn_cp.py` (refactor ring loop).
 - `examples/hstu/cp/bench_cp.py` (new perf harness; not pytest).
 
 **Acceptance**:
@@ -320,21 +320,31 @@ recsys-hstu_cp/
 ├── docs/cp/
 │   ├── hstu_cp_design.md       # research / rationale
 │   └── SPEC.md                 # this file
-├── corelib/hstu/hstu_attn/
-│   ├── hstu_attn_interface.py  # untouched (existing single-GPU wrapper)
+├── examples/hstu/context_parallel/
 │   ├── hstu_attn_cp.py         # NEW (Slice 3): public CP wrapper + helpers
-│   └── __init__.py             # add export of CP symbol
+│   └── __init__.py             # exports CP symbols
 ├── examples/hstu/cp/
 │   ├── poc_dualrank_sim.py     # Slice 1 + 2 (numerical oracle)
+│   ├── bench/baseline.py       # Slice 0 (single-GPU reference benchmark)
+│   ├── bench/compare.py        # Slice 0 (perf-regression gate)
+│   ├── run_cp_tests.sh         # Slice 3+ multi-GPU torchrun helper
+│   ├── run_regression.sh       # Slice 0 one-shot regression
 │   └── bench_cp.py             # Slice 5 (perf harness; non-pytest)
 └── examples/hstu/test/cp/
+    ├── test_reference.py       # Slice 0 (single-GPU reference)
+    ├── test_cp_api_smoke.py    # Slice 3 (single-GPU API smoke)
     ├── test_cp_forward.py      # Slice 3 (torchrun pytest)
     └── test_cp_backward.py     # Slice 4 (torchrun pytest)
 ```
 
-The PoC and the production wrapper live in **separate trees** (`examples/`
-vs. `corelib/`) so the PoC can never be accidentally taken as a runtime
-dependency. The PoC's role is *oracle*, not library.
+The PoC simulator and the production wrapper live in separate
+sub-trees (`examples/hstu/cp/` vs. `examples/hstu/context_parallel/`) so
+the PoC can never be accidentally taken as a runtime dependency. The
+PoC's role is *oracle*, not library. The production wrapper does not
+live under `corelib/hstu/`: that subtree is being deprecated as the
+HSTU kernel migrates to FBGEMM (the wrapper imports the kernel via
+`from hstu import hstu_attn_varlen_func`, where `hstu` is the installed
+FBGEMM-style package).
 
 ---
 
@@ -346,8 +356,8 @@ Inherit from the rest of `recsys-examples`. Specifically:
   copyright NVIDIA + original-author lines where applicable).
 - Type hints on all public functions; `from __future__ import annotations`
   in new files.
-- No new dependencies beyond `torch`, `torch.distributed`, the existing
-  `hstu_attn_2_cuda` binding, and `pytest` for tests.
+- No new dependencies beyond `torch`, `torch.distributed`, the installed
+  FBGEMM-style `hstu` package, and `pytest` for tests.
 - Docstrings on public functions; one-line `# why` comments only when the
   *why* is non-obvious. No narrative block comments.
 - File length budget: `hstu_attn_cp.py` ≤ 600 lines. If it grows past that,
@@ -479,6 +489,10 @@ Status as of 2026-04-29 (post-v0 verification):
 - `examples/hstu/cp/poc_dualrank_sim.py` — Slice 1 numerical oracle.
 - TransformerEngine: `transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py`.
 - MagiAttention: `magi_attention/api/magi_attn_interface.py` (Track B).
-- HSTU: `corelib/hstu/hstu_attn/hstu_attn_interface.py`,
+- HSTU kernel (production): installed `hstu` package
+  (`from hstu import hstu_attn_varlen_func`); FBGEMM-style.
+- HSTU (deprecated in-tree, retained for historical reference):
+  `corelib/hstu/hstu_attn/hstu_attn_interface.py`,
   `examples/hstu/ops/pt_ops/pt_hstu_attention.py`,
   `corelib/hstu/csrc/hstu_attn/hstu_api.cpp`.
+- CP wrapper (production): `examples/hstu/context_parallel/hstu_attn_cp.py`.
