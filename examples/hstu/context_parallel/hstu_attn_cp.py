@@ -1260,6 +1260,168 @@ def _multi_gpu_backward(
 
 
 # ----------------------------------------------------------------------------
+# Het-mask Step 4b — multi-GPU backward via arbitrary `func` mask.
+#
+# Mirrors `_multi_gpu_forward_arbitrary`: single kernel call per ring step,
+# `func` carries the full mask. Reverse-ring dKV exchange mirrors
+# `_multi_gpu_backward`.
+# ----------------------------------------------------------------------------
+def _multi_gpu_backward_arbitrary(
+    q_local: torch.Tensor,
+    k_local: torch.Tensor,
+    v_local: torch.Tensor,
+    cu_seqlens_local: torch.Tensor,
+    cu_seqlens_global: torch.Tensor,
+    dout_local: torch.Tensor,
+    *,
+    max_seqlen_q_global: int,
+    scaling_seqlen: int,
+    alpha: float,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    target_group_size: int,
+    window_size: tuple[int, int],
+    cp_group: dist.ProcessGroup,
+    cp_global_ranks: Sequence[int],
+    cp_rank: int,
+    cp_size: int,
+    cp_stream: Optional["torch.cuda.Stream"] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reverse-ring backward for the arbitrary-mask CP forward."""
+    from ._mask_func import localize_func_for_cp_step
+
+    local_max = max_seqlen_q_global // cp_size
+
+    default_stream = torch.cuda.current_stream()
+    comm_stream = _get_cp_stream(q_local.device, cp_stream)
+
+    # Re-run the forward ring locally to reconstruct kv_at_step[i].  Same
+    # ping-pong + clone pattern as `_multi_gpu_backward`.
+    cur_k = k_local.clone()
+    cur_v = v_local.clone()
+    recv_k = torch.empty_like(k_local)
+    recv_v = torch.empty_like(v_local)
+
+    dq_acc = torch.zeros_like(q_local, dtype=torch.float32)
+    dk_acc = torch.zeros_like(k_local, dtype=torch.float32)
+    dv_acc = torch.zeros_like(v_local, dtype=torch.float32)
+
+    # Collect (step, dk_partial, dv_partial) for the reverse-ring exchange.
+    # step==0 dKV is owned by self → added directly. step≥1 dKV belongs to
+    # peer src=(rank-step)%cp.
+    dkv_to_send: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+
+    for step in range(cp_size):
+        reqs: list[dist.Work] = []
+        if step < cp_size - 1:
+            comm_stream.wait_stream(default_stream)
+            reqs = _ring_send_recv_kv(
+                cur_k,
+                cur_v,
+                recv_k,
+                recv_v,
+                cp_group=cp_group,
+                cp_global_ranks=cp_global_ranks,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                direction="forward",
+                comm_stream=comm_stream,
+            )
+
+        # Per-step `func` tensor.
+        func = localize_func_for_cp_step(
+            cu_seqlens_global=cu_seqlens_global,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            step=step,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            NFUNC=3,
+            device=q_local.device,
+        )
+        # Re-run the per-tile forward under autograd to extract grads.
+        # Same enable_grad + detach.clone().requires_grad_ pattern as
+        # `_per_tile_partial_grads`.
+        with torch.enable_grad():
+            q_in = q_local.detach().clone().requires_grad_(True)
+            k_in = cur_k.detach().clone().requires_grad_(True)
+            v_in = cur_v.detach().clone().requires_grad_(True)
+            out = hstu_attn_varlen_func(
+                q=q_in,
+                k=k_in,
+                v=v_in,
+                cu_seqlens_q=cu_seqlens_local,
+                cu_seqlens_k=cu_seqlens_local,
+                seqused_q=None,
+                seqused_k=None,
+                max_seqlen_q=local_max,
+                max_seqlen_k=local_max,
+                scaling_seqlen=scaling_seqlen,
+                num_contexts=None,
+                num_targets=None,
+                target_group_size=1,
+                window_size=(-1, -1),
+                alpha=alpha,
+                func=func,
+                quant_mode=-1,
+            )
+            dq_p, dk_p, dv_p = torch.autograd.grad(out, (q_in, k_in, v_in), dout_local)
+            dq_p = dq_p.detach()
+            dk_p = dk_p.detach()
+            dv_p = dv_p.detach()
+        dq_acc += dq_p.float()
+        if step == 0:
+            # peer == self; dK/dV are ours.
+            dk_acc += dk_p.float()
+            dv_acc += dv_p.float()
+        else:
+            dkv_to_send.append((step, dk_p, dv_p))
+
+        if step < cp_size - 1:
+            for r in reqs:
+                r.wait()
+            default_stream.wait_stream(comm_stream)
+            cur_k, recv_k = recv_k, cur_k
+            cur_v, recv_v = recv_v, cur_v
+
+    # Reverse-ring dKV exchange (same logic as `_multi_gpu_backward`):
+    # send dKV computed at step i to peer (cp_rank - i) % cp_size; receive
+    # from peer (cp_rank + i) % cp_size who computed dKV for OUR KV at
+    # their step i.
+    recv_dk = torch.empty_like(k_local)
+    recv_dv = torch.empty_like(v_local)
+    for step, dk_p, dv_p in dkv_to_send:
+        send_dst = cp_global_ranks[(cp_rank - step) % cp_size]
+        recv_src = cp_global_ranks[(cp_rank + step) % cp_size]
+        reqs_k = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, dk_p.contiguous(), send_dst, group=cp_group),
+                dist.P2POp(dist.irecv, recv_dk, recv_src, group=cp_group),
+            ]
+        )
+        for r in reqs_k:
+            r.wait()
+        reqs_v = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, dv_p.contiguous(), send_dst, group=cp_group),
+                dist.P2POp(dist.irecv, recv_dv, recv_src, group=cp_group),
+            ]
+        )
+        for r in reqs_v:
+            r.wait()
+        dk_acc += recv_dk.float()
+        dv_acc += recv_dv.float()
+
+    return (
+        dq_acc.to(q_local.dtype),
+        dk_acc.to(k_local.dtype),
+        dv_acc.to(v_local.dtype),
+    )
+
+
+# ----------------------------------------------------------------------------
 # Multi-GPU autograd Function. Forward (T3.3) and backward (T4.2) implemented.
 # ----------------------------------------------------------------------------
 def _is_het_mask(
@@ -1376,24 +1538,57 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         # Reuse the same comm stream across forward/backward to avoid
         # re-creating per device.
         ctx.cp_stream = cp_stream
-        # Het-mask spec is saved for backward, but Step 4a only supports
-        # the het-mask path in forward; backward will raise if het_mask
-        # was set at forward time. Step 4b lifts this restriction.
+        # Het-mask spec saved for backward — Step 4b: backward routes to
+        # `_multi_gpu_backward_arbitrary` when ctx.het_mask is True.
         ctx.het_mask = het_mask
+        ctx.num_contexts = num_contexts
+        ctx.num_targets = num_targets
+        ctx.target_group_size = target_group_size
+        ctx.window_size = tuple(window_size)
         return out
 
     @staticmethod
     def backward(ctx, dout):  # type: ignore[override]
-        if ctx.het_mask:
-            raise GuardError(
-                "Het-mask backward under CP not yet wired (Step 4a ships "
-                "forward only). Avoid calling .backward() on outputs of "
-                "hstu_attn_varlen_cp_func when num_contexts / num_targets / "
-                "target_group_size > 1 / window_size != (-1, 0) is set with "
-                "cp_size > 1, until Step 4b lands. See "
-                "docs/cp/het_mask_design.md §8."
-            )
         q, k, v, cu_seqlens_q, _cu_seqlens_k = ctx.saved_tensors
+        if ctx.het_mask:
+            cu_seqlens_global = cu_seqlens_q * ctx.cp_size
+            grads = _multi_gpu_backward_arbitrary(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_global,
+                dout,
+                max_seqlen_q_global=ctx.max_seqlen_q,
+                scaling_seqlen=ctx.scaling_seqlen,
+                alpha=ctx.alpha,
+                num_contexts=ctx.num_contexts,
+                num_targets=ctx.num_targets,
+                target_group_size=ctx.target_group_size,
+                window_size=ctx.window_size,
+                cp_group=ctx.cp_group,
+                cp_global_ranks=ctx.cp_global_ranks,
+                cp_rank=ctx.cp_rank,
+                cp_size=ctx.cp_size,
+                cp_stream=ctx.cp_stream,
+            )
+            return (
+                *grads,
+                None,  # cu_seqlens_q
+                None,  # cu_seqlens_k
+                None,  # max_seqlen_q
+                None,  # max_seqlen_k
+                None,  # scaling_seqlen
+                None,  # alpha
+                None,  # num_contexts
+                None,  # num_targets
+                None,  # target_group_size
+                None,  # window_size
+                None,  # cp_group
+                None,  # cp_global_ranks
+                None,  # cp_stream
+                None,  # cp_comm_type
+            )
         return (
             *_multi_gpu_backward(
                 q,

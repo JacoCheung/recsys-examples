@@ -314,3 +314,143 @@ def test_cp4(entry: dict, cp_world: dict) -> None:
     if cp_world["world_size"] != 4:
         pytest.skip(f"requires WORLD_SIZE=4; got {cp_world['world_size']}")
     _run_one_correctness(entry, cp_world)
+
+
+# ============================================================================
+# Backward (Step 4b): ctx-saved het-mask spec + reverse-ring dKV exchange.
+# ============================================================================
+def _run_one_correctness_bwd(entry: dict, cp_world: dict) -> None:
+    cp_group = cp_world["cp_group"]
+    cp_size = cp_world["world_size"]
+    cp_rank = cp_world["rank"]
+    device = cp_world["device"]
+
+    seqlens = entry["seqlens"]
+    head_dim = entry["head_dim"]
+    num_heads = entry["num_heads"]
+    alpha = _alpha_for(head_dim)
+    max_seqlen = max(seqlens)
+
+    q_g, k_g, v_g, cu_g = random_varlen_batch(
+        seqlens, num_heads=num_heads, head_dim=head_dim, device=device, seed=0
+    )
+    nc = _to_int32_or_none(entry["nc"], device)
+    nt = _to_int32_or_none(entry["nt"], device)
+    tgs = entry["tgs"]
+    ws = entry["ws"]
+
+    # Deterministic dout on every rank (same seed).
+    g = torch.Generator(device=device).manual_seed(101)
+    dout_g = torch.randn(q_g.shape, generator=g, dtype=q_g.dtype, device=device)
+
+    # Single-GPU baseline fwd+bwd.
+    q_b = q_g.detach().clone().requires_grad_(True)
+    k_b = k_g.detach().clone().requires_grad_(True)
+    v_b = v_g.detach().clone().requires_grad_(True)
+    out_base = _baseline_fwd(
+        q_b,
+        k_b,
+        v_b,
+        cu_g,
+        max_seqlen=max_seqlen,
+        alpha=alpha,
+        num_contexts=nc,
+        num_targets=nt,
+        target_group_size=tgs,
+        window_size=ws,
+    )
+    dq_base, dk_base, dv_base = torch.autograd.grad(out_base, (q_b, k_b, v_b), dout_g)
+
+    # CP wrapper fwd+bwd on this rank's shard.
+    q_loc, k_loc, v_loc, cu_loc, l2g, _ = get_batch_on_this_cp_rank_for_hstu(
+        q_g, k_g, v_g, cu_g, cp_size=cp_size, cp_rank=cp_rank
+    )
+    q_loc = q_loc.detach().clone().requires_grad_(True)
+    k_loc = k_loc.detach().clone().requires_grad_(True)
+    v_loc = v_loc.detach().clone().requires_grad_(True)
+    dout_loc = dout_g[l2g]
+
+    out_loc = hstu_attn_varlen_cp_func(
+        q=q_loc,
+        k=k_loc,
+        v=v_loc,
+        cu_seqlens_q=cu_loc,
+        cu_seqlens_k=cu_loc,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        scaling_seqlen=max_seqlen,
+        num_contexts=nc,
+        num_targets=nt,
+        target_group_size=tgs,
+        window_size=ws,
+        alpha=alpha,
+        cp_group=cp_group,
+        cp_global_ranks=cp_world["cp_global_ranks"],
+    )
+    out_loc.backward(dout_loc)
+    dq_loc = q_loc.grad.detach()
+    dk_loc = k_loc.grad.detach()
+    dv_loc = v_loc.grad.detach()
+
+    def _scatter_allreduce(local: torch.Tensor) -> torch.Tensor:
+        contrib = torch.zeros_like(q_g, dtype=torch.float32)
+        contrib[l2g] = local.float()
+        dist.all_reduce(contrib, op=dist.ReduceOp.SUM, group=cp_group)
+        return contrib.to(q_g.dtype)
+
+    dq_g = _scatter_allreduce(dq_loc)
+    dk_g = _scatter_allreduce(dk_loc)
+    dv_g = _scatter_allreduce(dv_loc)
+    out_global = _scatter_allreduce(out_loc.detach())
+
+    for name, t in [
+        ("out", out_global),
+        ("dq", dq_g),
+        ("dk", dk_g),
+        ("dv", dv_g),
+    ]:
+        assert torch.isfinite(t).all().item(), f"{name}: non-finite"
+    torch.testing.assert_close(
+        out_global.float(),
+        out_base.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"{entry['id']} fwd",
+    )
+    torch.testing.assert_close(
+        dq_g.float(),
+        dq_base.float(),
+        rtol=5e-2,
+        atol=5e-2,
+        msg=f"{entry['id']} dq",
+    )
+    torch.testing.assert_close(
+        dk_g.float(),
+        dk_base.float(),
+        rtol=5e-2,
+        atol=5e-2,
+        msg=f"{entry['id']} dk",
+    )
+    torch.testing.assert_close(
+        dv_g.float(),
+        dv_base.float(),
+        rtol=5e-2,
+        atol=5e-2,
+        msg=f"{entry['id']} dv",
+    )
+
+
+@pytest.mark.parametrize("entry", HET_MASK_MATRIX_CP2, ids=lambda e: e["id"])
+def test_cp2_bwd(entry: dict, cp_world: dict) -> None:
+    if cp_world["world_size"] != 2:
+        pytest.skip(f"requires WORLD_SIZE=2; got {cp_world['world_size']}")
+    _run_one_correctness_bwd(entry, cp_world)
+
+
+@pytest.mark.parametrize("entry", HET_MASK_MATRIX_CP4, ids=lambda e: e["id"])
+def test_cp4_bwd(entry: dict, cp_world: dict) -> None:
+    if cp_world["world_size"] != 4:
+        pytest.skip(f"requires WORLD_SIZE=4; got {cp_world['world_size']}")
+    _run_one_correctness_bwd(entry, cp_world)
