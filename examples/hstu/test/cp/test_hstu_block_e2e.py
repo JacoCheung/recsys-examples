@@ -19,14 +19,33 @@ verifies that:
      trainable parameters are finite and non-zero.
 
 This is the integration gate that catches preprocessor / layer-stack /
-gather / postprocessor wiring bugs that the unit tests miss.
+gather / postprocessor wiring bugs that the unit tests miss. It is
+NOT a numerical-correctness oracle — that role belongs to the
+kernel-level CP tests (`test_cp_forward.py`, `test_cp_backward.py`)
+which compare gathered output and gradients against the single-GPU
+single-rank baseline. Together those three files form the regression
+matrix:
 
-We don't compare against a separate cp=1 oracle in this same process
-because Megatron `parallel_state` is global state — running cp=1
-inside a process already initialised at cp=2 requires destroy + re-
-init which is brittle. The cross-rank symmetry check (#3) plus the
-unit-level cp=1 path in `test_hstu_block_cp.py::
-test_block_cp_size_1_skips_dispatch` together cover both directions.
+  - test_cp_forward.py / test_cp_backward.py: kernel-level numerical
+    correctness vs single-GPU baseline. Catches mask, ring, scatter
+    bugs at the math level. Required pass for v0 ship.
+  - test_hstu_block_cp.py: HSTUBlock dispatch/gather wiring with
+    stubbed layers (this file's predecessor — single-GPU only).
+  - test_hstu_block_e2e.py (this file): integration smoke — proves
+    the stubbed wiring works with REAL layers on REAL Megatron CP
+    state and that the backward graph isn't replicated-local
+    (each CP rank backprops its own Q chunk, so per-rank pre-reduce
+    grads diverge above the bf16 noise floor).
+
+Codex round-4 NOTE on coverage: this test's grad-divergence check
+(items 6 below) catches the "CP completely disabled — every rank
+runs full batch locally" failure mode (verified by prove-it: setting
+`cp_active = False` in `HSTUBlock.forward` makes `rel_diff` collapse
+to ~0% and the assertion fires). It does NOT prove the backward
+reverse-ring is delivering peer-K contributions correctly — that
+proof comes from `test_cp_backward.py`'s direct kernel-level
+gradient comparison against the single-GPU baseline. The kernel
+test is required to pass in the same regression matrix.
 
 Run:
     bash examples/hstu/cp/run_cp_tests.sh    # part of regression
