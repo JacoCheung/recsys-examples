@@ -71,6 +71,33 @@ _SPEC_REF = "see SPEC §2 (out-of-scope) and plan T3.1 (hard-guard list)"
 
 
 # ----------------------------------------------------------------------------
+# Slice 5 — secondary CUDA stream used to overlap NCCL P2P with HSTU
+# attention compute. One stream per CUDA device per process, lazily created.
+# ----------------------------------------------------------------------------
+_default_cp_streams: dict[int, "torch.cuda.Stream"] = {}
+
+
+def _get_cp_stream(
+    device: torch.device, user_stream: Optional["torch.cuda.Stream"]
+) -> "torch.cuda.Stream":
+    """Return the comm stream this rank should use for ring P2P.
+
+    Caller may inject `user_stream` via `hstu_attn_varlen_cp_func(cp_stream=...)`
+    to share a stream across modules; otherwise we cache one per device on
+    the module. Each device gets its own stream so multi-stream code on one
+    rank with > 1 visible CUDA device (e.g. tests) does not cross-pollute.
+    """
+    if user_stream is not None:
+        return user_stream
+    key = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _default_cp_streams.get(key)
+    if cached is None:
+        cached = torch.cuda.Stream(device=key)
+        _default_cp_streams[key] = cached
+    return cached
+
+
+# ----------------------------------------------------------------------------
 # DualChunkSwap dispatch helper (T3.2).
 #
 # Maps a global packed batch onto the local shard owned by `(cp_rank, cp_size)`.
@@ -429,7 +456,13 @@ def _upper_call(
 
 
 # ----------------------------------------------------------------------------
-# Ring P2P helper (sequential single-stream — Slice 5 adds two-stream overlap).
+# Ring P2P helper.
+#
+# Slice 5 adds two-stream overlap: when `comm_stream` is provided, NCCL P2P
+# is launched on that stream so the kernel scheduler is free to overlap with
+# attention compute on the default stream. Single-stream call sites still
+# work — pass `comm_stream=None` (or omit) and the helper degenerates to the
+# Slice 3 behaviour.
 # ----------------------------------------------------------------------------
 def _ring_send_recv_kv(
     cur_k: torch.Tensor,
@@ -442,6 +475,7 @@ def _ring_send_recv_kv(
     cp_rank: int,
     cp_size: int,
     direction: str = "forward",
+    comm_stream: Optional[torch.cuda.Stream] = None,
 ) -> list[dist.Work]:
     """Issue P2P send + recv for one ring step.
 
@@ -450,6 +484,14 @@ def _ring_send_recv_kv(
     T4.2 (multi-GPU backward) to send dKV partials home along the reverse
     ring. Note that for backward, the tensors typically named `cur_k/cur_v`
     actually carry dK/dV gradients — the helper is direction-agnostic.
+
+    `comm_stream`: optional secondary CUDA stream on which to launch the NCCL
+    collective. If provided, the caller is responsible for the cross-stream
+    sync (`comm_stream.wait_stream(default)` BEFORE the call so the comm
+    stream sees the producer writes; `default.wait_stream(comm_stream)` AFTER
+    the work has waited so the consumer stream sees the recv'd bytes). When
+    None, the collective runs on whatever stream is current at call time —
+    Slice 3 behaviour.
 
     Uses `batch_isend_irecv` to avoid the deadlock pattern of naive isend/irecv
     pairs. Returns the list of `Work` handles; caller must call `.wait()`
@@ -465,28 +507,43 @@ def _ring_send_recv_kv(
         raise ValueError(
             f"direction must be 'forward' or 'backward'; got {direction!r}"
         )
-    # NCCL `batch_isend_irecv` reliably handles a single send/recv pair per
-    # batch. Bundling K and V into a 4-op batch hangs in some NCCL/torch
-    # combinations (verified on the production image's NCCL on A100 PCIe).
-    # Issue K and V as two separate 2-op batches; caller gets one combined
-    # Work list to wait on.
-    reqs_k = dist.batch_isend_irecv(
-        [
-            dist.P2POp(dist.isend, cur_k, dst, group=cp_group),
-            dist.P2POp(dist.irecv, recv_k, src, group=cp_group),
-        ]
-    )
-    reqs_v = dist.batch_isend_irecv(
-        [
-            dist.P2POp(dist.isend, cur_v, dst, group=cp_group),
-            dist.P2POp(dist.irecv, recv_v, src, group=cp_group),
-        ]
-    )
-    return list(reqs_k) + list(reqs_v)
+
+    def _issue_two_pairs() -> list[dist.Work]:
+        # NCCL `batch_isend_irecv` reliably handles a single send/recv pair
+        # per batch. Bundling K and V into a 4-op batch hangs in some
+        # NCCL/torch combinations (verified on the production image's NCCL
+        # on A100 PCIe). Issue K and V as two separate 2-op batches; caller
+        # gets one combined Work list to wait on.
+        rk = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, cur_k, dst, group=cp_group),
+                dist.P2POp(dist.irecv, recv_k, src, group=cp_group),
+            ]
+        )
+        rv = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, cur_v, dst, group=cp_group),
+                dist.P2POp(dist.irecv, recv_v, src, group=cp_group),
+            ]
+        )
+        return list(rk) + list(rv)
+
+    if comm_stream is None:
+        return _issue_two_pairs()
+    with torch.cuda.stream(comm_stream):
+        return _issue_two_pairs()
 
 
 # ----------------------------------------------------------------------------
-# T3.3: multi-GPU forward. Single CUDA stream, sequential ring P2P.
+# T3.3 + T5.1: multi-GPU forward. Two-stream comm/compute overlap.
+#
+# Step `i` issues NCCL P2P for step `i+1`'s KV on `cp_stream` while attention
+# compute for step `i` runs on the default stream. Cross-stream sync via
+# `wait_stream` on both sides:
+#   - cp_stream.wait_stream(default) BEFORE P2P, so P2P sees the latest writes
+#     to `cur_k/cur_v` (the initial clone, or the previous iteration's swap).
+#   - default.wait_stream(cp_stream) AFTER `r.wait()` and BEFORE the next-step
+#     compute consumes the swapped-in tensors.
 # ----------------------------------------------------------------------------
 def _multi_gpu_forward(
     q_local: torch.Tensor,
@@ -501,6 +558,7 @@ def _multi_gpu_forward(
     cp_global_ranks: Sequence[int],
     cp_rank: int,
     cp_size: int,
+    cp_stream: Optional["torch.cuda.Stream"] = None,
 ) -> torch.Tensor:
     """Run the (rank, step) classification grid as a real multi-GPU ring.
 
@@ -510,6 +568,9 @@ def _multi_gpu_forward(
     internally. `scaling_seqlen` is the global `1/N` divisor (must NOT change
     across ring steps — that's why every per-tile call passes the same value).
 
+    `cp_stream`: secondary CUDA stream for NCCL P2P. If None, we lazily create
+    or reuse a per-device cached stream (see `_get_cp_stream`).
+
     Reduction is in fp32 (per SPEC §2). The returned tensor is cast back to
     `q_local.dtype` on exit.
     """
@@ -518,6 +579,9 @@ def _multi_gpu_forward(
     )  # 2 chunks per sample → local len = global / cp_size
     half_max = local_max // 2  # one chunk per sample
     chunk_sizes = _chunk_sizes_from_cu(cu_seqlens_local)
+
+    default_stream = torch.cuda.current_stream()
+    comm_stream = _get_cp_stream(q_local.device, cp_stream)
 
     # Ping-pong KV buffers. Critical: clone the initial K/V so subsequent
     # buffer swaps never mutate the caller's input tensors. Without the clone,
@@ -532,9 +596,14 @@ def _multi_gpu_forward(
     out_local = torch.zeros_like(q_local, dtype=torch.float32)
 
     for step in range(cp_size):
-        # 1. Issue next-step KV exchange (skip on last step).
+        # 1. Issue next-step KV exchange on `comm_stream` (skip on last step).
+        # The comm stream waits for the producer of cur_k/cur_v, which is the
+        # default stream (initial clone in step 0; swap-stamped writes in
+        # steps > 0 originate from comm_stream itself, but we resync for
+        # safety since the swap is just a Python pointer rebind).
         reqs: list[dist.Work] = []
         if step < cp_size - 1:
+            comm_stream.wait_stream(default_stream)
             reqs = _ring_send_recv_kv(
                 cur_k,
                 cur_v,
@@ -544,9 +613,10 @@ def _multi_gpu_forward(
                 cp_global_ranks=cp_global_ranks,
                 cp_rank=cp_rank,
                 cp_size=cp_size,
+                comm_stream=comm_stream,
             )
 
-        # 2. Compute on the current KV (still owned).
+        # 2. Compute on the current KV (still owned), on default stream.
         if step == 0:
             partial = _diag_call(
                 q_local,
@@ -594,11 +664,14 @@ def _multi_gpu_forward(
             )
 
         # 3. Wait for next-step KV to arrive before overwriting `cur_*`.
-        for r in reqs:
-            r.wait()
-
-        # 4. Swap buffers for the next iteration.
+        # `Work.wait()` does CPU-blocking; default_stream.wait_stream(comm_stream)
+        # is the GPU-side ordering — default sees the recv'd buffer contents
+        # before the next iteration's compute consumes them.
         if step < cp_size - 1:
+            for r in reqs:
+                r.wait()
+            default_stream.wait_stream(comm_stream)
+            # 4. Swap buffers for the next iteration.
             cur_k, recv_k = recv_k, cur_k
             cur_v, recv_v = recv_v, cur_v
 
@@ -676,6 +749,7 @@ def _multi_gpu_backward(
     cp_global_ranks: Sequence[int],
     cp_rank: int,
     cp_size: int,
+    cp_stream: Optional["torch.cuda.Stream"] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reverse-direction-ring backward for HSTU CP forward.
 
@@ -699,10 +773,12 @@ def _multi_gpu_backward(
     Returned dtypes match the forward inputs (cast back from the fp32
     accumulators).
     """
-    2 * cp_size
     local_max = max_seqlen_q_global // cp_size
     half_max = local_max // 2
     chunk_sizes = _chunk_sizes_from_cu(cu_seqlens_local)
+
+    default_stream = torch.cuda.current_stream()
+    comm_stream = _get_cp_stream(q_local.device, cp_stream)
 
     # We need the SAME KV stream the forward saw at each step. Re-run the
     # forward ring locally (read-only) to reconstruct kv_at_step[i]. Cheap
@@ -727,9 +803,11 @@ def _multi_gpu_backward(
 
     for step in range(cp_size):
         # Issue next-step KV exchange (forward direction) so cur_k/v matches
-        # what was used in forward.
+        # what was used in forward. Same two-stream pattern as
+        # `_multi_gpu_forward` — comm overlaps with `_per_tile_partial_grads`.
         reqs: list[dist.Work] = []
         if step < cp_size - 1:
+            comm_stream.wait_stream(default_stream)
             reqs = _ring_send_recv_kv(
                 cur_k,
                 cur_v,
@@ -740,6 +818,7 @@ def _multi_gpu_backward(
                 cp_rank=cp_rank,
                 cp_size=cp_size,
                 direction="forward",
+                comm_stream=comm_stream,
             )
 
         # Compute per-tile partial grads.
@@ -819,9 +898,10 @@ def _multi_gpu_backward(
             dkv_to_send.append((step, dk_p, dv_p))
 
         # Wait for next-step KV (forward ring) to arrive before swap.
-        for r in reqs:
-            r.wait()
         if step < cp_size - 1:
+            for r in reqs:
+                r.wait()
+            default_stream.wait_stream(comm_stream)
             cur_k, recv_k = recv_k, cur_k
             cur_v, recv_v = recv_v, cur_v
 
@@ -889,9 +969,6 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         cp_stream,
         cp_comm_type,
     ):
-        # `cp_stream` is reserved (Slice 5 will use it for two-stream overlap);
-        # v0 is single-stream so we ignore it here.
-        del cp_stream  # unused in v0
         if cp_comm_type != "p2p":
             raise GuardError(
                 f"cp_comm_type={cp_comm_type!r} not supported in v0; only 'p2p'"
@@ -911,6 +988,7 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
             cp_global_ranks=cp_global_ranks,
             cp_rank=cp_rank,
             cp_size=cp_size,
+            cp_stream=cp_stream,
         )
 
         # Save for backward (T4.2).
@@ -926,6 +1004,9 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         ctx.cp_global_ranks = tuple(cp_global_ranks)
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
+        # Reuse the same comm stream across forward/backward to avoid
+        # re-creating per device.
+        ctx.cp_stream = cp_stream
         return out
 
     @staticmethod
@@ -945,6 +1026,7 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
                 cp_global_ranks=ctx.cp_global_ranks,
                 cp_rank=ctx.cp_rank,
                 cp_size=ctx.cp_size,
+                cp_stream=ctx.cp_stream,
             ),
             # No gradients for non-Tensor / metadata args. Forward took:
             #   q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
