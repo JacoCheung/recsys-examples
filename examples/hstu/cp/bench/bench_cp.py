@@ -198,8 +198,16 @@ def _time_one_shape_cp(
     cp_size: int,
     cp_rank: int,
     device: torch.device,
+    mask_mode: str = "causal",
 ) -> dict:
-    """cp_size > 1 path: time `hstu_attn_varlen_cp_func` on the local shard."""
+    """cp_size > 1 path: time `hstu_attn_varlen_cp_func` on the local shard.
+
+    `mask_mode` selects the mask spec passed to the wrapper:
+      - "causal" (default): plain causal, routes through `_multi_gpu_forward`.
+      - "het_targets": num_targets set, target_group_size=2; routes
+        through `_multi_gpu_forward_arbitrary` (per-step `func` builder).
+      - "sliding": window_size=(w, 0); also routes through arbitrary.
+    """
     q_global, k_global, v_global, cu_global = _build_equal_len_batch(
         shape["batch"],
         shape["seqlen"],
@@ -216,6 +224,22 @@ def _time_one_shape_cp(
     )
     local_tokens = q_loc.shape[0]
 
+    if mask_mode == "causal":
+        nc, nt, tgs, ws = None, None, 1, (-1, 0)
+    elif mask_mode == "het_targets":
+        # 1/8th of each sample is target region, group_size=2.
+        nt_per_sample = max(2, max_s // 8)
+        nt = torch.full(
+            (shape["batch"],), nt_per_sample, dtype=torch.int32, device=device
+        )
+        nc, tgs, ws = None, 2, (-1, 0)
+    elif mask_mode == "sliding":
+        nc, nt, tgs = None, None, 1
+        # Sliding window = 1/4 of seqlen (still routes through arbitrary).
+        ws = (max(8, max_s // 4), 0)
+    else:
+        raise ValueError(f"unknown mask_mode={mask_mode!r}")
+
     def _step() -> torch.Tensor:
         return hstu_attn_varlen_cp_func(
             q=q_loc,
@@ -228,10 +252,10 @@ def _time_one_shape_cp(
             max_seqlen_q=max_s,
             max_seqlen_k=max_s,
             scaling_seqlen=max_s,
-            num_contexts=None,
-            num_targets=None,
-            target_group_size=1,
-            window_size=(-1, 0),
+            num_contexts=nc,
+            num_targets=nt,
+            target_group_size=tgs,
+            window_size=ws,
             alpha=alpha,
             cp_group=cp_group,
             cp_global_ranks=cp_global_ranks,
@@ -283,6 +307,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument(
+        "--mask-mode",
+        choices=["causal", "het_targets", "sliding"],
+        default="causal",
+        help="Mask spec for the CP path (cp_size > 1). `causal` routes "
+        "through `_multi_gpu_forward` (3-region tile classifier); "
+        "`het_targets` and `sliding` route through "
+        "`_multi_gpu_forward_arbitrary` (per-step `func` builder). "
+        "Used to characterise the arbitrary-mask path overhead vs the "
+        "plain-causal path on the same shapes.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -293,6 +328,7 @@ def main() -> None:
         cp_size=args.cp_size,
         warmup=args.warmup,
         iters=args.iters,
+        mask_mode=args.mask_mode,
     )
 
     if args.cp_size == 1:
@@ -349,6 +385,7 @@ def main() -> None:
             cp_size=args.cp_size,
             cp_rank=rank,
             device=device,
+            mask_mode=args.mask_mode,
         )
         if rank == 0:
             print(
