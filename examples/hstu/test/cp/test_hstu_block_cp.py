@@ -235,76 +235,83 @@ def test_block_cp_size_1_skips_dispatch(cuda_device: torch.device) -> None:
     assert out_jd.values.shape[0] == total_global_tokens
 
 
+def _make_cp_config_stub(
+    *,
+    cp_size: int,
+    hstu_layer_type,
+    sequence_parallel: bool,
+):
+    """Build a minimal duck-typed config for `_validate_cp_config`.
+
+    `HSTUBlock._validate_cp_config` reads only the three CP-relevant
+    fields, so we don't need to construct a full `HSTUConfig` (which
+    would require a Megatron `parallel_state` init for TP/PP queries).
+    A `SimpleNamespace` is sufficient and keeps the test honest: it
+    exercises the *exact* code path that `HSTUBlock.__init__` runs.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        context_parallel_size=cp_size,
+        hstu_layer_type=hstu_layer_type,
+        sequence_parallel=sequence_parallel,
+    )
+
+
 def test_block_cp_rejects_fused_layer(cuda_device: torch.device) -> None:
     """cp_size>1 requires HSTULayerType.NATIVE; FUSED has no CP wrapper.
 
-    The full `HSTUBlock(...)` constructor invokes
-    `HSTUBlockPreprocessor` which queries Megatron `parallel_state` for
-    TP world size — that requires `initialize_model_parallel(...)`
-    which we don't run in unit tests. So we check the reject by directly
-    calling the same logic the constructor uses, not by instantiating
-    HSTUBlock.  Verifies the `_cp_size > 1 + non-NATIVE` branch.
-
-    TODO: when the preprocessor/parallel-state init can be cheaply
-    isolated (e.g. via a thin Megatron-init fixture), upgrade this to
-    `pytest.raises(ValueError): HSTUBlock(fake_config)` for behavioural
-    coverage. The current source-string assert is a weaker guard than
-    behavioural instantiation, per Codex round-2 note.
+    Behavioural reject (Codex round-3 IMPORTANT). Calls the same
+    classmethod that `HSTUBlock.__init__` runs at __init__ time, so
+    a refactor that silently removes the guard breaks this test.
     """
     from configs.hstu_config import HSTULayerType
-
-    # Replicate HSTUBlock.__init__'s reject logic verbatim.  If this
-    # branch is removed, the test fails — regression-guard.
-    cp_size = 2
-    layer_type = HSTULayerType.FUSED
-    with pytest.raises(ValueError, match="HSTULayerType.NATIVE"):
-        if cp_size > 1:
-            if layer_type != HSTULayerType.NATIVE:
-                raise ValueError(
-                    "Context Parallelism (cp_size > 1) is only wired through "
-                    f"HSTULayerType.NATIVE in v0; got {layer_type}. "
-                    "Switch to NATIVE or set context_parallel_size=1."
-                )
-    # Sanity: the EXACT message string we expect to see in the reject
-    # branch lives in `examples/hstu/modules/hstu_block.py` — if either
-    # message drifts, the regex match above tightens the test.
-    import inspect
-
     from modules.hstu_block import HSTUBlock
 
-    src = inspect.getsource(HSTUBlock.__init__)
-    assert "HSTULayerType.NATIVE" in src
-    assert "context_parallel_size > 1" in src or "cp_size > 1" in src
+    config = _make_cp_config_stub(
+        cp_size=2, hstu_layer_type=HSTULayerType.FUSED, sequence_parallel=False
+    )
+    with pytest.raises(ValueError, match="HSTULayerType.NATIVE"):
+        HSTUBlock._validate_cp_config(config)
+
+    # Sanity: cp_size=1 with FUSED must NOT raise (the layer-type
+    # restriction only applies under CP).
+    safe = _make_cp_config_stub(
+        cp_size=1, hstu_layer_type=HSTULayerType.FUSED, sequence_parallel=False
+    )
+    HSTUBlock._validate_cp_config(safe)  # must not raise
+
+    # Sanity: cp_size>1 with NATIVE + sequence_parallel=False is OK.
+    ok_native = _make_cp_config_stub(
+        cp_size=2, hstu_layer_type=HSTULayerType.NATIVE, sequence_parallel=False
+    )
+    HSTUBlock._validate_cp_config(ok_native)  # must not raise
 
 
 def test_block_cp_rejects_sequence_parallel(cuda_device: torch.device) -> None:
-    """cp_size>1 must reject `sequence_parallel=True` (Codex round-2 IMPORTANT).
+    """cp_size>1 must reject `sequence_parallel=True` (Codex round-2 IMPORTANT;
+    upgraded to behavioural reject in round-3).
 
     The SP preprocessor scatters `jd.values` along row-dim by tp_size
     (`hstu_processor.py:scatter_to_sequence_parallel_region`); the CP
     dispatch then indexes that scattered tensor with global
-    `seqlen_offsets` — shape/index mismatch. `HSTUBlock.__init__` must
-    fail loudly when both are configured.
-
-    Same TODO as `test_block_cp_rejects_fused_layer`: source-string
-    check until preprocessor/parallel-state init is cheaply mockable.
+    `seqlen_offsets` — shape/index mismatch. `_validate_cp_config`
+    must fail loudly when both are configured. Calling it directly
+    means a regressor that drops only the SP check (but keeps the
+    FUSED check) still fails the test.
     """
-    # Replicate the reject logic. If this branch is removed, this
-    # test fails — regression-guard.
-    cp_size = 2
-    sequence_parallel = True
-    with pytest.raises(ValueError, match="sequence_parallel"):
-        if cp_size > 1 and sequence_parallel:
-            raise ValueError(
-                "Context Parallelism (cp_size > 1) and sequence_parallel "
-                "are not co-wired in v0. The SP preprocessor scatters "
-                "values along the row dim, but CP dispatch indexes with "
-                "global offsets — they cannot stack. Disable one."
-            )
-    import inspect
-
+    from configs.hstu_config import HSTULayerType
     from modules.hstu_block import HSTUBlock
 
-    src = inspect.getsource(HSTUBlock.__init__)
-    assert "sequence_parallel" in src
-    assert "scatters" in src or "scatter" in src
+    config = _make_cp_config_stub(
+        cp_size=2, hstu_layer_type=HSTULayerType.NATIVE, sequence_parallel=True
+    )
+    with pytest.raises(ValueError, match="sequence_parallel"):
+        HSTUBlock._validate_cp_config(config)
+
+    # Sanity: cp_size=1 with sequence_parallel=True must NOT raise
+    # (SP is fine on its own; only the CP+SP stack is rejected).
+    safe = _make_cp_config_stub(
+        cp_size=1, hstu_layer_type=HSTULayerType.NATIVE, sequence_parallel=True
+    )
+    HSTUBlock._validate_cp_config(safe)  # must not raise

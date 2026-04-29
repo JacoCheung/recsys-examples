@@ -26,10 +26,61 @@ class HSTUBlock(MegatronModule):
         config (HSTUConfig): Configuration for the HSTU block.
     """
 
+    @staticmethod
+    def _validate_cp_config(config) -> None:
+        """Reject CP combinations that v0 does not support.
+
+        Pulled out of `__init__` so unit tests can call it on a tiny
+        duck-typed config without spinning up Megatron `parallel_state`
+        for `HSTUBlockPreprocessor` (used by the
+        `test_block_cp_rejects_*` regression-guards). Reads only three
+        config fields:
+
+          - `context_parallel_size`
+          - `hstu_layer_type`
+          - `sequence_parallel`
+
+        v0 wires CP only through the NATIVE HSTU layer (uses
+        `create_hstu_attention(...)` → `FusedHSTUAttention` which
+        routes to `hstu_attn_varlen_cp_func`). The FUSED layer uses
+        `fused_hstu_op` (separate triton fusion) and the DEBUG layer
+        doesn't yet thread CP plumbing through; both are rejected so
+        the failure points at the config rather than at a silent-no-op
+        layer call.
+
+        CP + sequence_parallel is also rejected: the SP preprocessor
+        scatters `jd.values` along row-dim by tp_size
+        (`hstu_processor.py:scatter_to_sequence_parallel_region`) but
+        CP dispatch (`apply_dualchunkswap_to_jagged`) indexes
+        `jd.values` with global `seqlen_offsets` — shape/index
+        mismatch as soon as both are on.
+        """
+        cp_size = config.context_parallel_size
+        if cp_size > 1:
+            if config.hstu_layer_type != HSTULayerType.NATIVE:
+                raise ValueError(
+                    "Context Parallelism (cp_size > 1) is only wired through "
+                    f"HSTULayerType.NATIVE in v0; got {config.hstu_layer_type}. "
+                    "Switch to NATIVE or set context_parallel_size=1."
+                )
+            if config.sequence_parallel:
+                raise ValueError(
+                    "Context Parallelism (cp_size > 1) and sequence_parallel "
+                    "are not co-wired in v0. The SP preprocessor scatters "
+                    "values along the row dim, but CP dispatch indexes with "
+                    "global offsets — they cannot stack. Disable one."
+                )
+
     def __init__(
         self,
         config: HSTUConfig,
     ):
+        # Validate CP config first so reject paths fail before any heavy
+        # init (HSTUBlockPreprocessor needs Megatron `parallel_state`).
+        # Tests call `_validate_cp_config` directly on a small
+        # duck-typed config to make the reject branches behavioural.
+        self._validate_cp_config(config)
+
         super().__init__(config=config)
         self._training_dtype = torch.float32
         if self.config.bf16:
@@ -45,38 +96,10 @@ class HSTUBlock(MegatronModule):
             is_inference=config.is_inference, sequence_parallel=config.sequence_parallel
         )
 
-        # Slice 6 T6.4: capture CP plumbing if active. CP is only wired
-        # through the NATIVE HSTU layer (uses `create_hstu_attention(...)`
-        # → `FusedHSTUAttention` which routes to `hstu_attn_varlen_cp_func`).
-        # The FUSED layer uses `fused_hstu_op` (separate triton fusion) and
-        # the DEBUG layer doesn't yet thread CP plumbing through; both are
-        # rejected explicitly so the failure points at the config rather
-        # than at a silent-no-op layer call.
         self._cp_size: int = config.context_parallel_size
         self._cp_group: Optional[dist.ProcessGroup] = None
         self._cp_global_ranks: Optional[Tuple[int, ...]] = None
         if self._cp_size > 1:
-            if config.hstu_layer_type != HSTULayerType.NATIVE:
-                raise ValueError(
-                    "Context Parallelism (cp_size > 1) is only wired through "
-                    f"HSTULayerType.NATIVE in v0; got {config.hstu_layer_type}. "
-                    "Switch to NATIVE or set context_parallel_size=1."
-                )
-            # CP + sequence_parallel are not co-wired in v0. The SP
-            # preprocessor scatters `jd.values` along row-dim by
-            # tp_size (`hstu_processor.py:scatter_to_sequence_parallel_region`),
-            # but the CP dispatch (`apply_dualchunkswap_to_jagged`) indexes
-            # `jd.values` with global `seqlen_offsets` — shape/index
-            # mismatch as soon as both are on. Reject explicitly so the
-            # failure surfaces at config rather than at a silent
-            # out-of-range index inside the dispatch.
-            if config.sequence_parallel:
-                raise ValueError(
-                    "Context Parallelism (cp_size > 1) and sequence_parallel "
-                    "are not co-wired in v0. The SP preprocessor scatters "
-                    "values along the row dim, but CP dispatch indexes with "
-                    "global offsets — they cannot stack. Disable one."
-                )
             self._cp_group = parallel_state.get_context_parallel_group()
             self._cp_global_ranks = tuple(
                 parallel_state.get_context_parallel_global_ranks()
