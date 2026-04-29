@@ -25,15 +25,14 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from hstu import (  # type: ignore[attr-defined]
+from conftest import random_varlen_batch
+from hstu import hstu_attn_varlen_func
+from hstu_attn import (
     GuardError,
     gather_global_from_cp_rank,
     get_batch_on_this_cp_rank_for_hstu,
     hstu_attn_varlen_cp_func,
-    hstu_attn_varlen_func,
 )
-
-from .conftest import random_varlen_batch
 
 
 # ----------------------------------------------------------------------------
@@ -75,6 +74,8 @@ def test_cp1_passthrough_bit_exact(cuda_device: torch.device) -> None:
         v=v,
         cu_seqlens_q=cu,
         cu_seqlens_k=cu,
+        seqused_q=None,
+        seqused_k=None,
         max_seqlen_q=max_s,
         max_seqlen_k=max_s,
         scaling_seqlen=max_s,
@@ -120,6 +121,8 @@ def test_cp1_passthrough_with_explicit_world_size_1(cuda_device: torch.device) -
         v=v,
         cu_seqlens_q=cu,
         cu_seqlens_k=cu,
+        seqused_q=None,
+        seqused_k=None,
         max_seqlen_q=64,
         max_seqlen_k=64,
         scaling_seqlen=64,
@@ -165,7 +168,7 @@ def test_cp1_passthrough_does_not_invoke_distributed(cuda_device: torch.device) 
 
     with patch("torch.distributed.batch_isend_irecv", side_effect=_boom), patch(
         "torch.distributed.get_rank", side_effect=_boom
-    ), patch("hstu.hstu_attn_cp._multi_gpu_forward", side_effect=_boom):
+    ), patch("hstu_attn.hstu_attn_cp._multi_gpu_forward", side_effect=_boom):
         hstu_attn_varlen_cp_func(
             q=q,
             k=k,
@@ -299,13 +302,16 @@ def test_guard_head_dim_unsupported(cuda_device: torch.device) -> None:
 
 
 def test_guard_divisibility(cuda_device: torch.device) -> None:
-    """seqlen not divisible by 2*cp_size fails."""
-    # seqlen=10, cp_size=2 → 2*cp_size=4, 10%4=2 ≠ 0
-    q = torch.randn(10, 2, 32, dtype=torch.bfloat16, device=cuda_device)
+    """Per-rank local seqlen must be even (so the DualChunkSwap two halves
+    are equal). The stronger global divisibility (`L % (2*cp_size) == 0`)
+    is enforced by `get_batch_on_this_cp_rank_for_hstu` at dispatch time.
+    """
+    # seqlen=9 (odd) — local layout can't be split into two equal halves.
+    q = torch.randn(9, 2, 32, dtype=torch.bfloat16, device=cuda_device)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    cu = torch.tensor([0, 10], dtype=torch.int32, device=cuda_device)
-    with fake_cp_group(2) as grp, pytest.raises(GuardError, match="not divisible"):
+    cu = torch.tensor([0, 9], dtype=torch.int32, device=cuda_device)
+    with fake_cp_group(2) as grp, pytest.raises(GuardError, match="not even"):
         hstu_attn_varlen_cp_func(
             q=q,
             k=k,
@@ -314,9 +320,9 @@ def test_guard_divisibility(cuda_device: torch.device) -> None:
             cu_seqlens_k=cu,
             seqused_q=None,
             seqused_k=None,
-            max_seqlen_q=10,
-            max_seqlen_k=10,
-            scaling_seqlen=10,
+            max_seqlen_q=9,
+            max_seqlen_k=9,
+            scaling_seqlen=9,
             num_contexts=None,
             num_targets=None,
             target_group_size=1,
@@ -367,8 +373,18 @@ def test_cp_path_requires_real_pg(cuda_device: torch.device) -> None:
         [16, 16], num_heads=2, head_dim=32, device=cuda_device, seed=0
     )
     with fake_cp_group(2) as grp:
+        # `KeyError` is raised by `dist.get_process_group_ranks(grp)` when grp
+        # is not registered; that's a legitimate way the CP path can fail
+        # against a fake group (no silent passthrough).
         with pytest.raises(
-            (RuntimeError, AttributeError, AssertionError, ValueError, TypeError)
+            (
+                RuntimeError,
+                AttributeError,
+                AssertionError,
+                ValueError,
+                TypeError,
+                KeyError,
+            )
         ):
             hstu_attn_varlen_cp_func(
                 q=q,
@@ -398,7 +414,7 @@ def test_cp_backward_implemented_calls_helper(cuda_device: torch.device) -> None
     """
     import inspect
 
-    from hstu.hstu_attn_cp import _HSTUVarlenCPFunc  # type: ignore[attr-defined]
+    from hstu_attn.hstu_attn_cp import _HSTUVarlenCPFunc  # type: ignore[attr-defined]
 
     src = inspect.getsource(_HSTUVarlenCPFunc.backward)
     assert (

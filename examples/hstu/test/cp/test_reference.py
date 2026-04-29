@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-
-from .conftest import (
+from conftest import (
     CANONICAL_HSTU_PARAMS,
     REFERENCE_MATRIX,
     get_signature_summary,

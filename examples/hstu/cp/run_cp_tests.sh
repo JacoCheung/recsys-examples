@@ -17,6 +17,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Workaround for NCCL CUDA-P2P (CUMEM) hang on A100 PCIe in this image.
+# Without this, batch_isend_irecv enqueues but never completes on the GPU
+# stream, deadlocking the ring loop. Forces NCCL to use Socket transport,
+# which is correctness-equivalent for our small KV exchanges.
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+
 INCLUDE_BWD=0
 SIZES_CSV="2,4,8"
 

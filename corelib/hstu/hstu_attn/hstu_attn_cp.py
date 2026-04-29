@@ -38,7 +38,13 @@ from typing import Optional, Sequence
 import torch
 import torch.distributed as dist
 
-from .hstu_attn_interface import hstu_attn_varlen_func
+# Use the *installed* `hstu.hstu_attn_varlen_func` as the runtime kernel
+# (Global rule 6 — runtime authority). The in-tree `.hstu_attn_interface`
+# is built from a different C-extension and is unavailable in production
+# containers; importing it here would crash before the wrapper is even
+# loaded. The kernel signature pin in `examples/hstu/test/cp/conftest.py`
+# guards against signature drift.
+from hstu import hstu_attn_varlen_func
 
 __all__ = [
     "hstu_attn_varlen_cp_func",
@@ -258,16 +264,21 @@ def _enforce_v0_contract(
         raise GuardError(
             "cu_seqlens_q must equal cu_seqlens_k (HSTU is self-attention only in v0)"
         )
-    # DualChunkSwap divisibility — only meaningful when chunking actually
-    # happens (cp_size > 1).
+    # Local DualChunkSwap layout requirement: each per-sample local length is
+    # `2 * c_b` (chunk_r and chunk_(2cp-1-r) concatenated), so it must be
+    # even. The stronger global divisibility `L_global % (2 * cp_size) == 0`
+    # is the CALLER's responsibility — `get_batch_on_this_cp_rank_for_hstu`
+    # enforces it during dispatch. Re-checking the global rule here would
+    # incorrectly flag the (per-rank) local cu_seqlens, since `local_len =
+    # global_len / cp_size` is divisible by 2 but generally NOT by 2*cp_size.
     if cp_size > 1:
-        chunks_per_seq = 2 * cp_size
         seqlens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
         for b, L in enumerate(seqlens):
-            if L % chunks_per_seq != 0:
+            if L % 2 != 0:
                 raise GuardError(
-                    f"sample {b}: seqlen {L} not divisible by 2*cp_size={chunks_per_seq} "
-                    f"(DualChunkSwap requirement; pre-pad in caller)"
+                    f"sample {b}: local seqlen {L} not even (each rank's "
+                    f"DualChunkSwap layout is 2*c_b per sample). Verify the "
+                    f"caller used `get_batch_on_this_cp_rank_for_hstu` for dispatch."
                 )
 
 
@@ -349,6 +360,8 @@ def _diag_call(
         v=v_loc,
         cu_seqlens_q=cu_loc,
         cu_seqlens_k=cu_loc,
+        seqused_q=None,
+        seqused_k=None,
         max_seqlen_q=local_max,
         max_seqlen_k=local_max,
         scaling_seqlen=scaling_seqlen,
@@ -357,6 +370,7 @@ def _diag_call(
         target_group_size=1,
         window_size=(-1, 0),
         alpha=alpha,
+        quant_mode=-1,
     )
 
 
@@ -369,6 +383,8 @@ def _lower_call(
         v=v_pad,
         cu_seqlens_q=cu_loc,
         cu_seqlens_k=cu_loc,
+        seqused_q=None,
+        seqused_k=None,
         max_seqlen_q=local_max,
         max_seqlen_k=local_max,
         scaling_seqlen=scaling_seqlen,
@@ -377,6 +393,7 @@ def _lower_call(
         target_group_size=1,
         window_size=(-1, -1),
         alpha=alpha,
+        quant_mode=-1,
     )
 
 
@@ -397,6 +414,8 @@ def _upper_call(
         v=v_full,
         cu_seqlens_q=cu_q_half,
         cu_seqlens_k=cu_full,
+        seqused_q=None,
+        seqused_k=None,
         max_seqlen_q=half_max,
         max_seqlen_k=local_max,
         scaling_seqlen=scaling_seqlen,
@@ -405,6 +424,7 @@ def _upper_call(
         target_group_size=1,
         window_size=(-1, -1),
         alpha=alpha,
+        quant_mode=-1,
     )
 
 
@@ -445,13 +465,24 @@ def _ring_send_recv_kv(
         raise ValueError(
             f"direction must be 'forward' or 'backward'; got {direction!r}"
         )
-    ops = [
-        dist.P2POp(dist.isend, cur_k, dst, group=cp_group),
-        dist.P2POp(dist.isend, cur_v, dst, group=cp_group),
-        dist.P2POp(dist.irecv, recv_k, src, group=cp_group),
-        dist.P2POp(dist.irecv, recv_v, src, group=cp_group),
-    ]
-    return dist.batch_isend_irecv(ops)
+    # NCCL `batch_isend_irecv` reliably handles a single send/recv pair per
+    # batch. Bundling K and V into a 4-op batch hangs in some NCCL/torch
+    # combinations (verified on the production image's NCCL on A100 PCIe).
+    # Issue K and V as two separate 2-op batches; caller gets one combined
+    # Work list to wait on.
+    reqs_k = dist.batch_isend_irecv(
+        [
+            dist.P2POp(dist.isend, cur_k, dst, group=cp_group),
+            dist.P2POp(dist.irecv, recv_k, src, group=cp_group),
+        ]
+    )
+    reqs_v = dist.batch_isend_irecv(
+        [
+            dist.P2POp(dist.isend, cur_v, dst, group=cp_group),
+            dist.P2POp(dist.irecv, recv_v, src, group=cp_group),
+        ]
+    )
+    return list(reqs_k) + list(reqs_v)
 
 
 # ----------------------------------------------------------------------------
@@ -615,6 +646,8 @@ def _per_tile_partial_grads(
             v=v_in,
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
+            seqused_q=None,
+            seqused_k=None,
             max_seqlen_q=max_q,
             max_seqlen_k=max_k,
             scaling_seqlen=scaling_seqlen,
@@ -623,6 +656,7 @@ def _per_tile_partial_grads(
             target_group_size=1,
             window_size=window_size,
             alpha=alpha,
+            quant_mode=-1,
         )
         dq, dk, dv = torch.autograd.grad(out, (q_in, k_in, v_in), dout_partial)
     return dq.detach(), dk.detach(), dv.detach()
@@ -804,14 +838,23 @@ def _multi_gpu_backward(
     for step, dk_p, dv_p in dkv_to_send:
         send_dst = cp_global_ranks[(cp_rank - step) % cp_size]
         recv_src = cp_global_ranks[(cp_rank + step) % cp_size]
-        ops = [
-            dist.P2POp(dist.isend, dk_p.contiguous(), send_dst, group=cp_group),
-            dist.P2POp(dist.isend, dv_p.contiguous(), send_dst, group=cp_group),
-            dist.P2POp(dist.irecv, recv_dk, recv_src, group=cp_group),
-            dist.P2POp(dist.irecv, recv_dv, recv_src, group=cp_group),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for r in reqs:
+        # Two separate 2-op batches: see _ring_send_recv_kv comment for why a
+        # 4-op batch hangs on the production NCCL.
+        reqs_k = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, dk_p.contiguous(), send_dst, group=cp_group),
+                dist.P2POp(dist.irecv, recv_dk, recv_src, group=cp_group),
+            ]
+        )
+        for r in reqs_k:
+            r.wait()
+        reqs_v = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, dv_p.contiguous(), send_dst, group=cp_group),
+                dist.P2POp(dist.irecv, recv_dv, recv_src, group=cp_group),
+            ]
+        )
+        for r in reqs_v:
             r.wait()
         dk_acc += recv_dk.float()
         dv_acc += recv_dv.float()
@@ -1004,22 +1047,25 @@ def hstu_attn_varlen_cp_func(
         )
 
     # 3. cp_size == 1 short-circuit. After guards have rejected non-v0 modes,
-    #    the call is just the bare in-tree kernel with the v0-only kwargs.
+    #    the call is just the bare installed kernel with the v0-only kwargs.
     if cp_size == 1:
         return hstu_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            scaling_seqlen=scaling_seqlen,
             num_contexts=None,
             num_targets=None,
             target_group_size=1,
             window_size=window_size,
             alpha=alpha,
-            scaling_seqlen=scaling_seqlen,
+            quant_mode=-1,
         )
 
     # 4. Multi-GPU CP path. cp_global_ranks defaults to the absolute world-rank

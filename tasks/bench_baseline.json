@@ -1,0 +1,62 @@
+{
+  "commit": "2ed0fb1b",
+  "device": "NVIDIA A100 80GB PCIe",
+  "warmup": 50,
+  "iters": 30,
+  "shapes": [
+    {
+      "label": "h2_d32_b4_s64",
+      "median_ms": 0.0567245006095618,
+      "p95_ms": 0.07259899575728923,
+      "tokens_per_s": 4513041.053672092,
+      "total_tokens": 256,
+      "warmup": 50,
+      "iters": 30
+    },
+    {
+      "label": "h2_d64_b4_s256",
+      "median_ms": 0.05485400470206514,
+      "p95_ms": 0.06510999810416251,
+      "tokens_per_s": 18667734.572193388,
+      "total_tokens": 1024,
+      "warmup": 50,
+      "iters": 30
+    },
+    {
+      "label": "h4_d64_b8_s512",
+      "median_ms": 0.06853949889773503,
+      "p95_ms": 0.08169899228960276,
+      "tokens_per_s": 59761160.58437301,
+      "total_tokens": 4096,
+      "warmup": 50,
+      "iters": 30
+    },
+    {
+      "label": "h4_d128_b8_s1024",
+      "median_ms": 0.12896399857709184,
+      "p95_ms": 0.132219007355161,
+      "tokens_per_s": 63521603.628806554,
+      "total_tokens": 8192,
+      "warmup": 50,
+      "iters": 30
+    },
+    {
+      "label": "h8_d128_b8_s4096",
+      "median_ms": 1.6810180022730492,
+      "p95_ms": 1.6877379966899753,
+      "tokens_per_s": 19492950.078875754,
+      "total_tokens": 32768,
+      "warmup": 50,
+      "iters": 30
+    },
+    {
+      "label": "h8_d128_b8_s8192",
+      "median_ms": 6.084375003410969,
+      "p95_ms": 6.125554005848244,
+      "tokens_per_s": 10771196.706853174,
+      "total_tokens": 65536,
+      "warmup": 50,
+      "iters": 30
+    }
+  ]
+}

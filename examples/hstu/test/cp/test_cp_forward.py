@@ -40,12 +40,8 @@ from typing import Iterator
 import pytest
 import torch
 import torch.distributed as dist
-from hstu import (  # type: ignore[attr-defined]
-    get_batch_on_this_cp_rank_for_hstu,
-    hstu_attn_varlen_cp_func,
-)
-
-from .conftest import random_varlen_batch, single_gpu_baseline_fwd
+from conftest import random_varlen_batch, single_gpu_baseline_fwd
+from hstu_attn import get_batch_on_this_cp_rank_for_hstu, hstu_attn_varlen_cp_func
 
 
 def _alpha_for(head_dim: int) -> float:
