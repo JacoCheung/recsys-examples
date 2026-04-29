@@ -43,11 +43,31 @@ from typing import Sequence
 # stand-ins for production data; replace with empirical samples per
 # dataset when available. Values are global per-sample seqlens (one
 # entry per sample in a typical batch).
+#
+# IMPORTANT: production seqlens are usually NOT power-of-2 (they are
+# raw user-history lengths). The "raw_*" distributions below model
+# this. The earlier "synthetic_*" buckets were pure power-of-2 which
+# masked real padding behaviour — flagged in code review and kept
+# here only as a "best case" reference. Default has been switched to
+# `raw_recsys`; opt into the bucketed forms with --distribution.
 DISTRIBUTIONS: dict[str, list[int]] = {
+    # Realistic non-bucketed recsys seqlens (mix of small primes,
+    # round numbers, and odd values that commonly appear in raw
+    # user-history data). This is the default — running this against
+    # any cp_size > 4 should produce a non-zero padding fraction so
+    # the analyser is visibly informative.
+    "raw_recsys": (
+        [3, 5, 7, 11, 13, 17, 23, 29, 31, 37] * 4
+        + [50, 75, 100, 150, 250, 300, 500] * 5
+        + [700, 850, 1100, 1300, 1700, 2300] * 3
+        + [3500, 4900, 7300] * 2
+    ),
     # Roughly approximates typical movie/short-video user histories
     # (KuaiRand-1k, MovieLens-32M trim): bimodal — many short users
-    # and a tail of long ones.
-    "synthetic_recsys": (
+    # and a tail of long ones. NB: power-of-2 buckets, so always 0%
+    # padding for any cp_size with 2*cp_size ≤ 16. This is the
+    # best-case, not the realistic case.
+    "synthetic_recsys_pow2": (
         [16] * 30
         + [32] * 30
         + [64] * 25
@@ -58,11 +78,16 @@ DISTRIBUTIONS: dict[str, list[int]] = {
         + [2048] * 3
         + [4096] * 1
     ),
-    # Pure ranking-style: shorter histories, less long-tail.
-    "synthetic_ranking": ([32] * 50 + [64] * 40 + [128] * 30 + [256] * 15 + [512] * 5),
+    # Pure ranking-style: shorter histories, less long-tail. Same
+    # pow2 caveat as synthetic_recsys_pow2.
+    "synthetic_ranking_pow2": (
+        [32] * 50 + [64] * 40 + [128] * 30 + [256] * 15 + [512] * 5
+    ),
     # KuaiRand-1k specific approximation. Real numbers should be
-    # plugged in from `kuairand_1k` raw data once available.
-    "kuairand_1k_approx": (
+    # plugged in from `kuairand_1k` raw data once available; the
+    # bucketed form only models the bucket *means*, not the within-
+    # bucket variance which is what drives padding cost.
+    "kuairand_1k_approx_pow2": (
         [16] * 25
         + [32] * 35
         + [64] * 30
@@ -83,8 +108,21 @@ def _round_up_to(x: int, multiple: int) -> int:
 
 
 def _measure(seqlens: Sequence[int], cp_size: int) -> dict:
-    """Compute padding cost for one (distribution, cp_size) pair."""
+    """Compute padding cost for one (distribution, cp_size) pair.
+
+    cp_size == 1 has no DualChunkSwap (pre-CP path; padding is
+    whatever the underlying kernel needs, which is independent of
+    CP). Report 0% padding for cp=1 to keep the verdict honest.
+    """
     raw = sum(seqlens)
+    if cp_size <= 1:
+        return {
+            "cp_size": cp_size,
+            "raw_tokens": raw,
+            "padded_tokens": raw,
+            "padding_only": 0,
+            "padding_fraction": 0.0,
+        }
     padded_per_sample = [_round_up_to(s, 2 * cp_size) for s in seqlens]
     padded = sum(padded_per_sample)
     pad_only = padded - raw
@@ -126,7 +164,7 @@ def main() -> None:
     parser.add_argument(
         "--distribution",
         choices=list(DISTRIBUTIONS.keys()),
-        default="synthetic_recsys",
+        default="raw_recsys",
     )
     parser.add_argument(
         "--custom",

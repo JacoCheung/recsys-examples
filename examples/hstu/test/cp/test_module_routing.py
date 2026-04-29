@@ -130,6 +130,8 @@ def test_cp_group_size_4_routes_to_cp_wrapper(cuda_device: torch.device) -> None
     from modules.hstu_attention import FusedHSTUAttention
 
     expected_ranks = [0, 1, 2, 3]
+    # Use a sentinel CUDA stream so we can verify it is forwarded.
+    expected_stream = torch.cuda.Stream(device=cuda_device)
     with _fake_cp_group(4) as grp:
         attn = FusedHSTUAttention(
             num_heads=2,
@@ -138,6 +140,7 @@ def test_cp_group_size_4_routes_to_cp_wrapper(cuda_device: torch.device) -> None
             is_causal=True,
             cp_group=grp,
             cp_global_ranks=expected_ranks,
+            cp_stream=expected_stream,
         )
         tq, tk, tv, cu = _build_jagged_inputs(
             batch=4, seqlen=64, num_heads=2, head_dim=32, device=cuda_device
@@ -166,6 +169,10 @@ def test_cp_group_size_4_routes_to_cp_wrapper(cuda_device: torch.device) -> None
     call_kwargs = cp_spy.call_args.kwargs
     assert call_kwargs["cp_group"] is grp
     assert tuple(call_kwargs["cp_global_ranks"]) == tuple(expected_ranks)
+    # cp_stream forwarding (Codex round-2 NIT): a dropped kwarg here
+    # would silently disable two-stream comm/compute overlap on the
+    # CP path without breaking any other test.
+    assert call_kwargs["cp_stream"] is expected_stream
 
 
 def test_cp_rejects_heterogeneous_mask(cuda_device: torch.device) -> None:

@@ -126,11 +126,16 @@ checkpoint is signed.
     | h4_d128_b8_s8192     | 3.323   | 3.534   | **1.06×** | **PASS** |
     | h8_d128_b4_s8192     | 3.316   | 3.392   | **1.02×** | **PASS** |
     cp=2 at s≥4096 also lands at ratio 1.17–1.76 (s8192/s4096
-    respectively); cp=2 at s2048 = 3.18×. Conclusion: the gate is a
-    long-context gate — CP wins only when local attention compute
-    >> per-step P2P latency. For HSTU production seqlens (8K-32K
-    user history), CP is a net win on NVLink. For shorter shapes,
-    pure DP scales better.
+    respectively); cp=2 at s2048 = 3.18×.
+    **Honest framing**: at every shape measured cp=4 is still
+    *slightly* slower than cp=1 in absolute wall-clock — the gate
+    is "overhead is acceptable", not "CP is faster". CP is a
+    **memory-wall enabler** (run shapes that single-GPU cannot fit
+    at all), not a speedup. The 1.5× gate exists so the overhead
+    does not exceed what data-parallel scaling could otherwise
+    recover. Numbers support that gate at s≥8192 (cp=4: 1.06×,
+    cp=2: 1.17×) and miss it at shorter shapes (where CP would
+    likely not be chosen anyway because single-GPU still fits).
 
 ### ✅ Checkpoint D — perf decision
 
