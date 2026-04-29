@@ -243,7 +243,14 @@ def test_block_cp_rejects_fused_layer(cuda_device: torch.device) -> None:
     TP world size — that requires `initialize_model_parallel(...)`
     which we don't run in unit tests. So we check the reject by directly
     calling the same logic the constructor uses, not by instantiating
-    HSTUBlock.  Verifies the `_cp_size > 1 + non-NATIVE` branch."""
+    HSTUBlock.  Verifies the `_cp_size > 1 + non-NATIVE` branch.
+
+    TODO: when the preprocessor/parallel-state init can be cheaply
+    isolated (e.g. via a thin Megatron-init fixture), upgrade this to
+    `pytest.raises(ValueError): HSTUBlock(fake_config)` for behavioural
+    coverage. The current source-string assert is a weaker guard than
+    behavioural instantiation, per Codex round-2 note.
+    """
     from configs.hstu_config import HSTULayerType
 
     # Replicate HSTUBlock.__init__'s reject logic verbatim.  If this
