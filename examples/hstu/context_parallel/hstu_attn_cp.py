@@ -425,28 +425,59 @@ def _enforce_v0_contract(
     quant_mode: Optional[int],
     cp_size: int,
 ) -> None:
-    # 1-2. Heterogeneous mask
-    if num_contexts is not None:
-        raise GuardError(f"num_contexts is not supported in v0 ({_SPEC_REF})")
-    if num_targets is not None:
-        raise GuardError(f"num_targets is not supported in v0 ({_SPEC_REF})")
-    # 3. target_group_size != 1 (v0 supports only the default size 1)
-    if target_group_size != 1:
-        raise GuardError(
-            f"target_group_size != 1 is not supported in v0 (got {target_group_size}; {_SPEC_REF})"
-        )
-    # 4. window_size != (-1, 0)
-    ws = tuple(window_size)
-    if ws != _SUPPORTED_WINDOW_SIZE:
-        raise GuardError(
-            f"window_size={ws} not supported in v0; only causal (-1, 0) ({_SPEC_REF})"
-        )
-    # 5. rab / has_drab
+    # 1-4. Heterogeneous mask + sliding-causal + arbitrary `func`.
+    #
+    # These five mask-shaping params are SUPPORTED at cp_size == 1 (the
+    # wrapper short-circuits to the bare installed kernel which handles
+    # them natively). For cp_size > 1 they remain rejected pending the
+    # het-mask-via-`func` integration tracked in
+    # `docs/cp/het_mask_design.md`. The CP path will eventually translate
+    # 4-tuple specs (num_contexts, num_targets, target_group_size,
+    # window_size) into per-step `func` tensors and remove the hard reject
+    # below; sliding-causal-under-CP follows the same path
+    # (`docs/cp/v0.5_sliding_causal.md`).
+    if cp_size > 1:
+        ws = tuple(window_size)
+        if num_contexts is not None:
+            raise GuardError(
+                f"num_contexts not yet supported under CP (cp_size>1); see "
+                f"docs/cp/het_mask_design.md for the in-progress integration. "
+                f"At cp_size==1 the wrapper forwards num_contexts to the "
+                f"kernel directly. ({_SPEC_REF})"
+            )
+        if num_targets is not None:
+            raise GuardError(
+                f"num_targets not yet supported under CP (cp_size>1); see "
+                f"docs/cp/het_mask_design.md. At cp_size==1 the wrapper "
+                f"forwards num_targets to the kernel directly. ({_SPEC_REF})"
+            )
+        if target_group_size != 1:
+            raise GuardError(
+                f"target_group_size != 1 not yet supported under CP "
+                f"(cp_size>1); see docs/cp/het_mask_design.md. Got "
+                f"{target_group_size}. ({_SPEC_REF})"
+            )
+        if ws != _SUPPORTED_WINDOW_SIZE:
+            raise GuardError(
+                f"window_size={ws} not yet supported under CP (cp_size>1); "
+                f"v0 ships only causal (-1, 0). Sliding-causal-under-CP "
+                f"shares the same `func`-tensor remedy path as het-mask "
+                f"(see docs/cp/het_mask_design.md and "
+                f"docs/cp/v0.5_sliding_causal.md). ({_SPEC_REF})"
+            )
+        if func is not None:
+            raise GuardError(
+                f"explicit `func` tensor not yet plumbed through the CP "
+                f"path; ring P2P needs per-step func rebuild "
+                f"(docs/cp/het_mask_design.md §5). At cp_size==1 the wrapper "
+                f"forwards `func` to the kernel directly. ({_SPEC_REF})"
+            )
+    # 5. rab / has_drab — out of v0 scope at any cp_size.
     if rab is not None:
         raise GuardError(f"rab is not supported in v0 ({_SPEC_REF})")
     if has_drab:
         raise GuardError(f"has_drab=True is not supported in v0 ({_SPEC_REF})")
-    # 6-9. KV cache + paging
+    # 6-9. KV cache + paging — out of v0 scope at any cp_size.
     if kv_cache is not None:
         raise GuardError(f"kv_cache is not supported in v0 ({_SPEC_REF})")
     if page_offsets is not None:
@@ -455,9 +486,6 @@ def _enforce_v0_contract(
         raise GuardError(f"page_ids is not supported in v0 ({_SPEC_REF})")
     if last_page_lens is not None:
         raise GuardError(f"last_page_lens is not supported in v0 ({_SPEC_REF})")
-    # 10. func (post-attention hook)
-    if func is not None:
-        raise GuardError(f"func hook is not supported in v0 ({_SPEC_REF})")
     # 11. quant_mode (only `-1` (== off) is allowed; both `None` and any other
     #     int are rejected so users can't accidentally bypass quantisation
     #     guards by leaving the kwarg unset on a build that defaults to None).
@@ -1326,7 +1354,14 @@ def hstu_attn_varlen_cp_func(
         )
 
     # 3. cp_size == 1 short-circuit. After guards have rejected non-v0 modes,
-    #    the call is just the bare installed kernel with the v0-only kwargs.
+    #    the call is just the bare installed kernel. cp_size==1 forwards the
+    #    user-supplied heterogeneous-mask params (`num_contexts`,
+    #    `num_targets`, `target_group_size`, `window_size`, `func`) to the
+    #    kernel directly — at cp_size==1 there is no DualChunkSwap reordering,
+    #    so the kernel handles them natively. cp_size > 1 paths still reject
+    #    these (see `_enforce_v0_contract`); the
+    #    `docs/cp/het_mask_design.md` track will lift the cp_size > 1
+    #    rejection by translating the mask spec into a per-step `func` tensor.
     if cp_size == 1:
         return hstu_attn_varlen_func(
             q=q,
@@ -1339,11 +1374,12 @@ def hstu_attn_varlen_cp_func(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             scaling_seqlen=scaling_seqlen,
-            num_contexts=None,
-            num_targets=None,
-            target_group_size=1,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
             window_size=window_size,
             alpha=alpha,
+            func=func,
             quant_mode=-1,
         )
 

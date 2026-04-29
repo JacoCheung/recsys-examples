@@ -15,49 +15,75 @@ that track.
 
 **Pre-reads**: SPEC §2 (current v0 reject list), `hstu_cp_design.md`
 §3 (DualChunkSwap chunk geometry), kernel sources at
-`corelib/hstu/csrc/hstu_attn/src/hstu_fwd.h` and `hstu_bwd.h`.
+`third_party/FBGEMM/fbgemm_gpu/experimental/hstu/src/hstu_ampere/hstu_fwd.h`
+and `hstu_bwd.h` (the FBGEMM submodule is the production source of
+truth; the in-tree `corelib/hstu/` is deprecated and intentionally
+ignored here).
 
 ---
 
 ## 1. Kernel `func` interface — what it actually is
 
-The HSTU kernel signature already accepts a `func` parameter
-(`Optional[torch.Tensor]`). Reading the C++/CUDA implementation:
+The FBGEMM HSTU kernel signature already accepts a `func` parameter
+(`Optional[torch.Tensor]`). Reading the C++/CUDA implementation
+under `third_party/FBGEMM/fbgemm_gpu/experimental/hstu/src/hstu_ampere/`:
 
-- `hstu_api.cpp:170-183`: `func` is `int32`, shape
-  `(B, H, n_func, seqlen_q)` where `n_func == HSTU_ARBITRARY_NFUNC`
-  (compile-time constant; `Makefile` default = 3 for the in-tree
-  build, the FBGEMM-style installed kernel must be checked at
+- `hstu_ops_gpu.cpp:198-215`: `func` is `int32`, shape
+  `(B, H, NFUNC, max_seqlen_q)` where `NFUNC == HSTU_ARBITRARY_NFUNC`
+  (compile-time constant; FBGEMM build default needs to be probed at
   runtime — see open question A).
-- The pointer is treated as **two** stacked tensors,
-  `MaxFunc[n_func, seqlen_q]` and `MinFunc[n_func, seqlen_q]`,
-  separated by `func_ids_stride`.
-- For each `(b, h, q_row)` the kernel reads up to `n_func` interval
-  endpoints encoding a **union of at most `n_func` disjoint K
-  intervals**:
-    - First interval is implicitly `[0, MaxFunc[0, q_row])`.
-    - Subsequent intervals are
-      `[MinFunc[j, q_row], MaxFunc[j+1, q_row])` for
-      `j = 0 … n_func - 1`.
-- `hstu_fwd.h:547-558` evaluates `(q_row, col)` cell:
+- The Python docstring says `(nheads, total_q + 256)`; that is wrong —
+  the C++ side and the FBGEMM tests
+  (`third_party/FBGEMM/fbgemm_gpu/experimental/hstu/test/hstu_test.py:401-409`)
+  build the tensor as `(B, H, NFUNC, max_seqlen_q)`.
+- The kernel's `mMaxFunc`/`mMinFunc` views (`hstu_fwd.h:155-168`)
+  interleave the NFUNC axis: stride `2 * func_ids_stride` along that
+  dim. Slot `0` is `MaxFunc[0]`, slot `1` is `MinFunc[0]`, slot `2` is
+  `MaxFunc[1]`, slot `3` is `MinFunc[1]`, etc.
+- For each `(b, h, q_row)` the kernel reads
+  `NFUNC // 2 + 1` upper bounds and `NFUNC // 2` lower bounds,
+  encoding up to **`NFUNC // 2 + 1` disjoint K intervals**:
+    - Interval `0` is implicitly `[0, func[b, h, 0, q_row])`.
+    - Interval `k ≥ 1` is
+      `[func[b, h, 2k-1, q_row], func[b, h, 2k, q_row])`.
+- `hstu_fwd.h:543-558` evaluates `(q_row, col)`:
   ```cpp
   non_mask = (0 <= col) && (col < col_max[0]);
   if (non_mask) continue;            // in window: keep score
-  for (j = 0; j < n_func; ++j) {
+  for (j = 0; j < size<0>(gMinFunc); ++j) {
       non_mask = (col_min[j] <= col) && (col < col_max[j+1]);
       if (non_mask) break;
   }
   if (!non_mask) tSrS_view = -INFINITY;  // out of window: drop score
   ```
-  Cells inside any of the `n_func` intervals are kept, others
-  zeroed.
-- Backward (`hstu_bwd.h:139-148`) reads the **same** `MaxFunc` /
+  Cells inside any of the encoded intervals are kept, others zeroed.
+- Backward (`hstu_bwd.h:152-168`) reads the **same** `MaxFunc` /
   `MinFunc` tensor — fwd/bwd "symmetric" (a single mask description
   drives both passes).
 - `is_arbitrary_mask = func.defined()` — when `func` is provided,
-  the kernel switches into arbitrary-mask mode and the built-in
-  `(num_contexts, num_targets, target_group_size, window_size)`
-  branches are bypassed.
+  the kernel **intersects** the arbitrary intervals with whichever
+  structured masks (`Is_causal` / `Is_local` / `Is_target` /
+  `Is_context`) are also enabled. Reading `hstu_fwd.h:519-558`:
+  structured masks zero out-of-region cells first; the arbitrary
+  intervals then zero anything not covered. Net result: a cell is
+  kept iff it passes structured AND arbitrary.
+- **Practical implication**: callers using `func` to express the
+  full mask should pass `window_size=(-1, -1)` (disables both
+  `Is_causal` and `Is_local`), set `num_contexts=None`,
+  `num_targets=None`, `target_group_size=1`, and encode every
+  mask constraint inside the `func` intervals. Otherwise the
+  structured layer "double-applies" and over-restricts. Verified
+  against FBGEMM tests at
+  `third_party/FBGEMM/fbgemm_gpu/experimental/hstu/test/hstu_test.py:401-442`
+  where the "emulate causal" / "emulate local" examples set
+  `is_causal=False, is_local=False, is_target=False` and put the
+  full causal/sliding constraint into `func`.
+
+For `NFUNC = 3`: 2 disjoint intervals max per Q row. Walking the
+PT reference (`examples/hstu/ops/pt_ops/pt_hstu_attention.py:46-105`)
+shows the standard HSTU mask families never exceed 2 intervals per
+Q row — even history+contextual+target_group+sliding combinations
+fit. So NFUNC=3 is sufficient for production v1 het-mask under CP.
 
 This is exactly the cell-level mask facility I claimed (incorrectly)
 the kernel did not expose. Owner correctly flagged this; the v0.5
@@ -115,28 +141,36 @@ CP-awareness lives in the **Layer 2 → Layer 3** materialisation step:
 
 ## 4. Open questions (need owner decision before coding)
 
-### A. `HSTU_ARBITRARY_NFUNC` value at runtime
+### A. `HSTU_ARBITRARY_NFUNC` value at runtime — RESOLVED
 
-The in-tree `Makefile` builds with `NFUNC=3` (default). The
-production-installed FBGEMM-style `hstu` package may ship with a
-different value (or no arbitrary-mask support at all if the build
-didn't enable it). v0.5-style fallback (kernel does not have
-arbitrary-mask compiled in) needs to be detected and handled with
-a clear error.
+The production container's pre-installed `hstu` package
+(`/usr/local/lib/python3.12/dist-packages/hstu/`) was built with
+`HSTU_ARBITRARY_NFUNC=0` and `HSTU_DISABLE_ARBITRARY=FALSE` —
+runtime probe (passing a small `func` tensor to
+`hstu_attn_varlen_func`) raises:
 
-**Detection plan**: at wrapper init, call `hstu_attn_varlen_func`
-once with a tiny dummy `func` tensor and catch the
-`is_arbitrary_mask` failure. If it errors, set a module-level flag
-and reject CP+heterogeneous-mask with a message that points users
-at the kernel rebuild step.
+  > RuntimeError: This hstu attention build does not support
+  > arbitrary mask.
 
-**Question for owner**: do we have control over the FBGEMM build,
-or must we treat NFUNC as an external-input value we discover at
-runtime? If we control it, what value do production ranking models
-need? (Worst HSTU mask is contextual + group-causal-within-target +
-sliding window: that's 1 prefix-block-row + 1 history-up-to-q +
-1 target-group-row = 3 intervals. NFUNC=3 looks tight but feasible
-for v1 of het-mask under CP.)
+(Verified 2026-04-29 against the existing PCIe container
+`computelab-job-1994669`.)
+
+**Resolution (chosen 2026-04-29)**: rebuild the FBGEMM hstu kernel
+from `third_party/FBGEMM/fbgemm_gpu/experimental/hstu/setup.py`
+inside the container with
+`HSTU_ARBITRARY_NFUNC=3 HSTU_ARCH_LIST=8.0
+ HSTU_DISABLE_ARBITRARY=FALSE` (the default already has
+`DISABLE_ARBITRARY=FALSE`; the only required override is
+`ARBITRARY_NFUNC=3`). `pip install --user .` overlays
+`~/.local/lib/python3.12/site-packages/hstu/` which precedes the
+system path → `import hstu` resolves to the rebuilt module. NFUNC
+must be odd (`setup.py:243-244`); 3 is the smallest legal value
+that supports the 2-interval ceiling HSTU's standard masks need.
+
+**Followup**: a permanent fix is to update the production container
+build to enable arbitrary-mask by default; this branch's user-site
+overlay is a stopgap for development. Document the rebuild step in
+`USER_GUIDE.md` until the production image picks it up.
 
 ### B. Layer 2 interface shape — `mask_mod` callable vs explicit `func` tensor
 
