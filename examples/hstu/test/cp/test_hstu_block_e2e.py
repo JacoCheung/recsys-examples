@@ -90,7 +90,9 @@ def cp_world() -> Iterator[dict]:
     # (lines 65-79) destroys the TP and DP-with-CP groups before
     # `destroy_model_parallel()`; mirror that order here so any
     # in-process re-import sees a clean state.
-    dist.barrier()
+    import gc
+
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     if parallel_state.model_parallel_is_initialized():
         if parallel_state.get_tensor_model_parallel_world_size() == 1:
             torch.distributed.destroy_process_group(
@@ -101,6 +103,7 @@ def cp_world() -> Iterator[dict]:
             )
         parallel_state.destroy_model_parallel()
     torch.cuda.empty_cache()
+    gc.collect()
 
 
 def _build_fixed_length_batch(
@@ -286,38 +289,42 @@ def test_hstu_block_e2e_forward_backward(cp_world: dict) -> None:
             n_with_grad += 1
     assert n_with_grad > 0, f"rank {rank}: no block parameter received a gradient"
 
-    # 6. CP backward distribution check (Codex round-2 Q2): with
-    # CP, each rank computes a PARTIAL gradient on its local Q
-    # chunk; the full gradient is `sum_over_cp_ranks(partial)`,
-    # and Megatron's `finalize_model_grads` performs that all-reduce
-    # before the optimizer step. So each rank's pre-reduce
-    # `param.grad` is generally DIFFERENT from every other rank's,
-    # and the previous "params equal across ranks" assertion was
-    # semantically wrong (it passed under bf16 noise + 1% tolerance).
+    # 6. CP-distinguishing backward check (Codex round-3 Q2): the
+    # right invariant is the INVERSE of round-1's broken assertion.
+    # Real CP: each rank computes a PARTIAL gradient on its own Q
+    # chunk; per-rank pre-reduce `param.grad` MUST DIFFER across
+    # ranks because each rank backprops different Q rows.
+    # CP-disabled fallback (every rank runs the full batch
+    # locally): pre-reduce grads are IDENTICAL across ranks.
     #
-    # Sound replacement: all-reduce(SUM) the embedding-input grad
-    # across ranks. The sum should be larger than any single rank's
-    # contribution — concretely, the L1 norm of the all-reduced
-    # grad must be > 1.05× any single rank's pre-reduce L1 norm.
-    # If CP backward short-circuited to a local-only path (no
-    # reverse ring), every rank would compute the SAME full grad
-    # locally and the all-reduce would just multiply by world_size,
-    # giving sum / per-rank ≈ world_size. With CP correctly
-    # distributing, sum / per-rank should be O(1) — partial grads
-    # differ across ranks and reduce to the full grad.
-    pre_reduce_l1 = embedding_values.grad.detach().float().abs().sum().item()
-    reduced_grad = embedding_values.grad.detach().float().clone()
-    dist.all_reduce(reduced_grad, op=dist.ReduceOp.SUM)
-    post_reduce_l1 = reduced_grad.abs().sum().item()
-    # Sanity: post-reduce must be at least the pre-reduce on any rank
-    # (sum of non-negative |grad| terms only grows). This is a weak
-    # but symmetric check — the strong "world_size×" failure mode
-    # from a CP-disabled fallback would still leave post_reduce
-    # bounded above by world_size × max_per_rank, but the test
-    # primarily verifies: (a) all_reduce ran without hang (so the
-    # CP group has live members), (b) the embedding grad is
-    # non-trivially populated on this rank.
-    assert (
-        post_reduce_l1 >= pre_reduce_l1 - 1e-6
-    ), f"rank {rank}: all_reduce reduced grad magnitude — impossible for SUM op"
-    assert post_reduce_l1 > 0, f"rank {rank}: all-reduced grad is zero"
+    # So the test for "CP backward actually fired" is: per-rank
+    # pre-reduce grad signature should differ from rank 0's
+    # signature by a non-trivial relative amount.
+    #
+    # Round-1 asserted equality (wrong direction; passed by bf16
+    # noise). Round-2 asserted post-reduce monotonicity (passes
+    # trivially under CP-disabled — `post = world_size × pre` still
+    # satisfies post >= pre, per Codex round-3 BLOCKER).
+    grad_sig = sum(
+        p.grad.detach().float().abs().sum().item()
+        for p in block.parameters()
+        if p.grad is not None
+    )
+    sig_t = torch.tensor([grad_sig], device=device, dtype=torch.float64)
+    sig_other = torch.zeros_like(sig_t)
+    if rank == 0:
+        for r in range(1, world_size):
+            dist.send(sig_t, dst=r)
+    else:
+        dist.recv(sig_other, src=0)
+        # Real CP produces non-trivially different partials across
+        # ranks. Threshold 0.5% relative diff catches the
+        # "identical-grad CP-disabled" failure mode while staying
+        # above bf16 numerical noise (~0.01% from the same input).
+        rel_diff = abs(grad_sig - sig_other.item()) / max(sig_other.item(), 1e-9)
+        assert rel_diff > 5e-3, (
+            f"rank {rank}: grad signature {grad_sig:.6f} matches rank 0 "
+            f"{sig_other.item():.6f} (rel diff {rel_diff:.6f}) — looks "
+            "like CP-disabled fallback (every rank ran the full batch "
+            "locally instead of CP-sharded backward)."
+        )
