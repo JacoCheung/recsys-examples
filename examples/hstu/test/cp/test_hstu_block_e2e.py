@@ -84,21 +84,35 @@ def cp_world() -> Iterator[dict]:
         world_size=world_size,
         device=torch.device(f"cuda:{rank}"),
     )
+    # Teardown: destroy parallel state so a re-imported test (or
+    # follow-up parametrize cell) starts clean. Codex round-1 Q3 —
+    # without this, `model_parallel_is_initialized()` short-circuits
+    # subsequent inits and reuses the cp=N group from the first run.
     dist.barrier()
+    if parallel_state.model_parallel_is_initialized():
+        parallel_state.destroy_model_parallel()
 
 
-def _build_random_batch(
+def _build_fixed_length_batch(
     *,
     batch_size: int,
-    max_seqlen: int,
+    seqlen: int,
     seed: int,
     device: torch.device,
 ):
-    """Build a deterministic HSTUBatch with item-only features.
+    """Build a deterministic HSTUBatch with all samples of the same length.
 
-    Seqlens are divisible by 2*cp_size to satisfy DualChunkSwap. Same
-    seed across all ranks → identical batch on every rank (the global
+    DualChunkSwap requires `L_b % (2 * cp_size) == 0` per sample, so
+    we sidestep variable-length alignment by using a single fixed
+    length divisible by `2 * cp_size` for every sample. Same seed
+    across all ranks → identical batch on every rank (the global
     input).
+
+    Codex round-1 Q2 fixed: a previous version used random varlen +
+    floor-rounded to chunks, which over-sliced into adjacent KJT
+    segments when a sample's natural length was less than one chunk.
+    Fixed-length avoids the edge case entirely; per-sample varlen
+    coverage lives in the kernel-level CP tests already.
     """
     from commons.datasets.hstu_batch import FeatureConfig, HSTUBatch
 
@@ -108,11 +122,11 @@ def _build_random_batch(
         FeatureConfig(
             feature_names=["item"],
             max_item_ids=[1000],
-            max_sequence_length=max_seqlen,
+            max_sequence_length=seqlen,
             is_jagged=True,
         )
     ]
-    return HSTUBatch.random(
+    batch = HSTUBatch.random(
         batch_size=batch_size,
         feature_configs=feature_configs,
         item_feature_name="item",
@@ -121,42 +135,21 @@ def _build_random_batch(
         max_num_candidates=0,
         device=device,
     )
-
-
-def _enforce_chunk_alignment(batch, cp_size: int):
-    """Pad sample lengths to be divisible by 2*cp_size.
-
-    DualChunkSwap requires `L_b % (2 * cp_size) == 0` per sample.
-    The random batch generator gives arbitrary lengths in
-    `[1, max_seqlen]`. Round each up to the next multiple of
-    2*cp_size by truncating the KJT lengths.
-    """
-    chunks = 2 * cp_size
-    new_lengths = (batch.features.lengths() // chunks) * chunks
-    # Ensure no zero-length sample (DualChunkSwap rejects).
-    new_lengths = torch.where(
-        new_lengths > 0, new_lengths, torch.full_like(new_lengths, chunks)
+    # Force every sample to length `seqlen` exactly (the random
+    # generator picks lengths in `[1, max_seqlen]`).
+    feats = batch.features
+    n_samples = batch_size  # one feature key
+    fixed_lengths = torch.full(
+        (n_samples,), seqlen, dtype=feats.lengths().dtype, device=device
     )
-    # Truncate the KJT.
+    # Truncate the KJT values to `n_samples * seqlen` (the random
+    # generator allocates enough; we just slice the prefix).
+    new_total = n_samples * seqlen
+    new_values = feats.values()[:new_total]
     from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-    feats = batch.features
-    keys = feats.keys()
-    n_keys = len(keys)
-    old_lengths = feats.lengths().view(n_keys, -1)
-    new_lengths_2d = new_lengths.view(n_keys, -1)
-    # Build new values by slicing each sample's prefix.
-    old_values = feats.values()
-    old_offsets = feats.offsets()
-    new_values_list = []
-    for k in range(n_keys):
-        for s in range(old_lengths.shape[1]):
-            base = int(old_offsets[k * old_lengths.shape[1] + s].item())
-            take = int(new_lengths_2d[k, s].item())
-            new_values_list.append(old_values[base : base + take])
-    new_values = torch.cat(new_values_list)
     new_feats = KeyedJaggedTensor.from_lengths_sync(
-        keys=keys, values=new_values, lengths=new_lengths
+        keys=feats.keys(), values=new_values, lengths=fixed_lengths
     )
     import dataclasses
 
@@ -178,21 +171,24 @@ def test_hstu_block_e2e_forward_backward(cp_world: dict) -> None:
     world_size = cp_world["world_size"]
     device = cp_world["device"]
 
-    # Small but realistic shapes. seqlens divisible by 2*cp_size after
-    # `_enforce_chunk_alignment`.
+    # Fixed-length batch: every sample has length `seqlen`, divisible
+    # by `2 * world_size`. cp=2 needs %4 == 0; cp=4 needs %8 == 0;
+    # 24 satisfies both.
     batch_size = 4
-    max_seqlen = 32  # plenty of headroom for chunk alignment
+    seqlen = 24
+    assert (
+        seqlen % (2 * world_size) == 0
+    ), f"seqlen={seqlen} must be divisible by 2*cp_size={2 * world_size}"
     hidden_dim_per_head = 32
     num_heads = 2
     hidden_size = hidden_dim_per_head * num_heads
 
-    batch = _build_random_batch(
+    batch = _build_fixed_length_batch(
         batch_size=batch_size,
-        max_seqlen=max_seqlen,
+        seqlen=seqlen,
         seed=42,
         device=device,
     )
-    batch = _enforce_chunk_alignment(batch, cp_size=world_size)
 
     # Build the HSTU config with cp wired in. NATIVE layer is the only
     # CP-supported layer type. The HSTU kernel only accepts fp16/bf16
@@ -296,3 +292,40 @@ def test_hstu_block_e2e_forward_backward(cp_world: dict) -> None:
         if p.grad is not None and p.grad.abs().sum().item() > 0:
             n_with_grad += 1
     assert n_with_grad > 0, f"rank {rank}: no block parameter received a gradient"
+
+    # 6. Backward CP-ness check (Codex round-1 Q4): with CP, every
+    # rank computes the SAME global loss (verified by #5 — outputs
+    # match cross-rank), and the layer params are replicated across
+    # CP ranks, so each rank's `param.grad` should match cross-rank
+    # AFTER summing the grads from this rank's local Q chunk + the
+    # peer-K contributions delivered via the reverse-ring P2P. If
+    # backward short-circuited to a local-only path (no reverse
+    # ring), each rank would only see grads from its OWN Q chunk
+    # and the per-rank values would diverge.
+    #
+    # Concretely: pick the largest-magnitude grad across all block
+    # params (deterministic across ranks since param ordering is
+    # the same), broadcast rank 0's value, and assert non-rank-0
+    # ranks' value matches within bf16 tolerance. This anchors the
+    # backward path to actual CP communication, not just to local
+    # autograd flow.
+    grad_norms = []
+    for p in block.parameters():
+        if p.grad is not None:
+            grad_norms.append(p.grad.detach().float().norm().item())
+    rank_grad_signature = sum(grad_norms)
+    sig_tensor = torch.tensor([rank_grad_signature], device=device, dtype=torch.float32)
+    other_sig = torch.zeros_like(sig_tensor)
+    if rank == 0:
+        for r in range(1, world_size):
+            dist.send(sig_tensor, dst=r)
+    else:
+        dist.recv(other_sig, src=0)
+        rel_diff = (sig_tensor - other_sig).abs().item() / max(
+            other_sig.abs().item(), 1e-6
+        )
+        assert rel_diff < 1e-2, (
+            f"rank {rank}: param-grad signature {sig_tensor.item():.6f} "
+            f"vs rank 0 {other_sig.item():.6f} (rel diff {rel_diff:.4f}); "
+            "CP backward likely not delivering peer-K gradient contributions"
+        )
