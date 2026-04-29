@@ -129,6 +129,7 @@ def test_cp_group_size_4_routes_to_cp_wrapper(cuda_device: torch.device) -> None
     import context_parallel
     from modules.hstu_attention import FusedHSTUAttention
 
+    expected_ranks = [0, 1, 2, 3]
     with _fake_cp_group(4) as grp:
         attn = FusedHSTUAttention(
             num_heads=2,
@@ -136,7 +137,7 @@ def test_cp_group_size_4_routes_to_cp_wrapper(cuda_device: torch.device) -> None
             linear_dim=32,
             is_causal=True,
             cp_group=grp,
-            cp_global_ranks=[0, 1, 2, 3],
+            cp_global_ranks=expected_ranks,
         )
         tq, tk, tv, cu = _build_jagged_inputs(
             batch=4, seqlen=64, num_heads=2, head_dim=32, device=cuda_device
@@ -156,8 +157,15 @@ def test_cp_group_size_4_routes_to_cp_wrapper(cuda_device: torch.device) -> None
         ) as cp_spy:
             out = attn(tq, tk, tv, cu, max_seqlen=64, scaling_seqlen=64)
     cp_spy.assert_called_once()
-    # And we received the patched sentinel reshaped to (T, num_heads*linear_dim).
+    # The patched sentinel got reshaped to (T, num_heads * linear_dim).
     assert out.shape[-1] == attn.num_heads * attn.linear_dim
+    # Verify the wrapper got the cp_group + cp_global_ranks from the module
+    # (regression guard: silently dropping either kwarg in the dispatch
+    # would have rendered the CP path unroutable on real ranks but let
+    # this test pass without this assertion).
+    call_kwargs = cp_spy.call_args.kwargs
+    assert call_kwargs["cp_group"] is grp
+    assert tuple(call_kwargs["cp_global_ranks"]) == tuple(expected_ranks)
 
 
 def test_cp_rejects_heterogeneous_mask(cuda_device: torch.device) -> None:

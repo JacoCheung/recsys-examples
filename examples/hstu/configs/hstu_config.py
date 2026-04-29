@@ -86,6 +86,24 @@ class HSTUPreprocessingConfig:
     contextual_embedding_dim: int
 
 
+def _resolve_cp_size_from_parallel_state(is_inference: bool) -> int:
+    """Return the CP world size or 1 if the API is unavailable / not initialised.
+
+    Inference always returns 1. The hasattr-then-try chain handles two
+    distinct failure modes for older Megatron forks: (1) the API does not
+    exist; (2) the API exists but raises at runtime (e.g. the CP group has
+    not been initialised yet). Either case ⇒ no CP.
+    """
+    if is_inference:
+        return 1
+    if not hasattr(parallel_state, "get_context_parallel_world_size"):
+        return 1
+    try:
+        return parallel_state.get_context_parallel_world_size()
+    except (AttributeError, AssertionError, RuntimeError):
+        return 1
+
+
 @dataclass
 class HSTUConfig(TransformerConfig):
     """
@@ -219,16 +237,11 @@ def get_hstu_config(
         else 1,
         # Pre-CP, this field was a copy-paste of pipeline_model_parallel_size.
         # CP integration (Slice 6) consumes the actual CP group size from
-        # Megatron `parallel_state` if available; on builds without a CP
-        # group initialised, it falls back to 1 (no CP).
-        context_parallel_size=(
-            parallel_state.get_context_parallel_world_size()
-            if (
-                not is_inference
-                and hasattr(parallel_state, "get_context_parallel_world_size")
-            )
-            else 1
-        ),
+        # Megatron `parallel_state` if available. The hasattr guard handles
+        # older Megatron forks without the API; the try/except handles forks
+        # where the API exists but raises at runtime (e.g. CP group not
+        # initialised). Both fall back to 1.
+        context_parallel_size=_resolve_cp_size_from_parallel_state(is_inference),
         sequence_parallel=sequence_parallel,
         fp16=is_fp16,
         is_causal=is_causal,

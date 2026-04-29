@@ -141,12 +141,24 @@ class HSTULayer(MegatronModule):
 
         self._target_group_size = config.target_group_size
 
+        # Thread CP plumbing into the attention module so the FusedHSTUAttention
+        # forward can route to the CP wrapper when cp_size > 1. Pre-Slice 6
+        # this layer constructed `create_hstu_attention(...)` with no CP
+        # arguments, which silently kept the legacy single-GPU path even when
+        # `config.context_parallel_size > 1` — the config switch was a no-op.
+        cp_group = None
+        cp_global_ranks = None
+        if config.context_parallel_size > 1:
+            cp_group = parallel_state.get_context_parallel_group()
+            cp_global_ranks = list(parallel_state.get_context_parallel_global_ranks())
         self._attn_func = create_hstu_attention(
             kernel_backend=config.kernel_backend,
             num_heads=self._num_heads_per_partition,
             attention_dim=self._attention_dim_per_head,
             linear_dim=self._linear_dim_per_head,
             is_causal=config.is_causal,
+            cp_group=cp_group,
+            cp_global_ranks=cp_global_ranks,
         )
         register_setter_and_getter_for_nvtx(
             HSTULayer.forward, key_or_attr_name="values"
