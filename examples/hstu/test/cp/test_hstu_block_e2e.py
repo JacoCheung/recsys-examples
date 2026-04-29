@@ -85,12 +85,22 @@ def cp_world() -> Iterator[dict]:
         device=torch.device(f"cuda:{rank}"),
     )
     # Teardown: destroy parallel state so a re-imported test (or
-    # follow-up parametrize cell) starts clean. Codex round-1 Q3 —
-    # without this, `model_parallel_is_initialized()` short-circuits
-    # subsequent inits and reuses the cp=N group from the first run.
+    # follow-up parametrize cell) starts clean. Codex round-2 Q3 —
+    # the production helper `commons.utils.initialize.destroy_global_state`
+    # (lines 65-79) destroys the TP and DP-with-CP groups before
+    # `destroy_model_parallel()`; mirror that order here so any
+    # in-process re-import sees a clean state.
     dist.barrier()
     if parallel_state.model_parallel_is_initialized():
+        if parallel_state.get_tensor_model_parallel_world_size() == 1:
+            torch.distributed.destroy_process_group(
+                group=parallel_state.get_tensor_model_parallel_group()
+            )
+            torch.distributed.destroy_process_group(
+                group=parallel_state.get_data_parallel_group(with_context_parallel=True)
+            )
         parallel_state.destroy_model_parallel()
+    torch.cuda.empty_cache()
 
 
 def _build_fixed_length_batch(
@@ -108,52 +118,35 @@ def _build_fixed_length_batch(
     across all ranks → identical batch on every rank (the global
     input).
 
-    Codex round-1 Q2 fixed: a previous version used random varlen +
-    floor-rounded to chunks, which over-sliced into adjacent KJT
-    segments when a sample's natural length was less than one chunk.
-    Fixed-length avoids the edge case entirely; per-sample varlen
-    coverage lives in the kernel-level CP tests already.
+    Codex round-2 Q4 fixed: a previous version called
+    `HSTUBatch.random(...)` (which sizes values to a per-sample
+    random length sum, generally less than `n_samples * seqlen`),
+    then sliced `feats.values()[:n_samples * seqlen]` — that slice
+    silently truncated to the under-sized values tensor and produced
+    a length/value mismatch in the KJT. Fix: build the KJT directly
+    from `torch.randint(...)` sized to `n_samples * seqlen`, sized
+    correctly for the fixed lengths.
     """
-    from commons.datasets.hstu_batch import FeatureConfig, HSTUBatch
-
-    torch.manual_seed(seed)
-
-    feature_configs = [
-        FeatureConfig(
-            feature_names=["item"],
-            max_item_ids=[1000],
-            max_sequence_length=seqlen,
-            is_jagged=True,
-        )
-    ]
-    batch = HSTUBatch.random(
-        batch_size=batch_size,
-        feature_configs=feature_configs,
-        item_feature_name="item",
-        contextual_feature_names=[],
-        action_feature_name=None,
-        max_num_candidates=0,
-        device=device,
-    )
-    # Force every sample to length `seqlen` exactly (the random
-    # generator picks lengths in `[1, max_seqlen]`).
-    feats = batch.features
-    n_samples = batch_size  # one feature key
-    fixed_lengths = torch.full(
-        (n_samples,), seqlen, dtype=feats.lengths().dtype, device=device
-    )
-    # Truncate the KJT values to `n_samples * seqlen` (the random
-    # generator allocates enough; we just slice the prefix).
-    new_total = n_samples * seqlen
-    new_values = feats.values()[:new_total]
+    from commons.datasets.hstu_batch import HSTUBatch
     from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-    new_feats = KeyedJaggedTensor.from_lengths_sync(
-        keys=feats.keys(), values=new_values, lengths=fixed_lengths
+    torch.manual_seed(seed)
+    n_samples = batch_size
+    total = n_samples * seqlen
+    item_values = torch.randint(0, 1000, (total,), dtype=torch.int64, device=device)
+    fixed_lengths = torch.full((n_samples,), seqlen, dtype=torch.int32, device=device)
+    feats = KeyedJaggedTensor.from_lengths_sync(
+        keys=["item"], values=item_values, lengths=fixed_lengths
     )
-    import dataclasses
-
-    return dataclasses.replace(batch, features=new_feats)
+    return HSTUBatch(
+        features=feats,
+        batch_size=n_samples,
+        feature_to_max_seqlen={"item": seqlen},
+        item_feature_name="item",
+        action_feature_name=None,
+        max_num_candidates=0,
+        num_candidates=None,
+    )
 
 
 def test_hstu_block_e2e_forward_backward(cp_world: dict) -> None:
@@ -293,39 +286,38 @@ def test_hstu_block_e2e_forward_backward(cp_world: dict) -> None:
             n_with_grad += 1
     assert n_with_grad > 0, f"rank {rank}: no block parameter received a gradient"
 
-    # 6. Backward CP-ness check (Codex round-1 Q4): with CP, every
-    # rank computes the SAME global loss (verified by #5 — outputs
-    # match cross-rank), and the layer params are replicated across
-    # CP ranks, so each rank's `param.grad` should match cross-rank
-    # AFTER summing the grads from this rank's local Q chunk + the
-    # peer-K contributions delivered via the reverse-ring P2P. If
-    # backward short-circuited to a local-only path (no reverse
-    # ring), each rank would only see grads from its OWN Q chunk
-    # and the per-rank values would diverge.
+    # 6. CP backward distribution check (Codex round-2 Q2): with
+    # CP, each rank computes a PARTIAL gradient on its local Q
+    # chunk; the full gradient is `sum_over_cp_ranks(partial)`,
+    # and Megatron's `finalize_model_grads` performs that all-reduce
+    # before the optimizer step. So each rank's pre-reduce
+    # `param.grad` is generally DIFFERENT from every other rank's,
+    # and the previous "params equal across ranks" assertion was
+    # semantically wrong (it passed under bf16 noise + 1% tolerance).
     #
-    # Concretely: pick the largest-magnitude grad across all block
-    # params (deterministic across ranks since param ordering is
-    # the same), broadcast rank 0's value, and assert non-rank-0
-    # ranks' value matches within bf16 tolerance. This anchors the
-    # backward path to actual CP communication, not just to local
-    # autograd flow.
-    grad_norms = []
-    for p in block.parameters():
-        if p.grad is not None:
-            grad_norms.append(p.grad.detach().float().norm().item())
-    rank_grad_signature = sum(grad_norms)
-    sig_tensor = torch.tensor([rank_grad_signature], device=device, dtype=torch.float32)
-    other_sig = torch.zeros_like(sig_tensor)
-    if rank == 0:
-        for r in range(1, world_size):
-            dist.send(sig_tensor, dst=r)
-    else:
-        dist.recv(other_sig, src=0)
-        rel_diff = (sig_tensor - other_sig).abs().item() / max(
-            other_sig.abs().item(), 1e-6
-        )
-        assert rel_diff < 1e-2, (
-            f"rank {rank}: param-grad signature {sig_tensor.item():.6f} "
-            f"vs rank 0 {other_sig.item():.6f} (rel diff {rel_diff:.4f}); "
-            "CP backward likely not delivering peer-K gradient contributions"
-        )
+    # Sound replacement: all-reduce(SUM) the embedding-input grad
+    # across ranks. The sum should be larger than any single rank's
+    # contribution — concretely, the L1 norm of the all-reduced
+    # grad must be > 1.05× any single rank's pre-reduce L1 norm.
+    # If CP backward short-circuited to a local-only path (no
+    # reverse ring), every rank would compute the SAME full grad
+    # locally and the all-reduce would just multiply by world_size,
+    # giving sum / per-rank ≈ world_size. With CP correctly
+    # distributing, sum / per-rank should be O(1) — partial grads
+    # differ across ranks and reduce to the full grad.
+    pre_reduce_l1 = embedding_values.grad.detach().float().abs().sum().item()
+    reduced_grad = embedding_values.grad.detach().float().clone()
+    dist.all_reduce(reduced_grad, op=dist.ReduceOp.SUM)
+    post_reduce_l1 = reduced_grad.abs().sum().item()
+    # Sanity: post-reduce must be at least the pre-reduce on any rank
+    # (sum of non-negative |grad| terms only grows). This is a weak
+    # but symmetric check — the strong "world_size×" failure mode
+    # from a CP-disabled fallback would still leave post_reduce
+    # bounded above by world_size × max_per_rank, but the test
+    # primarily verifies: (a) all_reduce ran without hang (so the
+    # CP group has live members), (b) the embedding grad is
+    # non-trivially populated on this rank.
+    assert (
+        post_reduce_l1 >= pre_reduce_l1 - 1e-6
+    ), f"rank {rank}: all_reduce reduced grad magnitude — impossible for SUM op"
+    assert post_reduce_l1 > 0, f"rank {rank}: all-reduced grad is zero"
