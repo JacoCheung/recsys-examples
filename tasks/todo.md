@@ -151,14 +151,30 @@ checkpoint is signed.
 
 ---
 
-## Phase 5 — Module / training integration (Slice 6; post-v0, optional)
+## Phase 5 — Module / training integration (Slice 6)
 
-Re-plan when this phase starts. Sketch:
-
-- [ ] **T6.1**: `HSTUConfig.cp_size` + Megatron parallel-state CP group
-- [ ] **T6.2**: `HSTUAttention` module accepts `cp_group`, routes to CP fn
-- [ ] **T6.3**: Dataloader DualChunkSwap shuffle
-- [ ] **T6.4**: E2E training smoke test
+- [x] **T6.1**: `HSTUConfig.cp_size` + Megatron parallel-state CP group
+      (commit `da831e6c`)
+- [x] **T6.2**: `HSTULayer` module accepts `cp_group`, routes to CP fn
+      via `FusedHSTUAttention` → `hstu_attn_varlen_cp_func` (`da831e6c`)
+- [x] **T6.3**: JaggedData-level DualChunkSwap dispatcher
+      (`apply_dualchunkswap_to_jagged`, commit `79e257b5`)
+- [x] **T6.4**: HSTUBlock dispatch + gather around layer stack +
+      dispatcher het-mask preservation (commits `0e78eca7` /
+      `4ed5b6cf` / `58a69b5c` — Codex 4 rounds LGTM)
+- [x] **Het-mask track**: arbitrary-mask `func` translator + per-step
+      CP localiser + multi-GPU correctness for sliding/contextual/
+      target masks (commits `380cc97d…410dfa18`, `0a9d1c7f`,
+      `3955531a` — Codex 5 rounds LGTM)
+- [x] **Localiser perf**: 1021ms → 79ms vectorisation
+      (commit `a8797a7d`)
+- [x] **T6.5**: E2E HSTUBlock cp=2/4 forward+backward smoke
+      (commits `625427b4` / `b828bf14` / `e11de001` / `98236857` /
+      `dde5d609` — Codex 4 rounds, including a behavioural
+      CP-disabled regression guard via grad-divergence check.
+      Numerical-correctness oracle role lives in the kernel-level
+      `test_cp_forward.py` / `test_cp_backward.py`, which are part
+      of the same regression suite.)
 
 ---
 
