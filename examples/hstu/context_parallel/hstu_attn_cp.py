@@ -437,6 +437,29 @@ def _enforce_v0_contract(
     # because per-step localisation requires the analytical predicate, not
     # an opaque tensor. Callers that need to feed a custom `func` directly
     # would need their own slicing logic — out of scope for v0.5.
+    #
+    # Mirror the FBGEMM kernel invariant
+    # (`cuda_hstu_attention.py:614-621`): num_contexts / num_targets must
+    # come with `window_size == (-1, 0)`. This is enforced at any
+    # cp_size — at cp==1 by the kernel itself, at cp>1 by us, since the
+    # arbitrary-mask path could otherwise silently accept the combo while
+    # the cp==1 path rejects it. Keeps behaviour identical across
+    # topologies.
+    ws = tuple(window_size)
+    if num_contexts is not None and ws != _SUPPORTED_WINDOW_SIZE:
+        raise GuardError(
+            f"num_contexts requires window_size=(-1, 0); got {ws}. "
+            f"Sliding window combined with contextual prefix is rejected "
+            f"by the FBGEMM kernel ABI; the CP arbitrary-mask path "
+            f"matches this invariant. ({_SPEC_REF})"
+        )
+    if num_targets is not None and ws != _SUPPORTED_WINDOW_SIZE:
+        raise GuardError(
+            f"num_targets requires window_size=(-1, 0); got {ws}. "
+            f"Sliding window combined with target groups is rejected by "
+            f"the FBGEMM kernel ABI; the CP arbitrary-mask path matches "
+            f"this invariant. ({_SPEC_REF})"
+        )
     if cp_size > 1:
         if func is not None:
             raise GuardError(

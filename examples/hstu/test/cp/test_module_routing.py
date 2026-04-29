@@ -175,8 +175,15 @@ def test_cp_group_size_4_routes_to_cp_wrapper(cuda_device: torch.device) -> None
     assert call_kwargs["cp_stream"] is expected_stream
 
 
-def test_cp_rejects_heterogeneous_mask(cuda_device: torch.device) -> None:
-    """v0 contract: cp>1 + heterogeneous mask params ⇒ ValueError."""
+def test_cp_forwards_heterogeneous_mask_to_wrapper(
+    cuda_device: torch.device,
+) -> None:
+    """Het-mask under CP is now SUPPORTED via the arbitrary-mask path
+    (`docs/cp/het_mask_design.md` Steps 4a+4b).  The module forwards
+    `num_contextuals` / `num_candidates` / `target_group_size` to the CP
+    wrapper instead of rejecting them.  Regression-guards against a
+    silent revert of the FBGEMM-arbitrary-mask integration."""
+    import context_parallel
     from modules.hstu_attention import FusedHSTUAttention
 
     with _fake_cp_group(2) as grp:
@@ -191,13 +198,17 @@ def test_cp_rejects_heterogeneous_mask(cuda_device: torch.device) -> None:
         tq, tk, tv, cu = _build_jagged_inputs(
             batch=4, seqlen=64, num_heads=2, head_dim=32, device=cuda_device
         )
-        # num_contextuals = int -> normalised to a tensor inside forward;
-        # tracker after that point checks `is None`. So we test the
-        # already-tensor case (production path) directly.
-        bad_num_contextuals = torch.tensor(
-            [4] * 4, dtype=torch.int32, device=cuda_device
+        num_candidates = torch.tensor(
+            [8, 8, 8, 8], dtype=torch.int32, device=cuda_device
         )
-        with pytest.raises(ValueError, match="heterogeneous mask"):
+        sentinel = torch.zeros(
+            tq.numel() // (2 * 32), 2 * 32, dtype=tq.dtype, device=tq.device
+        )
+        with patch.object(
+            context_parallel,
+            "hstu_attn_varlen_cp_func",
+            return_value=sentinel,
+        ) as cp_spy:
             attn(
                 tq,
                 tk,
@@ -205,8 +216,40 @@ def test_cp_rejects_heterogeneous_mask(cuda_device: torch.device) -> None:
                 cu,
                 max_seqlen=64,
                 scaling_seqlen=64,
-                num_contextuals=bad_num_contextuals,
+                num_candidates=num_candidates,
+                target_group_size=2,
             )
+    cp_spy.assert_called_once()
+    call_kwargs = cp_spy.call_args.kwargs
+    assert torch.equal(
+        call_kwargs["num_targets"], num_candidates
+    ), "num_candidates must be forwarded as num_targets"
+    assert call_kwargs["target_group_size"] == 2
+    # window_size still pinned to causal (-1, 0) because sliding+het-mask
+    # is rejected by both the FBGEMM kernel ABI and the CP path.
+    assert call_kwargs["window_size"] == (-1, 0)
+
+
+def test_cp_still_rejects_non_causal(cuda_device: torch.device) -> None:
+    """is_causal=False with cp_size>1 is still rejected — sliding/no-mask
+    under CP is out of scope at the module level (kernel intersection
+    semantics with arbitrary mask, plus DualChunkSwap is causal-shaped)."""
+    from modules.hstu_attention import FusedHSTUAttention
+
+    with _fake_cp_group(2) as grp:
+        attn = FusedHSTUAttention(
+            num_heads=2,
+            attention_dim=32,
+            linear_dim=32,
+            is_causal=False,
+            cp_group=grp,
+            cp_global_ranks=[0, 1],
+        )
+        tq, tk, tv, cu = _build_jagged_inputs(
+            batch=4, seqlen=64, num_heads=2, head_dim=32, device=cuda_device
+        )
+        with pytest.raises(ValueError, match="is_causal=True"):
+            attn(tq, tk, tv, cu, max_seqlen=64, scaling_seqlen=64)
 
 
 def test_cp_requires_global_ranks(cuda_device: torch.device) -> None:

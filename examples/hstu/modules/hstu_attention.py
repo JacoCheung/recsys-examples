@@ -318,30 +318,20 @@ class FusedHSTUAttention(HSTUAttention):
 
         cp_size = dist.get_world_size(self.cp_group) if self.cp_group is not None else 1
         if cp_size > 1:
-            # CP wrapper enforces v0 contract: pure causal, no rab, no
-            # heterogeneous mask, head_dim ∈ {32,64,128,256}. Reject
-            # incompatible inputs here (rather than inside the wrapper) so
-            # the failure points at the module config rather than at a
-            # generic GuardError.
+            # CP wrapper still requires causal (sliding-window window_size
+            # is rejected by both the kernel ABI when combined with
+            # heterogeneous mask, and by the CP arbitrary-mask path that
+            # this module routes to — see
+            # `examples/hstu/context_parallel/hstu_attn_cp.py::_enforce_v0_contract`).
+            # Het-mask params (num_contextuals, num_candidates,
+            # target_group_size > 1) are now SUPPORTED under CP via the
+            # arbitrary-mask path (see docs/cp/het_mask_design.md Steps
+            # 4a + 4b). Pass them through to the wrapper instead of the
+            # earlier blanket reject.
             if not self.is_causal:
                 raise ValueError(
                     "FusedHSTUAttention with cp_size>1 requires is_causal=True "
-                    "(v0 contract; sliding-causal lands in v0.5; see SPEC §2)"
-                )
-            if (
-                num_contextuals is not None
-                or (
-                    isinstance(num_candidates, torch.Tensor)
-                    and num_candidates.numel() > 0
-                )
-                or target_group_size != 1
-            ):
-                raise ValueError(
-                    "FusedHSTUAttention with cp_size>1 does not support "
-                    "heterogeneous mask params (num_contextuals, num_candidates, "
-                    "target_group_size>1) — those break DualChunkSwap balanced "
-                    "sharding (v0 contract, see SPEC §2). Disable CP for this "
-                    "config or wait for the heterogeneous-mask CP extension."
+                    "(SPEC §2)"
                 )
             from context_parallel import hstu_attn_varlen_cp_func
 
@@ -356,9 +346,13 @@ class FusedHSTUAttention(HSTUAttention):
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
                 scaling_seqlen=scaling_seqlen,
-                num_contexts=None,
-                num_targets=None,
-                target_group_size=1,
+                num_contexts=num_contextuals,
+                num_targets=(
+                    num_candidates.to(torch.int32)
+                    if isinstance(num_candidates, torch.Tensor)
+                    else None
+                ),
+                target_group_size=target_group_size,
                 window_size=(-1, 0),
                 alpha=1.0 / (self.attention_dim**0.5),
                 cp_group=self.cp_group,

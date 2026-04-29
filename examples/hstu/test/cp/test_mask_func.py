@@ -538,6 +538,45 @@ def test_localiser_step_zero_matches_global_self_chunks(
         assert torch.equal(decoded.cpu(), oracle), f"step=0 cp_rank={cp_rank}"
 
 
+def test_intervals_to_slots_nfunc_overflow_raises(
+    cuda_device: torch.device,
+) -> None:
+    """If a Q row needs more disjoint intervals than NFUNC capacity,
+    `_intervals_to_slots` must raise rather than silently truncating —
+    truncation would silently drop in-window K cells from attention."""
+    from context_parallel._mask_func import _intervals_to_slots
+
+    # NFUNC=3 → max 2 disjoint intervals.  Three intervals → must raise.
+    too_many = [(0, 1), (3, 5), (8, 10)]
+    with pytest.raises(ValueError, match="NFUNC"):
+        _intervals_to_slots(too_many, NFUNC=3)
+
+
+def test_global_builder_nfunc_overflow_raises(cuda_device: torch.device) -> None:
+    """If the global mask requires more intervals than NFUNC supports,
+    `build_global_mask_func` must raise.  Constructed by deliberately
+    passing NFUNC=1 (single implicit interval [0, slot_0)) with a target Q
+    that needs 2 intervals (history-band + target-group-band)."""
+    from context_parallel._mask_func import build_global_mask_func
+
+    cu = torch.tensor([0, 16], dtype=torch.int32, device=cuda_device)
+    num_targets = torch.tensor([4], dtype=torch.int32, device=cuda_device)
+    # Target Q at q=12 needs 2 intervals: [0, 12) (history) and [12, 13)
+    # (group of size 1 ending at self).  Already exercised in
+    # test_targets_g1_translator_matches_4tuple at NFUNC=3; with NFUNC=1
+    # we can't fit both, so the builder must raise.
+    with pytest.raises(ValueError, match="NFUNC"):
+        build_global_mask_func(
+            cu_seqlens_q=cu,
+            max_seqlen_q=16,
+            num_contexts=None,
+            num_targets=num_targets,
+            target_group_size=1,
+            window_size=(-1, 0),
+            NFUNC=1,
+        )
+
+
 def test_localiser_union_across_steps_equals_full_q_row(
     cuda_device: torch.device,
 ) -> None:
