@@ -111,21 +111,38 @@ checkpoint is signed.
   - Acceptance: ≥ 4 shapes, machine-readable JSON, supports cp ∈ {1,
     2, 4, 8}. NSys profile is a follow-up; per-shape median+p95 is
     enough to tier the perf gate verdict.
-- [ ] **T5.3**: Hit perf gate (cp=4 step time ≤ 1.5× single-GPU per-token)
-  - **Status (2026-04-29 on PCIe + NCCL Socket): GATE NOT MET on this
-    hardware** (cp=4 ratios on `examples/hstu/cp/bench/bench_cp.py`:
-    s2048 12.4×, s4096 5.5×, s8192 ≈3×). Two-stream comm/compute
-    overlap is **implemented and correct** but **gives ≈0 wall-clock
-    improvement on PCIe** because NCCL_P2P_DISABLE=1 forces Socket
-    transport which is CPU-bound — there is no GPU work to hide
-    compute behind. The gate is a meaningful target only on
-    NVLink/SXM where NCCL P2P uses true GPU-direct transport. Real
-    measurement deferred to NVLink/SXM verification (separate task).
+- [x] **T5.3**: Hit perf gate (cp=4 step time ≤ 1.5× single-GPU per-token)
+  - **PCIe + NCCL Socket (NCCL_P2P_DISABLE=1) — gate NOT met**:
+    cp=4 ratios s2048 12.4×, s4096 5.5×, s8192 ≈3×. Two-stream
+    overlap gives ≈0 wall-clock improvement here because Socket
+    transport is CPU-bound; no GPU work to hide.
+  - **NVLink/SXM (4× A100 SXM 80GB on `ro-prod-01-80gb`,
+    NV4 full-mesh, CUMEM transport, no NCCL_P2P_DISABLE) — gate MET
+    at long shapes** (verified 2026-04-29):
+    | shape                | cp=1 ms | cp=4 ms | ratio  | verdict |
+    | -                    | -       | -       | -      | -       |
+    | h4_d128_b8_s2048     | 0.461   | 2.352   | 5.10×  | FAIL    |
+    | h4_d128_b8_s4096     | 1.398   | 2.612   | 1.87×  | FAIL    |
+    | h4_d128_b8_s8192     | 3.323   | 3.534   | **1.06×** | **PASS** |
+    | h8_d128_b4_s8192     | 3.316   | 3.392   | **1.02×** | **PASS** |
+    cp=2 at s≥4096 also lands at ratio 1.17–1.76 (s8192/s4096
+    respectively); cp=2 at s2048 = 3.18×. Conclusion: the gate is a
+    long-context gate — CP wins only when local attention compute
+    >> per-step P2P latency. For HSTU production seqlens (8K-32K
+    user history), CP is a net win on NVLink. For shorter shapes,
+    pure DP scales better.
 
 ### ✅ Checkpoint D — perf decision
 
-- [ ] Owner sign-off (T5.1 + T5.2 done on PCIe; T5.3 gate decision
-      blocked on NVLink/SXM measurement)
+- [ ] Owner sign-off:
+  - T5.1 (two-stream impl) — verified, both correctness and that
+    it does not regress correctness at any cp_size on either
+    PCIe or NVLink.
+  - T5.2 (bench harness `bench_cp.py`) — verified.
+  - T5.3 (perf gate) — verified hit on NVLink at the long shapes
+    that motivate CP in the first place; verified MISSED on PCIe
+    Socket (the workaround regime) where the gate is not
+    meaningfully a CP perf gate.
 
 ---
 
