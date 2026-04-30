@@ -333,30 +333,24 @@ def generate_config(args):
     # layout — the row-level chunking is mathematically equivalent to the
     # non-interleaved case (verified vs single-GPU baseline at fp64).
     #
-    # However, with interleaved action the per-sample total seqlen is
-    # `ctx_max + 2 * item_length`. With the template's ctx_max=3 (odd),
-    # `ctx_max + 2*item_length` is always odd → never divisible by
-    # `2*cp_size` (which is even ≥4) → the dispatcher's `% (2*cp_size)`
-    # check rejects every batch. Validate this feasibility at config-gen
-    # so the failure surfaces here, not minutes into a queued job.
+    # However, the alignment-emitter below
+    # (`item_seqlen_dist/RandomDistribution.align_offset`) currently
+    # produces residues for `main = item_length` (no-action). The
+    # interleaved case needs `main = 2*item_length` and a different
+    # offset formula — not implemented. Even-ctx_max + interleaved IS
+    # alignment-feasible (e.g., ctx_max=2, cp=2 → item odd) but the
+    # emitter doesn't produce the right residue. Defensively reject
+    # any cp>1 + interleaved combination until the emitter is updated.
+    # Codex round-3 NIT: latent bug if ctx_max ever becomes even and
+    # someone removes this guard but forgets the alignment formula.
     if args.cp_size > 1 and not args.no_action:
-        # NUM_CONTEXTUAL_FEATURES is set below; recompute here for the
-        # alignment-feasibility check.
-        ctx_max = 3  # matches the template (asserted below).
-        # 2*item is always even. We need (ctx_max + 2*item) % (2*cp_size) == 0.
-        # That requires `(2*item) % (2*cp_size) ≡ -ctx_max (mod 2*cp_size)`.
-        # The LHS is always even; the RHS is `(2*cp_size - ctx_max) % (2*cp_size)`.
-        # Feasible iff RHS is even, i.e., iff ctx_max is even.
-        if ctx_max % 2 != 0:
-            raise ValueError(
-                f"--cp_size={args.cp_size} with the default contextual "
-                f"schema (ctx_max={ctx_max}) requires --no_action: with "
-                "interleaved action, total per-sample seqlen = "
-                f"{ctx_max} + 2*item_length is always odd → never "
-                f"divisible by 2*cp_size = {2 * args.cp_size}. Use "
-                "--no_action, or change the template to have an even "
-                "number of contextual features."
-            )
+        raise ValueError(
+            f"--cp_size={args.cp_size} requires --no_action. The "
+            "alignment-emitter currently assumes non-interleaved main "
+            "(`main = item_length`); the interleaved case "
+            "(`main = 2*item_length`) needs a different `align_offset` "
+            "formula — not yet implemented. Use --no_action."
+        )
 
     # Number of contextual features baked into the inline template; CP
     # alignment depends on this count. Parse the literal list from the
