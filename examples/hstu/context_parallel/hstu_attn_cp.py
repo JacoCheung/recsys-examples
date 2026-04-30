@@ -1451,8 +1451,18 @@ def _is_het_mask(
     target_group_size: int,
     window_size: tuple[int, int],
 ) -> bool:
-    """Return True iff any of the four mask params requires the
-    arbitrary-mask path (otherwise the plain-causal Step 3/4 path is used)."""
+    """DEPRECATED: kept only for tests that read the predicate directly.
+
+    Pre-`func` design: this returned True iff the mask required the
+    arbitrary-mask path. Pure-causal went through the legacy
+    `_multi_gpu_forward` (4 ops/ring step with zero-pad + select
+    workarounds). Now ALL CP paths route through the
+    `func`-based `_multi_gpu_forward_arbitrary` (1 kernel/ring step) —
+    the FBGEMM HSTU kernel's arbitrary-mask interface is more
+    flexible than flash-attn's `is_causal`, so the legacy
+    tile-classification trick was technical debt from before the
+    het-mask track existed.
+    """
     if num_contexts is not None:
         return True
     if num_targets is not None:
@@ -1495,52 +1505,40 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         cp_size = dist.get_world_size(cp_group)
         cp_rank = dist.get_rank(cp_group)
 
-        het_mask = _is_het_mask(
+        # All CP paths route through the `func`-based
+        # `_multi_gpu_forward_arbitrary` (1 kernel call per ring step).
+        # The legacy `_multi_gpu_forward` (4 ops per ring step with zero-pad
+        # + select workarounds) was a pre-`func` design from when the kernel
+        # didn't yet have arbitrary-mask support. Now that `func` is
+        # available, plain-causal CP is just a special case where each Q
+        # row's allowed K interval is `[0, q+1)` — encoded by
+        # `localize_func_for_cp_step` and run as one kernel per step.
+        #
+        # Requires the FBGEMM kernel to be built with
+        # `HSTU_ARBITRARY_NFUNC >= 3`. Production builds without it will
+        # raise `RuntimeError: This hstu attention build does not support
+        # arbitrary mask` — bake the rebuilt kernel into the deployment
+        # container, OR push HSTU_ARBITRARY_NFUNC=3 upstream.
+        cu_seqlens_global = cu_seqlens_q * cp_size
+        out = _multi_gpu_forward_arbitrary(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_global,
+            max_seqlen_q_global=max_seqlen_q,
+            scaling_seqlen=scaling_seqlen,
+            alpha=alpha,
             num_contexts=num_contexts,
             num_targets=num_targets,
             target_group_size=target_group_size,
-            window_size=window_size,
+            window_size=tuple(window_size),
+            cp_group=cp_group,
+            cp_global_ranks=cp_global_ranks,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            cp_stream=cp_stream,
         )
-        if het_mask:
-            # Step 4a: het-mask forward via arbitrary `func` per ring step.
-            # Reconstruct global cu_seqlens from local: DualChunkSwap requires
-            # `global_L_b = local_L_b * cp_size` (each rank holds 2 chunks of
-            # size `c_b = global_L_b / (2 * cp_size)` = 2c per sample).
-            cu_seqlens_global = cu_seqlens_q * cp_size
-            out = _multi_gpu_forward_arbitrary(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_global,
-                max_seqlen_q_global=max_seqlen_q,
-                scaling_seqlen=scaling_seqlen,
-                alpha=alpha,
-                num_contexts=num_contexts,
-                num_targets=num_targets,
-                target_group_size=target_group_size,
-                window_size=tuple(window_size),
-                cp_group=cp_group,
-                cp_global_ranks=cp_global_ranks,
-                cp_rank=cp_rank,
-                cp_size=cp_size,
-                cp_stream=cp_stream,
-            )
-        else:
-            out = _multi_gpu_forward(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                max_seqlen_q_global=max_seqlen_q,
-                scaling_seqlen=scaling_seqlen,
-                alpha=alpha,
-                cp_group=cp_group,
-                cp_global_ranks=cp_global_ranks,
-                cp_rank=cp_rank,
-                cp_size=cp_size,
-                cp_stream=cp_stream,
-            )
 
         # Save for backward (T4.2).
         ctx.save_for_backward(q, k, v, cu_seqlens_q, cu_seqlens_k)
@@ -1558,9 +1556,8 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         # Reuse the same comm stream across forward/backward to avoid
         # re-creating per device.
         ctx.cp_stream = cp_stream
-        # Het-mask spec saved for backward — Step 4b: backward routes to
-        # `_multi_gpu_backward_arbitrary` when ctx.het_mask is True.
-        ctx.het_mask = het_mask
+        # Backward also uses the `func` path
+        # (`_multi_gpu_backward_arbitrary`) for symmetry with forward.
         ctx.num_contexts = num_contexts
         ctx.num_targets = num_targets
         ctx.target_group_size = target_group_size
@@ -1570,66 +1567,31 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):  # type: ignore[override]
         q, k, v, cu_seqlens_q, _cu_seqlens_k = ctx.saved_tensors
-        if ctx.het_mask:
-            cu_seqlens_global = cu_seqlens_q * ctx.cp_size
-            grads = _multi_gpu_backward_arbitrary(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_global,
-                dout,
-                max_seqlen_q_global=ctx.max_seqlen_q,
-                scaling_seqlen=ctx.scaling_seqlen,
-                alpha=ctx.alpha,
-                num_contexts=ctx.num_contexts,
-                num_targets=ctx.num_targets,
-                target_group_size=ctx.target_group_size,
-                window_size=ctx.window_size,
-                cp_group=ctx.cp_group,
-                cp_global_ranks=ctx.cp_global_ranks,
-                cp_rank=ctx.cp_rank,
-                cp_size=ctx.cp_size,
-                cp_stream=ctx.cp_stream,
-            )
-            return (
-                *grads,
-                None,  # cu_seqlens_q
-                None,  # cu_seqlens_k
-                None,  # max_seqlen_q
-                None,  # max_seqlen_k
-                None,  # scaling_seqlen
-                None,  # alpha
-                None,  # num_contexts
-                None,  # num_targets
-                None,  # target_group_size
-                None,  # window_size
-                None,  # cp_group
-                None,  # cp_global_ranks
-                None,  # cp_stream
-                None,  # cp_comm_type
-            )
+        # All paths route through `_multi_gpu_backward_arbitrary` for
+        # symmetry with forward (single kernel per ring step via `func`).
+        cu_seqlens_global = cu_seqlens_q * ctx.cp_size
+        grads = _multi_gpu_backward_arbitrary(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_global,
+            dout,
+            max_seqlen_q_global=ctx.max_seqlen_q,
+            scaling_seqlen=ctx.scaling_seqlen,
+            alpha=ctx.alpha,
+            num_contexts=ctx.num_contexts,
+            num_targets=ctx.num_targets,
+            target_group_size=ctx.target_group_size,
+            window_size=ctx.window_size,
+            cp_group=ctx.cp_group,
+            cp_global_ranks=ctx.cp_global_ranks,
+            cp_rank=ctx.cp_rank,
+            cp_size=ctx.cp_size,
+            cp_stream=ctx.cp_stream,
+        )
         return (
-            *_multi_gpu_backward(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                dout,
-                max_seqlen_q_global=ctx.max_seqlen_q,
-                scaling_seqlen=ctx.scaling_seqlen,
-                alpha=ctx.alpha,
-                cp_group=ctx.cp_group,
-                cp_global_ranks=ctx.cp_global_ranks,
-                cp_rank=ctx.cp_rank,
-                cp_size=ctx.cp_size,
-                cp_stream=ctx.cp_stream,
-            ),
-            # No gradients for non-Tensor / metadata args. Forward took:
-            #   q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            #   scaling_seqlen, alpha, num_contexts, num_targets,
-            #   target_group_size, window_size, cp_group, cp_global_ranks,
-            #   cp_stream, cp_comm_type
+            *grads,
             None,  # cu_seqlens_q
             None,  # cu_seqlens_k
             None,  # max_seqlen_q

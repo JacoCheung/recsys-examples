@@ -218,13 +218,25 @@ def test_guard_padding_length(cuda_device: torch.device) -> None:
         apply_dualchunkswap_to_jagged(jd, cp_size=2, cp_rank=0)
 
 
-def test_guard_interleaved_action(cuda_device: torch.device) -> None:
-    from context_parallel import GuardError, apply_dualchunkswap_to_jagged
+def test_dispatch_preserves_interleaved_action_flag(
+    cuda_device: torch.device,
+) -> None:
+    """Lifted reject: `has_interleaved_action=True` is now SUPPORTED.
+
+    DualChunkSwap row-level chunking is mathematically equivalent under
+    interleaved layout — each row is an independent Q/K token, causal
+    mask uses global row position. Verified vs single-GPU baseline at
+    fp64 (`tasks/verify_cp_grad_standalone.py`). The dispatcher must
+    therefore accept the flag and propagate it to `jd_local`.
+    """
+    from context_parallel import apply_dualchunkswap_to_jagged
 
     jd = _build_jd([8], hidden_dim=2, device=cuda_device)
     jd.has_interleaved_action = True
-    with pytest.raises(GuardError, match="has_interleaved_action"):
-        apply_dualchunkswap_to_jagged(jd, cp_size=2, cp_rank=0)
+    jd_local, _ = apply_dualchunkswap_to_jagged(jd, cp_size=2, cp_rank=0)
+    assert jd_local.has_interleaved_action is True
+    # local layout: 2 chunks of size c_b = 8/(2*2) = 2 → local seqlen = 4.
+    assert jd_local.values.shape[0] == 4
 
 
 def test_guard_divisibility(cuda_device: torch.device) -> None:
