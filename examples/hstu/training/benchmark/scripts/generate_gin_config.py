@@ -323,6 +323,33 @@ def generate_config(args):
             file=sys.stderr,
         )
 
+    # CP requires `--no_action` because `apply_dualchunkswap_to_jagged`
+    # rejects interleaved-action layout (v0 limitation; SPEC §2). Validate
+    # at config-gen time so the user sees the error here rather than at
+    # the dispatcher GuardError several minutes into a queued job.
+    if args.cp_size > 1 and not args.no_action:
+        raise ValueError(
+            f"--cp_size={args.cp_size} requires --no_action "
+            "(`apply_dualchunkswap_to_jagged` rejects interleaved-action "
+            "layout in v0). Add --no_action to the experiments file, or "
+            "set --cp_size 1."
+        )
+
+    # Number of contextual features hardcoded in the template (lines 91-99).
+    # contextual_max_seqlen = sum of each contextual feature's max_seqlen
+    # (each = 1, non-jagged). If you change the template's contextual list,
+    # update this count to match — assert below catches the mismatch by
+    # spot-checking the raw template string.
+    NUM_CONTEXTUAL_FEATURES = 3
+    template_str = get_baseline_template()
+    expected_ctx_features = "['user_id', 'user_age']"
+    if expected_ctx_features not in template_str:
+        raise ValueError(
+            "gin template's contextual feature list changed; update "
+            "NUM_CONTEXTUAL_FEATURES (and this assertion) in "
+            "generate_gin_config.py to match. CP alignment depends on it."
+        )
+
     # Generate value distribution sections
     if args.value_dist == "zipf":
         alpha = args.value_dist_alpha
@@ -374,10 +401,13 @@ def generate_config(args):
         # If cp>1: aligned_main has residue (-ctx_max) % align_to mod align_to.
         # align_offset stored is `ctx_max % align_to` so that
         # target_residue = (align_to - align_offset) % align_to ≡ -ctx_max.
-        # ctx_max=3 here (3 contextual features each max_sequence_length=1,
-        # see lines 87-95 of this template). Update if the contextual
-        # feature schema changes.
-        seqlen_align_offset=(3 % (2 * args.cp_size) if args.cp_size > 1 else 0),
+        # ctx_max = NUM_CONTEXTUAL_FEATURES (each non-jagged with
+        # max_sequence_length=1; sum = count). Asserted at top of this
+        # function — if the template's contextual list changes, the
+        # assertion fires.
+        seqlen_align_offset=(
+            NUM_CONTEXTUAL_FEATURES % (2 * args.cp_size) if args.cp_size > 1 else 0
+        ),
         item_feature_names="['item']" if args.no_action else "['item', 'action']",
         action_feature_name_value="None" if args.no_action else "'action'",
         action_embedding_line=""

@@ -17,7 +17,6 @@ from typing import Dict, List, Tuple, Union
 
 import commons.datasets as datasets
 import torch  # pylint: disable-unused-import
-import torch.distributed as dist
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.optimizer import OptimizerParam
 from configs import (
@@ -178,14 +177,17 @@ def get_data_loader(
         # see different batches → CP math broken (codex review BLOCKER Q2).
         from megatron.core import parallel_state as _ps
 
-        if _ps.model_parallel_is_initialized():
-            dp_rank = _ps.get_data_parallel_rank(with_context_parallel=False)
-            dp_world = _ps.get_data_parallel_world_size(with_context_parallel=False)
-        else:
-            # `set_random_seed` initialises parallel_state; this branch only
-            # fires when called outside the standard trainer entry.
-            dp_rank = dist.get_rank()
-            dp_world = dist.get_world_size()
+        assert _ps.model_parallel_is_initialized(), (
+            "get_data_loader for the real-dataset path requires Megatron "
+            "parallel_state to be initialised first (so DP rank/size can be "
+            "queried with `with_context_parallel=False`). The standard "
+            "trainer entry calls `init.initialize_model_parallel(...)` "
+            "before this; do the same in any custom caller. Falling back "
+            "to `dist.get_rank()/get_world_size()` would silently mis-shard "
+            "under CP > 1."
+        )
+        dp_rank = _ps.get_data_parallel_rank(with_context_parallel=False)
+        dp_world = _ps.get_data_parallel_world_size(with_context_parallel=False)
         (
             train_dataset,
             test_dataset,
