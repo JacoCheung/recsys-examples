@@ -259,10 +259,15 @@ def apply_dualchunkswap_to_jagged(
 
     Refuses to dispatch when JaggedData metadata is incompatible with
     DualChunkSwap permutation:
-      - has_interleaved_action True (interleaved Q/K layout — would
-        require half-stride permutation that v0 does not implement)
       - padding_length > 0 (would be permuted into the live region;
         SP+CP composition is out of v0 scope, see SPEC §2)
+
+    `has_interleaved_action=True` IS supported. The interleaved layout
+    is `[item₀, action₀, item₁, action₁, ...]` per sample — each row is
+    an independent Q/K token in attention's view, causal mask applies
+    per row position. DualChunkSwap row-level slicing is mathematically
+    equivalent regardless of whether rows came from interleaved or
+    item-only layout (verified vs single-GPU baseline at fp64).
 
     Het-mask metadata (`max_num_candidates`, `num_candidates`,
     `num_candidates_offsets`, `contextual_max_seqlen`, `contextual_seqlen`,
@@ -288,11 +293,6 @@ def apply_dualchunkswap_to_jagged(
     if not 0 <= cp_rank < cp_size:
         raise GuardError(f"cp_rank must be in [0, {cp_size}); got {cp_rank}")
 
-    if jd.has_interleaved_action:
-        raise GuardError(
-            "apply_dualchunkswap_to_jagged: has_interleaved_action=True not "
-            "supported in v0 (would require half-stride permutation)."
-        )
     if jd.padding_length > 0:
         raise GuardError(
             "apply_dualchunkswap_to_jagged: padding_length > 0 not supported "

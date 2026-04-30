@@ -169,8 +169,16 @@ def hstu_preprocess_embeddings(
             sequence_max_seqlen += batch.feature_to_max_seqlen[
                 batch.action_feature_name
             ]
-        if item_mlp is not None:
-            sequence_embeddings = item_mlp(sequence_embeddings)
+    # `item_mlp` projects item (and optionally interleaved action) embeddings
+    # to hidden_size. Must run regardless of whether the action feature is
+    # present, otherwise the no-action path leaves `sequence_embeddings` at
+    # the raw embedding_dim and the downstream `jagged_2D_tensor_concat` with
+    # contextual_sequence_embeddings (which is at hidden_size after
+    # contextual_mlp) hits a dim mismatch ("All tensors must have the same
+    # value dimension"). Pre-fix this was nested inside `if action_feature
+    # _name is not None:` — broken when CP forced `--no_action`.
+    if item_mlp is not None:
+        sequence_embeddings = item_mlp(sequence_embeddings)
 
     if (
         batch.num_candidates is not None

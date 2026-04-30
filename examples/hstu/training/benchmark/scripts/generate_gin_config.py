@@ -326,17 +326,37 @@ def generate_config(args):
     if args.cp_size < 1:
         raise ValueError(f"--cp_size must be >= 1; got {args.cp_size}")
 
-    # CP requires `--no_action` because `apply_dualchunkswap_to_jagged`
-    # rejects interleaved-action layout (v0 limitation; SPEC §2). Validate
-    # at config-gen time so the user sees the error here rather than at
-    # the dispatcher GuardError several minutes into a queued job.
+    # Note on `--no_action` requirement under CP > 1 (revised after lifting
+    # the dispatcher's `has_interleaved_action` reject):
+    #
+    # `apply_dualchunkswap_to_jagged` no longer math-rejects interleaved
+    # layout — the row-level chunking is mathematically equivalent to the
+    # non-interleaved case (verified vs single-GPU baseline at fp64).
+    #
+    # However, with interleaved action the per-sample total seqlen is
+    # `ctx_max + 2 * item_length`. With the template's ctx_max=3 (odd),
+    # `ctx_max + 2*item_length` is always odd → never divisible by
+    # `2*cp_size` (which is even ≥4) → the dispatcher's `% (2*cp_size)`
+    # check rejects every batch. Validate this feasibility at config-gen
+    # so the failure surfaces here, not minutes into a queued job.
     if args.cp_size > 1 and not args.no_action:
-        raise ValueError(
-            f"--cp_size={args.cp_size} requires --no_action "
-            "(`apply_dualchunkswap_to_jagged` rejects interleaved-action "
-            "layout in v0). Add --no_action to the experiments file, or "
-            "set --cp_size 1."
-        )
+        # NUM_CONTEXTUAL_FEATURES is set below; recompute here for the
+        # alignment-feasibility check.
+        ctx_max = 3  # matches the template (asserted below).
+        # 2*item is always even. We need (ctx_max + 2*item) % (2*cp_size) == 0.
+        # That requires `(2*item) % (2*cp_size) ≡ -ctx_max (mod 2*cp_size)`.
+        # The LHS is always even; the RHS is `(2*cp_size - ctx_max) % (2*cp_size)`.
+        # Feasible iff RHS is even, i.e., iff ctx_max is even.
+        if ctx_max % 2 != 0:
+            raise ValueError(
+                f"--cp_size={args.cp_size} with the default contextual "
+                f"schema (ctx_max={ctx_max}) requires --no_action: with "
+                "interleaved action, total per-sample seqlen = "
+                f"{ctx_max} + 2*item_length is always odd → never "
+                f"divisible by 2*cp_size = {2 * args.cp_size}. Use "
+                "--no_action, or change the template to have an even "
+                "number of contextual features."
+            )
 
     # Number of contextual features baked into the inline template; CP
     # alignment depends on this count. Parse the literal list from the
