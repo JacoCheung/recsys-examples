@@ -125,7 +125,14 @@ echo ""
 # ============================================================================
 # Environment Variable Setup (add HSTU_ROOT's parent directory to PYTHONPATH)
 # ============================================================================
-export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
+# CP override: route ALL CP paths through the `func`-based wrapper requires
+# FBGEMM kernel built with HSTU_ARBITRARY_NFUNC>=3. The stock production
+# image's `hstu` package doesn't have it. Prepend a lustre-staged
+# rebuilt-kernel site-packages path so it shadows the in-image install.
+# Path is the host-side; `/lustre` is mounted into the container by the
+# srun --container-mounts default at line 29.
+HSTU_REBUILT_PYPATH=${HSTU_REBUILT_PYPATH:-"/lustre/fsw/coreai_devtech_hugectr/junzhang/.local/lib/python3.12/site-packages"}
+export PYTHONPATH="${HSTU_REBUILT_PYPATH}:${HSTU_ROOT}/..:${PYTHONPATH}"
 export PYTHONWARNINGS="ignore"
 export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -240,7 +247,7 @@ WRAPPER_EOF
         bash -c "
             nvidia-smi && \
             cd ${HSTU_ROOT} && \
-            export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
+            export PYTHONPATH=${HSTU_REBUILT_PYPATH}:${HSTU_ROOT}/..:\${PYTHONPATH} && \
             export PYTHONUNBUFFERED=1 && \
             export DISABLE_RICH=1 && \
             export MEM_DEBUG=${MEM_DEBUG:-0} && \
@@ -272,7 +279,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_REBUILT_PYPATH}:${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
