@@ -59,6 +59,7 @@
   <div class="tab" onclick="switchTab(1)">2. Data Dependency</div>
   <div class="tab" onclick="switchTab(2)">3. NCCL Ordering</div>
   <div class="tab" onclick="switchTab(3)">4. Multi-Batch Pipeline</div>
+  <div class="tab" onclick="switchTab(4)">5. Search Space</div>
 </div>
 
 <div class="panels">
@@ -220,7 +221,7 @@ _NcclOrderedLock state machine:
 <h3>Mask formula (SPEC &sect;4.8)</h3>
 <pre>
 Task with batch_offset=k runs at iteration i iff:
-    (max_offset - k) ≤ i < M + (max_offset - k)
+    (max_offset - k) ≤ i &lt; M + (max_offset - k)
 
 Where M = number of batches pulled from dataloader.
 
@@ -243,6 +244,38 @@ For in_flight_batches=2 (max_offset=1), M=5:
 
 <h3>Full 3-batch pipeline: in_flight_batches=3</h3>
 <div class="diagram-scroll" id="diagram-pipeline-3"></div>
+</div>
+
+<!-- ============================================================ -->
+<!-- Panel 5: Search Space -->
+<!-- ============================================================ -->
+<div class="panel" id="panel-4">
+<h2>Auto-Scheduler v2 Search Space</h2>
+
+<div class="note">
+  Joint search chooses <code>thread_map</code>, <code>stream_map</code>, and <code>fire_ordering</code>.
+  Each candidate then calls the existing <code>auto_assign_lookaheads</code> lookahead oracle before scoring.
+</div>
+
+<h3>Beam-search funnel</h3>
+<div class="diagram-scroll" id="diagram-search-space"></div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#58a6ff"></div> default-stream anchor</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#f0883e"></div> movable prep task</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#bc8cff"></div> NCCL-serialized resource</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#3fb950"></div> scored candidate</div>
+</div>
+
+<h3>Hard constraints</h3>
+<pre>
+max_threads   &lt;= 4
+max_in_flight &lt;= 5
+forward / backward / finalize_model_grads / optimizer_step:
+    stream="default", lookahead=0
+
+NCCL tasks with the same comm group serialize even on different streams.
+</pre>
 </div>
 
 </div><!-- /panels -->
@@ -305,6 +338,7 @@ function arrow(x1,y1,x2,y2,color,dash) {
 
 // Colors
 const C = {
+  accent:'#58a6ff',
   default:'#58a6ff', memcpy:'#f0883e', nccl:'#bc8cff',
   bg:'#0d1117', border:'#30363d', fg:'#c9d1d9',
   green:'#3fb950', red:'#f85149', yellow:'#d29922',
@@ -657,6 +691,124 @@ const C = {
   s.appendChild(text(W-15, H-20, 'time', C.dim, 10, 'end'));
 
   document.getElementById('diagram-pipeline-3').appendChild(s);
+})();
+
+// ============================================================
+// Diagram 5: Auto-scheduler v2 search space
+// ============================================================
+(function(){
+  const W=1120, H=520;
+  const s = svg(W, H);
+
+  s.appendChild(text(W/2, 24, 'HSTU auto-scheduler v2: beam search over thread_map x stream_map x fire_ordering', C.yellow, 13, 'middle'));
+
+  function card(x, y, w, h, title, lines, color) {
+    s.appendChild(rect(x, y, w, h, '#161b22', 6, color));
+    s.appendChild(text(x+12, y+22, title, color, 12));
+    lines.forEach((lineText, i) => {
+      s.appendChild(text(x+12, y+48+i*18, lineText, i===0 ? C.fg : C.dim, 10));
+    });
+  }
+
+  card(30, 55, 210, 160, '1. thread_map', [
+    'HSTU presets',
+    'default / by_stream',
+    'io + data_dist + prefetch',
+    'reject per_task: 14 threads',
+    'cap: <= 4 workers'
+  ], C.green);
+
+  card(280, 55, 210, 160, '2. stream_map', [
+    'default, memcpy',
+    'data_dist, prefetch',
+    'prep groups may move',
+    'bit-exact chain frozen',
+    'cap: <= 4 stream groups'
+  ], C.memcpy);
+
+  card(530, 55, 210, 160, '3. fire_ordering', [
+    'topological tie-breaks',
+    'critical chain first',
+    'NCCL queue early',
+    'PCIe prep early',
+    'never removes DAG edges'
+  ], C.default);
+
+  // Beam funnel
+  s.appendChild(rect(790, 75, 130, 120, '#161b22', 6, C.yellow));
+  s.appendChild(text(855, 105, 'beam', C.yellow, 13, 'middle'));
+  s.appendChild(text(855, 126, 'keep top B', C.fg, 10, 'middle'));
+  s.appendChild(text(855, 144, 'after each', C.dim, 10, 'middle'));
+  s.appendChild(text(855, 162, 'mutation round', C.dim, 10, 'middle'));
+
+  // Scoring chain
+  card(970, 45, 130, 82, 'lookahead', [
+    'auto_assign',
+    'max_in_flight=5'
+  ], C.nccl);
+  card(970, 160, 130, 82, 'latency model', [
+    'cost JSON',
+    'overlap matrix'
+  ], C.green);
+  card(970, 275, 130, 70, 'best plan', [
+    'thread + stream',
+    'order + la'
+  ], C.accent);
+
+  // Arrows from axes to beam
+  s.appendChild(arrow(240, 135, 790, 118, C.dim));
+  s.appendChild(arrow(490, 135, 790, 135, C.dim));
+  s.appendChild(arrow(740, 135, 790, 152, C.dim));
+  s.appendChild(arrow(920, 135, 970, 88, C.nccl));
+  s.appendChild(arrow(1035, 127, 1035, 160, C.dim));
+  s.appendChild(arrow(1035, 242, 1035, 275, C.dim));
+
+  // Constraint gate
+  s.appendChild(rect(790, 225, 130, 120, '#161b22', 6, C.red));
+  s.appendChild(text(855, 253, 'hard gate', C.red, 13, 'middle'));
+  s.appendChild(text(855, 275, 'bit-exact la=0', C.fg, 10, 'middle'));
+  s.appendChild(text(855, 293, 'threads <= 4', C.dim, 10, 'middle'));
+  s.appendChild(text(855, 311, 'in-flight <= 5', C.dim, 10, 'middle'));
+  s.appendChild(text(855, 329, 'NCCL serial', C.dim, 10, 'middle'));
+  s.appendChild(arrow(855, 195, 855, 225, C.red));
+  s.appendChild(arrow(920, 285, 970, 202, C.green));
+
+  // Task strip
+  s.appendChild(text(30, 380, '14-task HSTU prefetch schedule: movable prep groups feed frozen default-stream anchors', C.yellow, 12));
+
+  const tasks = [
+    {n:'h2d', la:'la2', c:C.memcpy, nccl:false},
+    {n:'shuf_s', la:'la2', c:C.memcpy, nccl:true},
+    {n:'shuf_f', la:'la2', c:C.memcpy, nccl:true},
+    {n:'dist_s', la:'la1', c:C.nccl, nccl:true},
+    {n:'dist_w', la:'la1', c:C.nccl, nccl:true},
+    {n:'pref', la:'la1', c:C.memcpy, nccl:false},
+    {n:'zero', la:'la0', c:C.dim, nccl:false},
+    {n:'gtok', la:'la0', c:C.nccl, nccl:true},
+    {n:'barrier', la:'la0', c:C.dim, nccl:false},
+    {n:'fwd', la:'la0', c:C.default, nccl:false, frozen:true},
+    {n:'bwd', la:'la0', c:C.default, nccl:true, frozen:true},
+    {n:'final', la:'la0', c:C.default, nccl:true, frozen:true},
+    {n:'opt', la:'la0', c:C.default, nccl:false, frozen:true},
+    {n:'watch', la:'la0', c:C.dim, nccl:false},
+  ];
+
+  const x0=25, y0=400, bw=73, bh=52, gap=5;
+  tasks.forEach((task, i) => {
+    const x = x0 + i*(bw+gap);
+    const stroke = task.frozen ? C.default : (task.nccl ? C.nccl : task.c);
+    const fill = task.frozen ? C.default+'22' : task.c+'22';
+    s.appendChild(rect(x, y0, bw, bh, fill, 5, stroke, task.nccl && !task.frozen ? '4 3' : null));
+    s.appendChild(text(x+bw/2, y0+20, task.n, task.frozen ? C.default : stroke, 10, 'middle'));
+    s.appendChild(text(x+bw/2, y0+38, task.la, C.dim, 9, 'middle'));
+  });
+
+  // NCCL serialization rail
+  const railY = 477;
+  s.appendChild(line(x0+bw+gap, railY, x0+12*(bw+gap)+bw/2, railY, C.nccl, '4 4'));
+  s.appendChild(text(W/2, 496, 'same DP communicator: NCCL collectives serialize even when stream_map separates them', C.nccl, 10, 'middle'));
+
+  document.getElementById('diagram-search-space').appendChild(s);
 })();
 </script>
 
