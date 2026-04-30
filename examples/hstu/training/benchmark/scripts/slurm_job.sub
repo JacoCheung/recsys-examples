@@ -131,7 +131,25 @@ echo ""
 # rebuilt-kernel site-packages path so it shadows the in-image install.
 # Path is the host-side; `/lustre` is mounted into the container by the
 # srun --container-mounts default at line 29.
-HSTU_REBUILT_PYPATH=${HSTU_REBUILT_PYPATH:-"/lustre/fsw/coreai_devtech_hugectr/junzhang/.local/lib/python3.12/site-packages"}
+#
+# Auto-detect cluster by checking which lustre path exists. EOS uses
+# `/lustre/fsw/coreai_devtech_hugectr/junzhang/`; cw-dfw uses
+# `/lustre/fsw/portfolios/coreai/users/junzhang/`. Override via the
+# HSTU_REBUILT_PYPATH env var if you've staged the rebuilt kernel
+# elsewhere.
+if [ -z "${HSTU_REBUILT_PYPATH:-}" ]; then
+    if [ -f "/lustre/fsw/portfolios/coreai/users/junzhang/.local/lib/python3.12/site-packages/hstu/fbgemm_gpu_experimental_hstu.so" ]; then
+        HSTU_REBUILT_PYPATH="/lustre/fsw/portfolios/coreai/users/junzhang/.local/lib/python3.12/site-packages"
+    elif [ -f "/lustre/fsw/coreai_devtech_hugectr/junzhang/.local/lib/python3.12/site-packages/hstu/fbgemm_gpu_experimental_hstu.so" ]; then
+        HSTU_REBUILT_PYPATH="/lustre/fsw/coreai_devtech_hugectr/junzhang/.local/lib/python3.12/site-packages"
+    else
+        echo "⚠️  No staged rebuilt-kernel hstu/.so found in known lustre paths."
+        echo "   Set HSTU_REBUILT_PYPATH or stage the kernel; CP will fail with"
+        echo "   'This hstu attention build does not support arbitrary mask'."
+        HSTU_REBUILT_PYPATH=""
+    fi
+fi
+echo "HSTU_REBUILT_PYPATH=${HSTU_REBUILT_PYPATH:-<unset>}"
 export PYTHONPATH="${HSTU_REBUILT_PYPATH}:${HSTU_ROOT}/..:${PYTHONPATH}"
 export PYTHONWARNINGS="ignore"
 export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered
