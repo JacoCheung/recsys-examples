@@ -171,12 +171,17 @@ class HSTUBlock(MegatronModule):
                 gather_jagged_from_cp_rank,
             )
 
-            # Open the per-(HSTUBlock.forward) `func` tensor cache scope.
-            # All `_cached_localize_func_for_cp_step` calls in the inner
-            # CP wrappers (forward + backward) share this cache —
-            # 8 layers × cp_size builds → cp_size builds per training
-            # step. Closed in the `finally` block at the end of forward
-            # to release tensors regardless of exception.
+            # Open the per-training-step `func` tensor cache. All
+            # `_cached_localize_func_for_cp_step` calls in the inner CP
+            # wrappers (forward + backward) share this cache — 8 layers
+            # × cp_size builds (× 2 for fwd+bwd) collapses to `cp_size`
+            # builds per training step. The cache MUST live across the
+            # forward → backward boundary because PyTorch autograd runs
+            # `.backward()` on a worker thread; if we cleared the cache
+            # at end of forward, the backward thread would re-build all
+            # 16 funcs (cw-dfw round-4 regression: 30.9 → 667 TFLOPS,
+            # 4.6%). The next training step's `scope_enter` drops the
+            # prior step's tensors before any new build happens.
             cp_func_cache_scope_enter()
 
             cp_rank = dist.get_rank(self._cp_group)
@@ -195,20 +200,12 @@ class HSTUBlock(MegatronModule):
             # the CP wrapper consumes.
             jd = dataclasses.replace(jd, max_seqlen=global_jd_template.max_seqlen)
 
-        try:
-            for hstu_layer in self._attention_layers:
-                jd = hstu_layer(jd)
-        finally:
-            if cp_active:
-                # Note: backward will re-enter the same scope keyed by
-                # this thread; for now we close at forward end to release
-                # tensors. Backward rebuilds on first miss (which is
-                # acceptable since backward's per-layer-per-step build
-                # is also cached for the duration of backward).
-                # TODO: extend cache lifetime to include backward.
-                from context_parallel import cp_func_cache_scope_exit as _cp_exit
-
-                _cp_exit()
+        for hstu_layer in self._attention_layers:
+            jd = hstu_layer(jd)
+        # NOTE: do NOT call `cp_func_cache_scope_exit()` here. The cache
+        # must outlive forward so the autograd worker thread (which runs
+        # backward) can read what this thread wrote. The next training
+        # step's `cp_func_cache_scope_enter` will drop these tensors.
 
         if cp_active:
             assert global_jd_template is not None

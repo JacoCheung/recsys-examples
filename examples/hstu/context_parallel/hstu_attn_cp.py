@@ -33,7 +33,6 @@ What this module does NOT do (v0 / SPEC §2)
 
 from __future__ import annotations
 
-import threading
 from typing import Optional, Sequence
 
 import torch
@@ -81,48 +80,71 @@ _default_cp_streams: dict[int, "torch.cuda.Stream"] = {}
 
 
 # ----------------------------------------------------------------------------
-# Per-(HSTUBlock.forward) `func` tensor cache.
+# Per-training-step `func` tensor cache.
 #
 # `localize_func_for_cp_step` is invoked PER LAYER PER RING STEP inside
 # `_multi_gpu_forward_arbitrary` / `_multi_gpu_backward_arbitrary`. The
 # resulting `func` only depends on (cu_seqlens_global, cp_size, cp_rank,
 # step, num_contexts, num_targets, target_group_size, window_size) — all
-# of which are CONSTANT across the layer stack within a single
-# HSTUBlock.forward call. So we build `cp_size` funcs once and reuse them
-# across all 8 layers (8× builds avoided per training step). This was
-# the dominant overhead in the func-based CP path on EOS round-3
-# (1150ms/step → expected ~150ms/step after caching).
+# of which are CONSTANT across both the forward layer stack AND the
+# backward of the SAME training step. So we build `cp_size` funcs once
+# and reuse them across all 8 forward layers + the matching backward
+# layers (≈30× builds avoided per training step at 8 layers × cp_size=2).
+# This was the dominant overhead in the func-based CP path:
+#  - EOS round-3 no caching:           1150 ms/step (32 builds)
+#  - cw-dfw round-4 forward-only TLS:   734 ms/step (16 builds, backward
+#    rebuilt because PyTorch autograd runs backward on a *worker thread*
+#    — `threading.local()` set on the forward thread is NOT visible from
+#    the autograd worker thread. Use a plain module-level dict so the
+#    backward thread can read the cache the forward thread populated.)
 #
-# The cache is thread-local + scoped via `cp_func_cache_scope()` context
-# manager. HSTUBlock.forward enters the scope once; layers inside reuse.
-# Exiting the scope clears the cache to avoid leaking tensors across
-# training steps.
+# Lifetime: scope_enter() resets the dict; scope_exit() is a no-op (kept
+# for API symmetry). The dict naturally lives across the
+# forward-then-backward of one training step. The next training step's
+# scope_enter() drops the prior tensors before any new builds happen.
+#
+# Threading note: this is process-global (NOT thread-local) because we
+# need the autograd worker thread to read what the main thread wrote.
+# That's safe in practice: HSTU training is single-step single-thread —
+# only one HSTUBlock.forward runs at a time per process, so no concurrent
+# writers race on this dict.
 # ----------------------------------------------------------------------------
-_CP_FUNC_TLS = threading.local()
+_cp_func_cache: Optional[dict[int, torch.Tensor]] = None
 
 
 def cp_func_cache_scope_enter() -> None:
-    """Mark the start of a `HSTUBlock.forward` scope; create empty cache."""
-    _CP_FUNC_TLS.cache = {}
+    """Mark the start of a training step; create an empty cache.
+
+    Replaces (rather than .clear()s) the dict so the previous step's
+    tensors are released to the allocator the moment the next step
+    starts — without us having to walk the keys.
+    """
+    global _cp_func_cache
+    _cp_func_cache = {}
 
 
 def cp_func_cache_scope_exit() -> None:
-    """Mark the end of the scope; clear the cache to release tensors."""
-    _CP_FUNC_TLS.cache = None
+    """No-op kept for API symmetry.
+
+    The cache must outlive forward (backward, on its own autograd worker
+    thread, reads the same dict). It is dropped on the next training
+    step's scope_enter().
+    """
+    return
 
 
 def _cached_localize_func_for_cp_step(*, step: int, **kwargs) -> torch.Tensor:
-    """Drop-in replacement for `localize_func_for_cp_step` with TLS cache.
+    """Drop-in replacement for `localize_func_for_cp_step` with a cache.
 
     Cache is keyed by `step` only — the OTHER args (cu_seqlens_global,
     cp_size, cp_rank, num_contexts, num_targets, etc.) are invariant
-    within one HSTUBlock.forward scope. Each step's func tensor is
-    computed once on the first call and reused on subsequent calls
-    within the same scope.
+    within one training step. Each step's func tensor is computed once
+    on the first call and reused on subsequent calls within the same
+    scope (across forward AND backward of the same training step).
     """
     from ._mask_func import localize_func_for_cp_step
 
-    cache = getattr(_CP_FUNC_TLS, "cache", None)
+    cache = _cp_func_cache
     if cache is None:
         # No active scope: fall back to direct build (no caching).
         return localize_func_for_cp_step(step=step, **kwargs)
