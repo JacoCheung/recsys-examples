@@ -250,6 +250,15 @@ while [[ $# -gt 0 ]]; do
             GIT_BRANCH="$2"
             shift 2
             ;;
+        --benchmark-type=*|--benchmark-type)
+            # No-op compat shim: the e2e variant of this script ignores
+            # --benchmark-type because submit_remote.sh always sends it.
+            if [[ "$1" == --benchmark-type=* ]]; then
+                shift
+            else
+                shift 2
+            fi
+            ;;
         --help|-h)
             show_help
             ;;
