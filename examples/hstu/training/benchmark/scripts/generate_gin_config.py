@@ -323,6 +323,9 @@ def generate_config(args):
             file=sys.stderr,
         )
 
+    if args.cp_size < 1:
+        raise ValueError(f"--cp_size must be >= 1; got {args.cp_size}")
+
     # CP requires `--no_action` because `apply_dualchunkswap_to_jagged`
     # rejects interleaved-action layout (v0 limitation; SPEC §2). Validate
     # at config-gen time so the user sees the error here rather than at
@@ -335,19 +338,35 @@ def generate_config(args):
             "set --cp_size 1."
         )
 
-    # Number of contextual features hardcoded in the template (lines 91-99).
-    # contextual_max_seqlen = sum of each contextual feature's max_seqlen
-    # (each = 1, non-jagged). If you change the template's contextual list,
-    # update this count to match — assert below catches the mismatch by
-    # spot-checking the raw template string.
+    # Number of contextual features baked into the inline template; CP
+    # alignment depends on this count. Parse the literal list from the
+    # template string and compare its length, so a maintainer adding
+    # / removing a contextual feature without updating
+    # `NUM_CONTEXTUAL_FEATURES` here gets a clean error instead of
+    # silent alignment skew.
     NUM_CONTEXTUAL_FEATURES = 3
     template_str = get_baseline_template()
-    expected_ctx_features = "['user_id', 'user_age']"
-    if expected_ctx_features not in template_str:
+    import ast
+    import re
+
+    m = re.search(
+        r"BenchmarkDatasetArgs\.contextual_feature_names\s*=\s*(\[[^\]]*\])",
+        template_str,
+    )
+    if m is None:
         raise ValueError(
-            "gin template's contextual feature list changed; update "
-            "NUM_CONTEXTUAL_FEATURES (and this assertion) in "
-            "generate_gin_config.py to match. CP alignment depends on it."
+            "Cannot locate `BenchmarkDatasetArgs.contextual_feature_names` "
+            "list in the gin template — refactored away? CP alignment relies "
+            "on this count."
+        )
+    parsed_ctx = ast.literal_eval(m.group(1))
+    if len(parsed_ctx) != NUM_CONTEXTUAL_FEATURES:
+        raise ValueError(
+            f"gin template has {len(parsed_ctx)} contextual features "
+            f"({parsed_ctx!r}) but generate_gin_config has "
+            f"NUM_CONTEXTUAL_FEATURES = {NUM_CONTEXTUAL_FEATURES}. Update "
+            "the constant to match — CP alignment math (`align_offset`) "
+            "depends on it."
         )
 
     # Generate value distribution sections
