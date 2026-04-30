@@ -167,8 +167,17 @@ class HSTUBlock(MegatronModule):
             assert self._cp_group is not None  # for type-checker
             from context_parallel import (
                 apply_dualchunkswap_to_jagged,
+                cp_func_cache_scope_enter,
                 gather_jagged_from_cp_rank,
             )
+
+            # Open the per-(HSTUBlock.forward) `func` tensor cache scope.
+            # All `_cached_localize_func_for_cp_step` calls in the inner
+            # CP wrappers (forward + backward) share this cache —
+            # 8 layers × cp_size builds → cp_size builds per training
+            # step. Closed in the `finally` block at the end of forward
+            # to release tensors regardless of exception.
+            cp_func_cache_scope_enter()
 
             cp_rank = dist.get_rank(self._cp_group)
             global_jd_template = jd
@@ -186,8 +195,20 @@ class HSTUBlock(MegatronModule):
             # the CP wrapper consumes.
             jd = dataclasses.replace(jd, max_seqlen=global_jd_template.max_seqlen)
 
-        for hstu_layer in self._attention_layers:
-            jd = hstu_layer(jd)
+        try:
+            for hstu_layer in self._attention_layers:
+                jd = hstu_layer(jd)
+        finally:
+            if cp_active:
+                # Note: backward will re-enter the same scope keyed by
+                # this thread; for now we close at forward end to release
+                # tensors. Backward rebuilds on first miss (which is
+                # acceptable since backward's per-layer-per-step build
+                # is also cached for the duration of backward).
+                # TODO: extend cache lifetime to include backward.
+                from context_parallel import cp_func_cache_scope_exit as _cp_exit
+
+                _cp_exit()
 
         if cp_active:
             assert global_jd_template is not None

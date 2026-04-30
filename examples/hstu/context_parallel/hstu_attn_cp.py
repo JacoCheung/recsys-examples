@@ -33,6 +33,7 @@ What this module does NOT do (v0 / SPEC §2)
 
 from __future__ import annotations
 
+import threading
 from typing import Optional, Sequence
 
 import torch
@@ -77,6 +78,57 @@ _SPEC_REF = "see SPEC §2 (out-of-scope) and plan T3.1 (hard-guard list)"
 # attention compute. One stream per CUDA device per process, lazily created.
 # ----------------------------------------------------------------------------
 _default_cp_streams: dict[int, "torch.cuda.Stream"] = {}
+
+
+# ----------------------------------------------------------------------------
+# Per-(HSTUBlock.forward) `func` tensor cache.
+#
+# `localize_func_for_cp_step` is invoked PER LAYER PER RING STEP inside
+# `_multi_gpu_forward_arbitrary` / `_multi_gpu_backward_arbitrary`. The
+# resulting `func` only depends on (cu_seqlens_global, cp_size, cp_rank,
+# step, num_contexts, num_targets, target_group_size, window_size) — all
+# of which are CONSTANT across the layer stack within a single
+# HSTUBlock.forward call. So we build `cp_size` funcs once and reuse them
+# across all 8 layers (8× builds avoided per training step). This was
+# the dominant overhead in the func-based CP path on EOS round-3
+# (1150ms/step → expected ~150ms/step after caching).
+#
+# The cache is thread-local + scoped via `cp_func_cache_scope()` context
+# manager. HSTUBlock.forward enters the scope once; layers inside reuse.
+# Exiting the scope clears the cache to avoid leaking tensors across
+# training steps.
+# ----------------------------------------------------------------------------
+_CP_FUNC_TLS = threading.local()
+
+
+def cp_func_cache_scope_enter() -> None:
+    """Mark the start of a `HSTUBlock.forward` scope; create empty cache."""
+    _CP_FUNC_TLS.cache = {}
+
+
+def cp_func_cache_scope_exit() -> None:
+    """Mark the end of the scope; clear the cache to release tensors."""
+    _CP_FUNC_TLS.cache = None
+
+
+def _cached_localize_func_for_cp_step(*, step: int, **kwargs) -> torch.Tensor:
+    """Drop-in replacement for `localize_func_for_cp_step` with TLS cache.
+
+    Cache is keyed by `step` only — the OTHER args (cu_seqlens_global,
+    cp_size, cp_rank, num_contexts, num_targets, etc.) are invariant
+    within one HSTUBlock.forward scope. Each step's func tensor is
+    computed once on the first call and reused on subsequent calls
+    within the same scope.
+    """
+    from ._mask_func import localize_func_for_cp_step
+
+    cache = getattr(_CP_FUNC_TLS, "cache", None)
+    if cache is None:
+        # No active scope: fall back to direct build (no caching).
+        return localize_func_for_cp_step(step=step, **kwargs)
+    if step not in cache:
+        cache[step] = localize_func_for_cp_step(step=step, **kwargs)
+    return cache[step]
 
 
 def _get_cp_stream(
@@ -934,8 +986,6 @@ def _multi_gpu_forward_arbitrary(
     cp_stream: Optional["torch.cuda.Stream"] = None,
 ) -> torch.Tensor:
     """Multi-GPU forward via FBGEMM arbitrary-mask `func` per ring step."""
-    from ._mask_func import localize_func_for_cp_step
-
     local_max = max_seqlen_q_global // cp_size
 
     default_stream = torch.cuda.current_stream()
@@ -966,8 +1016,12 @@ def _multi_gpu_forward_arbitrary(
                 comm_stream=comm_stream,
             )
 
-        # 2. Build per-step `func` tensor and run the kernel.
-        func = localize_func_for_cp_step(
+        # 2. Build per-step `func` tensor and run the kernel. The
+        # `_cached_localize_func_for_cp_step` reuses across all layers
+        # in the same `HSTUBlock.forward` scope (set up via
+        # `cp_func_cache_scope_enter/exit`). Major perf win:
+        # 8 layers × cp_size builds → cp_size builds per training step.
+        func = _cached_localize_func_for_cp_step(
             cu_seqlens_global=cu_seqlens_global,
             cp_size=cp_size,
             cp_rank=cp_rank,
@@ -1308,8 +1362,6 @@ def _multi_gpu_backward_arbitrary(
     cp_stream: Optional["torch.cuda.Stream"] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reverse-ring backward for the arbitrary-mask CP forward."""
-    from ._mask_func import localize_func_for_cp_step
-
     local_max = max_seqlen_q_global // cp_size
 
     default_stream = torch.cuda.current_stream()
@@ -1348,8 +1400,9 @@ def _multi_gpu_backward_arbitrary(
                 comm_stream=comm_stream,
             )
 
-        # Per-step `func` tensor.
-        func = localize_func_for_cp_step(
+        # Per-step `func` tensor (cached: forward already built it for
+        # this scope, so backward gets a hit and avoids re-building).
+        func = _cached_localize_func_for_cp_step(
             cu_seqlens_global=cu_seqlens_global,
             cp_size=cp_size,
             cp_rank=cp_rank,

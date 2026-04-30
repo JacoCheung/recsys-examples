@@ -29,6 +29,8 @@ Public API (re-exported from `hstu_attn_cp`):
 from .hstu_attn_cp import (
     GuardError,
     apply_dualchunkswap_to_jagged,
+    cp_func_cache_scope_enter,
+    cp_func_cache_scope_exit,
     gather_global_from_cp_rank,
     gather_jagged_from_cp_rank,
     get_batch_on_this_cp_rank_for_hstu,
@@ -41,5 +43,7 @@ __all__ = [
     "gather_global_from_cp_rank",
     "apply_dualchunkswap_to_jagged",
     "gather_jagged_from_cp_rank",
+    "cp_func_cache_scope_enter",
+    "cp_func_cache_scope_exit",
     "GuardError",
 ]
