@@ -33,6 +33,7 @@ V3 adds cross-stream `wait_stream` insertion; V4 adds N-batch ring +
 prefill/drain; V5 adds validator; V9 adds auto-scheduler.
 """
 
+import contextlib
 from typing import Any, Callable, Generic, Iterable, Iterator, Optional, TypeVar
 
 import torch
@@ -46,6 +47,26 @@ from .deps import (
 from .executor import SequentialExecutor, ThreadedExecutor
 from .schedule import Schedule, Stage
 from .streams import StreamPool
+
+# NVTX is optional; mirrors executor.py's pattern. Used to bracket each
+# internal pipeline iteration so timeline analyzers can see boundaries
+# between progress() iterations (in addition to per-task ranges already
+# emitted by the executor).
+try:
+    import nvtx as _nvtx
+except ImportError:  # pragma: no cover - nvtx absence
+    _nvtx = None
+
+
+def _progress_nvtx_range(iter_count: int):
+    """Wrap one internal pipeline iteration in an NVTX range tagged
+    ``progress[iter=N]``. No-op when nvtx is unavailable or CUDA is
+    not initialized — the range would have no profiler to record into.
+    """
+    if _nvtx is None or not torch.cuda.is_available():
+        return contextlib.nullcontext()
+    return _nvtx.annotate(f"progress[iter={iter_count}]")
+
 
 __all__ = ["Pipeline", "SchedulablePipeline"]
 
@@ -255,55 +276,59 @@ class SchedulablePipeline(Generic[In, Out]):
         correct: if M < prefill-count the pipeline ends during
         prefill, and the first `progress()` call raises).
         """
-        # Pull next batch into the furthest-ahead slot if iterator
-        # still has batches. Populates `batch_cpu` at
-        # batch_offset=max_offset per SPEC §4.7 protocol.
-        #
-        # Exception: if `_seed_first_batch` was called, the first
-        # `_seeded` iters skip the pull — the slot is already populated
-        # and `_pulled` has already been bumped.
-        if self._seeded > 0:
-            self._seeded -= 1
-        elif not self._exhausted:
-            try:
-                batch = next(batch_iter)
-                self._ring.at(self._max_offset).set("batch_cpu", batch)
-                self._pulled += 1
-            except StopIteration:
-                self._exhausted = True
+        with _progress_nvtx_range(self._internal_iter):
+            # Pull next batch into the furthest-ahead slot if iterator
+            # still has batches. Populates `batch_cpu` at
+            # batch_offset=max_offset per SPEC §4.7 protocol.
+            #
+            # Exception: if `_seed_first_batch` was called, the first
+            # `_seeded` iters skip the pull — the slot is already populated
+            # and `_pulled` has already been bumped.
+            if self._seeded > 0:
+                self._seeded -= 1
+            elif not self._exhausted:
+                try:
+                    batch = next(batch_iter)
+                    self._ring.at(self._max_offset).set("batch_cpu", batch)
+                    self._pulled += 1
+                except StopIteration:
+                    self._exhausted = True
 
-        # End check AFTER pull attempt: at this `_internal_iter`,
-        # with this `_pulled` count, can any task's mask still fire?
-        # The k=0 task has the widest window (hi = pulled + max_offset).
-        # So once `_internal_iter >= pulled + max_offset` with the
-        # iterator exhausted, no further useful work is possible.
-        if self._exhausted and self._internal_iter >= self._pulled + self._max_offset:
-            raise StopIteration
+            # End check AFTER pull attempt: at this `_internal_iter`,
+            # with this `_pulled` count, can any task's mask still fire?
+            # The k=0 task has the widest window (hi = pulled + max_offset).
+            # So once `_internal_iter >= pulled + max_offset` with the
+            # iterator exhausted, no further useful work is possible.
+            if (
+                self._exhausted
+                and self._internal_iter >= self._pulled + self._max_offset
+            ):
+                raise StopIteration
 
-        iter_count = self._internal_iter
-        mask = lambda task: self._should_run(task, iter_count, self._pulled)
+            iter_count = self._internal_iter
+            mask = lambda task: self._should_run(task, iter_count, self._pulled)
 
-        for stage in self._schedule.stages:
-            self._executor.execute_stage(
-                stage,
-                self._ctx,
-                iter_count,
-                mask,
-                self._cross_stream_waits,
-                self._stream_pool,
-                event_deps=self._cross_stream_event_deps,
-                producers_to_record=self._producers_to_record,
-            )
+            for stage in self._schedule.stages:
+                self._executor.execute_stage(
+                    stage,
+                    self._ctx,
+                    iter_count,
+                    mask,
+                    self._cross_stream_waits,
+                    self._stream_pool,
+                    event_deps=self._cross_stream_event_deps,
+                    producers_to_record=self._producers_to_record,
+                )
 
-        # Restore active offset for any external inspection.
-        self._ctx._active_offset = 0
+            # Restore active offset for any external inspection.
+            self._ctx._active_offset = 0
 
-        # Capture result (what the offset=0 compute task wrote) BEFORE
-        # advancing the ring — the current slot is about to be evicted.
-        result = self._ring.current().get(self.RETURN_SLOT, None)
-        self._ring.advance()
-        self._internal_iter += 1
-        return result
+            # Capture result (what the offset=0 compute task wrote) BEFORE
+            # advancing the ring — the current slot is about to be evicted.
+            result = self._ring.current().get(self.RETURN_SLOT, None)
+            self._ring.advance()
+            self._internal_iter += 1
+            return result
 
     def progress(self, batch_iter: Iterator) -> Optional[object]:
         """User-facing driver — SPEC §4.8 contract.
