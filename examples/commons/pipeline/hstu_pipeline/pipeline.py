@@ -370,12 +370,24 @@ class HSTUPipeline:
         depth=K adds K-1 buffer slots between input_dist and compute:
               max_offset = K+1 for both variants.
         """
-        depth = self._prefetch_depth
-        h2d_lookahead = depth + 1  # = 2 for depth=1
-        start_shuffle_lookahead = h2d_lookahead
-        finish_shuffle_lookahead = h2d_lookahead
-        start_input_dist_lookahead = depth  # = 1 for depth=1
-        wait_input_dist_lookahead = depth
+        self._prefetch_depth
+        # 6-la cascade: every same-thread / host-sync chain pair gets +1
+        # la so each downstream "wait" drains a producer that fired 1
+        # full iter ago (host syncs collapse to ~µs).
+        #
+        # Pair                                 Host sync source           Fix
+        # h2d → start_shuffle                  tolist() after AG          +1 la
+        # start_shuffle → finish_shuffle       KK background wait         +1 la
+        # start_input_dist → wait_input_dist   awaitable.wait() splits    +1 la
+        # wait_input_dist → prefetch_emb       request.wait() tensor a2a  +1 la
+        #
+        # 6 in-flight batches; prefetch.la − forward.la is unchanged (=1)
+        # so dynamicemb prefetch cache outstanding keys budget is intact.
+        h2d_lookahead = 5
+        start_shuffle_lookahead = 4
+        finish_shuffle_lookahead = 3
+        start_input_dist_lookahead = 3
+        wait_input_dist_lookahead = 2
         prefetch_lookahead = 1 if self._prefetch else None
 
         # Apply auto-scheduler / explicit overrides. Only the off-default
