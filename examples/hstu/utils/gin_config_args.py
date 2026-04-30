@@ -405,20 +405,26 @@ class OptimizerArgs:
 @gin.configurable
 @dataclass
 class TensorModelParallelArgs:
-    """Tensor Model Parallelism Configuration.
+    """Tensor / Context Model Parallelism Configuration.
 
-    Tensor model parallelism settings.
+    Tensor model parallelism + context parallelism settings.
 
     Attributes:
         tensor_model_parallel_size (int): Tensor model parallel size (number of GPUs
             for model sharding). Default: 1.
+        context_parallel_size (int): Context parallel size (number of GPUs that
+            jointly compute one DP replica's attention via DualChunkSwap; only
+            wired through `HSTULayerType.NATIVE`). Default: 1.
 
     Note:
-        The data parallel size is deduced based on the world_size and
-        tensor_model_parallel_size.
+        The data parallel size is deduced as
+        `world_size / (tensor_model_parallel_size * context_parallel_size)`.
+        CP > 1 requires `HSTULayerType.NATIVE` and `sequence_parallel = False`
+        (rejected at `HSTUBlock.__init__` otherwise).
     """
 
     tensor_model_parallel_size: int = 1
+    context_parallel_size: int = 1
 
 
 @gin.configurable

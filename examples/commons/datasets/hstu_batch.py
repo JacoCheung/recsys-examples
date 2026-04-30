@@ -96,6 +96,11 @@ class RandomDistribution:
     std: Optional[float] = None
     # zipf distribution parameter
     alpha: Optional[float] = None
+    # Round each sample up to the nearest multiple of `align_to` (after
+    # clamp). 1 = no alignment. Required > 1 for context-parallel
+    # benchmarks where DualChunkSwap demands `seqlen % (2 * cp_size) == 0`
+    # per sample.
+    align_to: int = 1
 
     def sample(
         self,
@@ -118,7 +123,7 @@ class RandomDistribution:
         if self.dist_type == DistType.UNIFORM:
             assert hi is not None, "uniform distribution requires `high` to be set"
             assert hi > lo, f"uniform requires high > low, got [{lo}, {hi})"
-            return torch.randint(lo, hi, (size,), device=device)
+            return self._align(torch.randint(lo, hi, (size,), device=device))
 
         elif self.dist_type == DistType.NORMAL:
             assert (
@@ -129,7 +134,7 @@ class RandomDistribution:
             samples = samples.clamp(min=lo)
             if hi is not None:
                 samples = samples.clamp(max=hi)
-            return samples.round().long().to(device)
+            return self._align(samples.round().long().to(device))
 
         elif self.dist_type == DistType.LOGNORMAL:
             assert (
@@ -151,7 +156,7 @@ class RandomDistribution:
             samples = samples.clamp(min=lo)
             if hi is not None:
                 samples = samples.clamp(max=hi)
-            return samples.round().long().to(device)
+            return self._align(samples.round().long().to(device))
 
         elif self.dist_type == DistType.ZIPF:
             alpha = self.alpha if self.alpha is not None else 1.5
@@ -168,10 +173,33 @@ class RandomDistribution:
                 if hi is not None:
                     samples = samples.clamp(max=hi)
                 samples = samples.to(device)
-            return samples
+            return self._align(samples)
 
         else:
             raise ValueError(f"Unknown distribution type: {self.dist_type}")
+
+    def _align(self, samples: torch.Tensor) -> torch.Tensor:
+        """Round each sample up to the nearest multiple of `self.align_to`.
+
+        Used by CP benchmarks where DualChunkSwap demands
+        `L_b % (2 * cp_size) == 0` per sample. Skipped at align_to=1.
+        Clamps zero-aligned samples up to `align_to` so no sample is
+        empty (the dispatcher rejects `L_b == 0`).
+        """
+        if self.align_to <= 1:
+            return samples
+        a = self.align_to
+        # Round-up: ((x + a - 1) // a) * a
+        aligned = ((samples + (a - 1)) // a) * a
+        # Ensure no zero-length sample.
+        aligned = torch.where(aligned > 0, aligned, torch.full_like(aligned, a))
+        if self.high is not None:
+            # Cap at the largest multiple of `a` that fits under high.
+            cap = (self.high // a) * a
+            if cap < a:
+                cap = a
+            aligned = aligned.clamp(max=cap)
+        return aligned
 
 
 @dataclass

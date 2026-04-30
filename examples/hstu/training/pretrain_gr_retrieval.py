@@ -87,7 +87,8 @@ def main():
 
     init.initialize_distributed()
     init.initialize_model_parallel(
-        tensor_model_parallel_size=tp_args.tensor_model_parallel_size
+        tensor_model_parallel_size=tp_args.tensor_model_parallel_size,
+        context_parallel_size=tp_args.context_parallel_size,
     )
     init.set_random_seed(trainer_args.seed)
 

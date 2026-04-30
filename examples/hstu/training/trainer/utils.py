@@ -71,8 +71,13 @@ def create_hstu_config(
         raise ValueError(
             f"Kernel backend {network_args.kernel_backend} is not supported."
         )
+    # CP > 1 also requires NATIVE layer (FUSED triton fusion has no CP
+    # wrapper); HSTUBlock.__init__ rejects FUSED+CP explicitly.
     layer_type = None
-    if tensor_model_parallel_args.tensor_model_parallel_size == 1:
+    if (
+        tensor_model_parallel_args.tensor_model_parallel_size == 1
+        and tensor_model_parallel_args.context_parallel_size == 1
+    ):
         layer_type = HSTULayerType.FUSED
     else:
         layer_type = HSTULayerType.NATIVE

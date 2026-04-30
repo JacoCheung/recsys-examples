@@ -1,0 +1,15 @@
+# DP2CP2 vs DP4 — context-parallelism overhead measurement.
+#
+# Run on a single 8-GPU node with --ranks-per-node=4 (so world_size=4
+# per job). Compare TFLOPS:
+#   - dp4_cp1: cp_size=1, dp=4 (no CP comm)
+#   - dp2_cp2: cp_size=2, dp=2 (each CP cohort = 2 GPUs sharing one DP replica)
+# Both at the same total batch size; CP halves per-rank Q-chunk work but adds
+# DualChunkSwap KV ring + post-layer gather.
+#
+# All experiments use cutlass + balanced_shuffler + recompute_layernorm
+# (the strongest reference baseline; matches exp3_recompute / exp4_tp).
+#
+# Format: exp_name,generate_gin_config_options
+dp4_cp1,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --cp_size 1 --value_dist zipf --value_dist_alpha 1.05
+dp2_cp2,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --cp_size 2 --value_dist zipf --value_dist_alpha 1.05

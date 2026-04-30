@@ -46,6 +46,7 @@ def get_baseline_template():
 #   - Eviction Strategy: {evict}
 #   - Pipeline: {pipeline_type}
 #   - Tensor Parallel: {tp_size}
+#   - Context Parallel: {cp_size}
 # ============================================================================
 
 # ===== Trainer Configuration =====
@@ -76,6 +77,8 @@ item_and_action_feature/FeatureArgs.is_jagged = True
 item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
 item_seqlen_dist/RandomDistribution.alpha = 1.2
 item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length
+# CP requires per-sample L_b % (2*cp_size) == 0; for cp_size=1 align_to=1 is a no-op.
+item_seqlen_dist/RandomDistribution.align_to = {seqlen_align_to}
 item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
 
 {value_dist_section}
@@ -175,6 +178,7 @@ OptimizerArgs.adam_eps = 1e-8
 
 # ===== Parallelism =====
 TensorModelParallelArgs.tensor_model_parallel_size = {tp_size}
+TensorModelParallelArgs.context_parallel_size = {cp_size}
 """
 
 
@@ -264,6 +268,16 @@ Examples:
     )
 
     parser.add_argument(
+        "--cp_size",
+        type=int,
+        default=1,
+        help="Context Parallel size — DualChunkSwap GPUs jointly computing one DP "
+        "replica's attention via `hstu_attn_varlen_cp_func`. Requires NATIVE "
+        "layer (auto-selected by `create_hstu_config` when cp_size>1). "
+        "(default: 1)",
+    )
+
+    parser.add_argument(
         "--value_dist",
         type=str,
         choices=["uniform", "zipf"],
@@ -334,6 +348,10 @@ def generate_config(args):
         evict=args.evict,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
+        cp_size=args.cp_size,
+        # When CP > 1, align random seqlens to 2*cp_size so DualChunkSwap's
+        # per-sample alignment invariant holds. cp=1 → align_to=1 (no-op).
+        seqlen_align_to=2 * args.cp_size if args.cp_size > 1 else 1,
         value_dist_section=value_dist_section,
         user_id_value_dist_section=user_id_value_dist_section,
     )

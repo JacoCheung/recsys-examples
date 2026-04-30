@@ -52,12 +52,13 @@ def initialize_distributed():
     torch.distributed.init_process_group(backend=backend)
 
 
-def initialize_model_parallel(tensor_model_parallel_size=1):
+def initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1):
     if parallel_state.model_parallel_is_initialized():
         return
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        context_parallel_size=context_parallel_size,
     )
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
