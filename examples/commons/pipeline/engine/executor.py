@@ -134,12 +134,18 @@ def _nvtx_range(task: Task) -> Iterator[None]:
     ``task.nvtx_tag`` (falling back to ``task.name`` when the tag is
     unset). No-op when nvtx is not importable or when CUDA is not
     available — the range would have no profiler to record into.
+
+    Prefixed with ``[engine]`` and colored ``orange`` so it visually
+    separates from the inner task-body ``nvtx.annotate("## ... ##")``
+    ranges. The outer range covers the whole task slot (cross-thread
+    Event.wait + body + completion bookkeeping); the inner range
+    covers only the actual task body work.
     """
     if _nvtx is None or not torch.cuda.is_available():
         yield
         return
     tag = task.nvtx_tag or task.name
-    with _nvtx.annotate(tag):
+    with _nvtx.annotate(f"[engine] {tag}", color="orange"):
         yield
 
 
@@ -438,15 +444,31 @@ class ThreadedExecutor:
     max_workers : int, optional
         Maximum worker threads. Auto-sized to the number of active
         thread groups if not specified.
+    inline_thread : str, optional
+        Name of one thread chain to run **on the calling thread**
+        (typically Python's main thread) instead of submitting to the
+        worker pool. Default: ``"compute"``. Set to ``None`` to disable
+        and run all chains in the pool.
+
+        Why: ``nsys`` projects an NVTX range onto a CUDA stream only when
+        the emitting thread launched kernels on that stream during the
+        range. With every task body on a worker thread, a main-thread
+        range like ``step N`` projects to no GPU stream because the main
+        thread itself launches no kernels — it just dispatches. Running
+        the kernel-heavy chain (default-stream forward / backward / opt)
+        inline on the main thread restores the NVTX → default-stream GPU
+        projection.
     """
 
     def __init__(
         self,
         thread_map: ThreadMap = None,
         max_workers: Optional[int] = None,
+        inline_thread: Optional[str] = "compute",
     ) -> None:
         self._thread_map = thread_map
         self._max_workers = max_workers
+        self._inline_thread = inline_thread
         self._pool: Optional[ThreadPoolExecutor] = None
         self._pool_size: int = 0
         self._nccl_lock = _NcclOrderedLock()
@@ -527,8 +549,6 @@ class ThreadedExecutor:
                     _record_completion_event(task, ctx, producers_to_record)
             return
 
-        pool = self._ensure_pool(len(thread_to_tasks))
-
         # Per-task completion events
         completion: Dict[str, threading.Event] = {
             t.name: threading.Event() for t in active
@@ -606,10 +626,28 @@ class ThreadedExecutor:
                 for t in tasks:
                     completion[t.name].set()
 
-        # Submit each thread chain
+        # Inline-thread split: pop the chain whose name matches
+        # ``inline_thread`` (default "compute") and run it on the
+        # calling thread, so its kernels and NVTX ranges attach to the
+        # caller for nsys's NVTX→GPU-stream projection. The remaining
+        # chains run in the pool concurrently with the inline run.
+        inline_chain: Optional[List[Task]] = None
+        if self._inline_thread is not None and self._inline_thread in thread_to_tasks:
+            inline_chain = thread_to_tasks.pop(self._inline_thread)
+
+        # Submit non-inlined thread chains to the pool first so they
+        # start running concurrently with the inline chain.
         futures = []
-        for thread_id, tasks in thread_to_tasks.items():
-            futures.append(pool.submit(_run_thread_chain, tasks))
+        if thread_to_tasks:
+            pool = self._ensure_pool(len(thread_to_tasks))
+            for thread_id, tasks in thread_to_tasks.items():
+                futures.append(pool.submit(_run_thread_chain, tasks))
+
+        # Run the inlined chain on the calling thread. ``cpu_deps`` /
+        # ``completion`` / ``_nccl_lock`` are shared closures, so cross-
+        # thread ordering still holds.
+        if inline_chain is not None:
+            _run_thread_chain(inline_chain)
 
         # Stage barrier
         for f in futures:
