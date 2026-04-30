@@ -88,28 +88,14 @@ item_seqlen_dist/RandomDistribution.align_offset = {seqlen_align_offset}
 item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
 
 {value_dist_section}
-# Contextual Features (only 3)
-user_contextual_features/FeatureArgs.feature_names = ['user_id', 'user_age']
-user_contextual_features/FeatureArgs.max_sequence_length = 1
-user_contextual_features/FeatureArgs.is_jagged = False
-{user_id_value_dist_section}
-
-item_contextual_features/FeatureArgs.feature_names = ['item_category_l1']
-item_contextual_features/FeatureArgs.max_sequence_length = 1
-item_contextual_features/FeatureArgs.is_jagged = False
-
+{contextual_features_block}
 BenchmarkDatasetArgs.feature_args = [
     @item_and_action_feature/FeatureArgs(),
-    @user_contextual_features/FeatureArgs(),
-    @item_contextual_features/FeatureArgs(),
+{contextual_feature_args_lines}
 ]
 
 BenchmarkDatasetArgs.item_feature_name = 'item'
-BenchmarkDatasetArgs.contextual_feature_names = [
-    'user_id',
-    'user_age',
-    'item_category_l1',
-]  # Total 3 contextual features
+BenchmarkDatasetArgs.contextual_feature_names = {contextual_feature_names_literal}
 BenchmarkDatasetArgs.action_feature_name = {action_feature_name_value}
 BenchmarkDatasetArgs.max_num_candidates = 0
 BenchmarkDatasetArgs.num_generated_batches = 100
@@ -151,9 +137,7 @@ item_cat_l1_emb/EmbeddingArgs.sharding_type = 'data_parallel'
 BenchmarkDatasetArgs.embedding_args = [
     @item_embedding/DynamicEmbeddingArgs(),
 {action_embedding_line}
-    @user_id_emb/DynamicEmbeddingArgs(),
-    @user_age_emb/EmbeddingArgs(),
-    @item_cat_l1_emb/EmbeddingArgs(),
+{contextual_embedding_lines}
 ]
 
 # ===== Network Configuration =====
@@ -294,6 +278,18 @@ Examples:
     )
 
     parser.add_argument(
+        "--no_contextual",
+        action="store_true",
+        default=False,
+        help="Drop all contextual features (user_id, user_age, item_category_l1) "
+        "from the dataset. Lets the CP wrapper take the structured-mask path "
+        "(no arbitrary-mask `func` kernel), which works even on FBGEMM builds "
+        "without HSTU_ARBITRARY_NFUNC. Set both --no_action and --no_contextual "
+        "for the simplest item-only causal CP benchmark on production builds. "
+        "(default: False)",
+    )
+
+    parser.add_argument(
         "--value_dist",
         type=str,
         choices=["uniform", "zipf"],
@@ -352,36 +348,11 @@ def generate_config(args):
             "formula — not yet implemented. Use --no_action."
         )
 
-    # Number of contextual features baked into the inline template; CP
-    # alignment depends on this count. Parse the literal list from the
-    # template string and compare its length, so a maintainer adding
-    # / removing a contextual feature without updating
-    # `NUM_CONTEXTUAL_FEATURES` here gets a clean error instead of
-    # silent alignment skew.
-    NUM_CONTEXTUAL_FEATURES = 3
-    template_str = get_baseline_template()
-    import ast
-    import re
-
-    m = re.search(
-        r"BenchmarkDatasetArgs\.contextual_feature_names\s*=\s*(\[[^\]]*\])",
-        template_str,
-    )
-    if m is None:
-        raise ValueError(
-            "Cannot locate `BenchmarkDatasetArgs.contextual_feature_names` "
-            "list in the gin template — refactored away? CP alignment relies "
-            "on this count."
-        )
-    parsed_ctx = ast.literal_eval(m.group(1))
-    if len(parsed_ctx) != NUM_CONTEXTUAL_FEATURES:
-        raise ValueError(
-            f"gin template has {len(parsed_ctx)} contextual features "
-            f"({parsed_ctx!r}) but generate_gin_config has "
-            f"NUM_CONTEXTUAL_FEATURES = {NUM_CONTEXTUAL_FEATURES}. Update "
-            "the constant to match — CP alignment math (`align_offset`) "
-            "depends on it."
-        )
+    # Number of contextual features after applying --no_contextual.
+    # 3 by default (user_id, user_age, item_category_l1); 0 with --no_contextual.
+    # CP alignment math depends on this count: total per-sample seqlen =
+    # NUM_CONTEXTUAL_FEATURES + main_seqlen must be divisible by 2*cp_size.
+    NUM_CONTEXTUAL_FEATURES = 0 if args.no_contextual else 3
 
     # Generate value distribution sections
     if args.value_dist == "zipf":
@@ -446,8 +417,44 @@ def generate_config(args):
         action_embedding_line=""
         if args.no_action
         else "    @action_embedding/EmbeddingArgs(),",
+        # Contextual features. Either the full 3-feature schema or empty
+        # (with `--no_contextual`). Empty drops the contextual prefix from
+        # `jd.values` and lets CP wrappers route through the
+        # structured-mask kernel path (no arbitrary-mask `func` needed),
+        # which works on FBGEMM builds without HSTU_ARBITRARY_NFUNC.
+        contextual_features_block=(
+            ""
+            if args.no_contextual
+            else f"""# Contextual Features (3 total)
+user_contextual_features/FeatureArgs.feature_names = ['user_id', 'user_age']
+user_contextual_features/FeatureArgs.max_sequence_length = 1
+user_contextual_features/FeatureArgs.is_jagged = False
+{user_id_value_dist_section}
+
+item_contextual_features/FeatureArgs.feature_names = ['item_category_l1']
+item_contextual_features/FeatureArgs.max_sequence_length = 1
+item_contextual_features/FeatureArgs.is_jagged = False
+"""
+        ),
+        contextual_feature_args_lines=(
+            ""
+            if args.no_contextual
+            else "    @user_contextual_features/FeatureArgs(),\n"
+            "    @item_contextual_features/FeatureArgs(),"
+        ),
+        contextual_feature_names_literal=(
+            "[]"
+            if args.no_contextual
+            else "[\n    'user_id',\n    'user_age',\n    'item_category_l1',\n]"
+        ),
+        contextual_embedding_lines=(
+            ""
+            if args.no_contextual
+            else "    @user_id_emb/DynamicEmbeddingArgs(),\n"
+            "    @user_age_emb/EmbeddingArgs(),\n"
+            "    @item_cat_l1_emb/EmbeddingArgs(),"
+        ),
         value_dist_section=value_dist_section,
-        user_id_value_dist_section=user_id_value_dist_section,
     )
 
     return config

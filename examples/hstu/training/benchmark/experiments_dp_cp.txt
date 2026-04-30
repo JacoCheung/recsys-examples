@@ -11,5 +11,5 @@
 # (the strongest reference baseline; matches exp3_recompute / exp4_tp).
 #
 # Format: exp_name,generate_gin_config_options
-dp4_cp1,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --cp_size 1 --no_action --value_dist zipf --value_dist_alpha 1.05
-dp2_cp2,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --cp_size 2 --no_action --value_dist zipf --value_dist_alpha 1.05
+dp4_cp1,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --cp_size 1 --no_action --no_contextual --value_dist zipf --value_dist_alpha 1.05
+dp2_cp2,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --cp_size 2 --no_action --no_contextual --value_dist zipf --value_dist_alpha 1.05
