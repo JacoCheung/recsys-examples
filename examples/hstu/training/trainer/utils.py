@@ -171,6 +171,21 @@ def get_data_loader(
         )
     else:
         assert isinstance(dataset_args, DatasetArgs)
+        # CP fix: real-dataset sharding must use the DP rank/world (excluding
+        # CP), so all CP cohort ranks see the SAME batch (CP slices the
+        # sequence dimension across cohort, not the dataset). Using
+        # `dist.get_rank() / get_world_size()` would make CP cohort ranks
+        # see different batches → CP math broken (codex review BLOCKER Q2).
+        from megatron.core import parallel_state as _ps
+
+        if _ps.model_parallel_is_initialized():
+            dp_rank = _ps.get_data_parallel_rank(with_context_parallel=False)
+            dp_world = _ps.get_data_parallel_world_size(with_context_parallel=False)
+        else:
+            # `set_random_seed` initialises parallel_state; this branch only
+            # fires when called outside the standard trainer entry.
+            dp_rank = dist.get_rank()
+            dp_world = dist.get_world_size()
         (
             train_dataset,
             test_dataset,
@@ -181,8 +196,8 @@ def get_data_loader(
             max_num_candidates=dataset_args.max_num_candidates,
             num_tasks=num_tasks,
             batch_size=trainer_args.train_batch_size,
-            rank=dist.get_rank(),
-            world_size=dist.get_world_size(),
+            rank=dp_rank,
+            world_size=dp_world,
             shuffle=dataset_args.shuffle,
             random_seed=trainer_args.seed,
             eval_batch_size=trainer_args.eval_batch_size,

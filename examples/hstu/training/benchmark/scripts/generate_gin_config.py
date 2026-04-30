@@ -70,15 +70,21 @@ TrainerArgs.ckpt_save_dir = './checkpoints/generated_exp'
 TrainerArgs.ckpt_save_interval = 999999999
 
 # ===== Dataset Configuration =====
-# Main sequence features (item + action)
-item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
+# Main sequence features (item [+ action]).  When `--no_action` is set
+# the action feature is dropped — required for CP runs in v0 because
+# `apply_dualchunkswap_to_jagged` rejects interleaved action layout.
+item_and_action_feature/FeatureArgs.feature_names = {item_feature_names}
 item_and_action_feature/FeatureArgs.max_sequence_length = 4096
 item_and_action_feature/FeatureArgs.is_jagged = True
 item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
 item_seqlen_dist/RandomDistribution.alpha = 1.2
 item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length
-# CP requires per-sample L_b % (2*cp_size) == 0; for cp_size=1 align_to=1 is a no-op.
+# CP requires per-sample (contextual_max_seqlen + main_seqlen) % (2*cp_size) == 0.
+# `align_to = 2*cp_size`; `align_offset` shifts the main_seqlen target residue
+# so that `(main + contextual_max_seqlen) % align_to == 0`. cp=1 → both 0/1
+# (no-op).
 item_seqlen_dist/RandomDistribution.align_to = {seqlen_align_to}
+item_seqlen_dist/RandomDistribution.align_offset = {seqlen_align_offset}
 item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
 
 {value_dist_section}
@@ -104,7 +110,7 @@ BenchmarkDatasetArgs.contextual_feature_names = [
     'user_age',
     'item_category_l1',
 ]  # Total 3 contextual features
-BenchmarkDatasetArgs.action_feature_name = 'action'
+BenchmarkDatasetArgs.action_feature_name = {action_feature_name_value}
 BenchmarkDatasetArgs.max_num_candidates = 0
 BenchmarkDatasetArgs.num_generated_batches = 100
 
@@ -141,10 +147,10 @@ item_cat_l1_emb/EmbeddingArgs.table_name = 'item_category_l1'
 item_cat_l1_emb/EmbeddingArgs.item_vocab_size_or_capacity = 50
 item_cat_l1_emb/EmbeddingArgs.sharding_type = 'data_parallel'
 
-# Aggregate all embedding configs (5 embedding tables total)
+# Aggregate all embedding configs.
 BenchmarkDatasetArgs.embedding_args = [
     @item_embedding/DynamicEmbeddingArgs(),
-    @action_embedding/EmbeddingArgs(),
+{action_embedding_line}
     @user_id_emb/DynamicEmbeddingArgs(),
     @user_age_emb/EmbeddingArgs(),
     @item_cat_l1_emb/EmbeddingArgs(),
@@ -278,6 +284,16 @@ Examples:
     )
 
     parser.add_argument(
+        "--no_action",
+        action="store_true",
+        default=False,
+        help="Drop the interleaved action feature from the dataset. Required "
+        "when cp_size>1 because `apply_dualchunkswap_to_jagged` rejects "
+        "interleaved-action layout in v0 (would need half-stride permutation). "
+        "(default: False)",
+    )
+
+    parser.add_argument(
         "--value_dist",
         type=str,
         choices=["uniform", "zipf"],
@@ -349,9 +365,24 @@ def generate_config(args):
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
         cp_size=args.cp_size,
-        # When CP > 1, align random seqlens to 2*cp_size so DualChunkSwap's
-        # per-sample alignment invariant holds. cp=1 → align_to=1 (no-op).
+        # When CP > 1, align random seqlens so that
+        # (main_seqlen + contextual_max_seqlen) % (2*cp_size) == 0.
+        # contextual_max_seqlen = number of contextual features (each has
+        # max_sequence_length=1, non-jagged). 3 by default. With
+        # --no_contextual it's 0. cp=1 → align_to=1 (no-op).
         seqlen_align_to=2 * args.cp_size if args.cp_size > 1 else 1,
+        # If cp>1: aligned_main has residue (-ctx_max) % align_to mod align_to.
+        # align_offset stored is `ctx_max % align_to` so that
+        # target_residue = (align_to - align_offset) % align_to ≡ -ctx_max.
+        # ctx_max=3 here (3 contextual features each max_sequence_length=1,
+        # see lines 87-95 of this template). Update if the contextual
+        # feature schema changes.
+        seqlen_align_offset=(3 % (2 * args.cp_size) if args.cp_size > 1 else 0),
+        item_feature_names="['item']" if args.no_action else "['item', 'action']",
+        action_feature_name_value="None" if args.no_action else "'action'",
+        action_embedding_line=""
+        if args.no_action
+        else "    @action_embedding/EmbeddingArgs(),",
         value_dist_section=value_dist_section,
         user_id_value_dist_section=user_id_value_dist_section,
     )

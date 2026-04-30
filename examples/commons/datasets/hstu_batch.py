@@ -96,11 +96,19 @@ class RandomDistribution:
     std: Optional[float] = None
     # zipf distribution parameter
     alpha: Optional[float] = None
-    # Round each sample up to the nearest multiple of `align_to` (after
-    # clamp). 1 = no alignment. Required > 1 for context-parallel
-    # benchmarks where DualChunkSwap demands `seqlen % (2 * cp_size) == 0`
-    # per sample.
+    # Round each sample up so that `(sample + align_offset) % align_to == 0`
+    # (after clamp). 1 = no alignment.
+    #
+    # Required for context-parallel benchmarks where DualChunkSwap demands
+    # `(contextual_max_seqlen + main_seqlen) % (2 * cp_size) == 0` per sample.
+    # The contextual prefix is a fixed offset added by the preprocessor
+    # (typically = number of contextual features), so the random-sampled
+    # `main_seqlen` must be aligned such that the SUM is a multiple of
+    # `2 * cp_size`. Caller passes `align_to = 2 * cp_size` and
+    # `align_offset = (align_to - contextual_max_seqlen % align_to) % align_to`.
+    # When `align_offset = 0`, the behaviour reduces to plain ceil-to-align_to.
     align_to: int = 1
+    align_offset: int = 0
 
     def sample(
         self,
@@ -179,25 +187,35 @@ class RandomDistribution:
             raise ValueError(f"Unknown distribution type: {self.dist_type}")
 
     def _align(self, samples: torch.Tensor) -> torch.Tensor:
-        """Round each sample up to the nearest multiple of `self.align_to`.
+        """Round each sample up so that `(sample + align_offset) % align_to == 0`.
 
-        Used by CP benchmarks where DualChunkSwap demands
-        `L_b % (2 * cp_size) == 0` per sample. Skipped at align_to=1.
-        Clamps zero-aligned samples up to `align_to` so no sample is
-        empty (the dispatcher rejects `L_b == 0`).
+        Used by CP benchmarks: DualChunkSwap requires
+        `(contextual_max_seqlen + main_seqlen) % (2*cp_size) == 0`.
+        Caller sets `align_to = 2*cp_size` and `align_offset = (align_to
+        - contextual_max_seqlen % align_to) % align_to` so that
+        `aligned_main + contextual_max_seqlen` is divisible by `2*cp_size`.
+
+        Skipped at align_to=1. Clamps to ensure no sample is empty.
         """
         if self.align_to <= 1:
             return samples
         a = self.align_to
-        # Round-up: ((x + a - 1) // a) * a
-        aligned = ((samples + (a - 1)) // a) * a
-        # Ensure no zero-length sample.
-        aligned = torch.where(aligned > 0, aligned, torch.full_like(aligned, a))
+        o = self.align_offset % a  # normalize to [0, a)
+        # We want aligned ≡ -o (mod a) ≡ (a - o) % a (mod a).
+        # I.e., target_residue := (a - o) % a, and aligned is the smallest
+        # value ≥ samples with that residue mod a.
+        # Equivalent formula: ((samples - target_residue + a - 1) // a) * a + target_residue
+        target_residue = (a - o) % a
+        aligned = ((samples - target_residue + (a - 1)) // a) * a + target_residue
+        # Ensure no zero-length sample. Smallest legal value > 0 with the
+        # target residue: if target_residue > 0 → target_residue; else a.
+        min_legal = target_residue if target_residue > 0 else a
+        aligned = torch.where(aligned > 0, aligned, torch.full_like(aligned, min_legal))
         if self.high is not None:
-            # Cap at the largest multiple of `a` that fits under high.
-            cap = (self.high // a) * a
-            if cap < a:
-                cap = a
+            # Cap at the largest legal value ≤ high.
+            cap = ((self.high - target_residue) // a) * a + target_residue
+            if cap < min_legal:
+                cap = min_legal
             aligned = aligned.clamp(max=cap)
         return aligned
 

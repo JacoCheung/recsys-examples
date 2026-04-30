@@ -844,7 +844,15 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             local_loss_sum = torch.sum(losses)
 
         if self._model.training:
-            dp_size = parallel_state.get_data_parallel_world_size()
+            # CP fix: gradient_scaling_factor in MCoreDistributedDataParallel
+            # uses 1/data_parallel_world_size(with_context_parallel=True). The
+            # loss-side scaling here must match (= dp_world_size_with_cp) so
+            # the SUM all-reduce yields the correct mean per-token gradient.
+            # Without with_context_parallel=True, dense weight grads end up
+            # under-scaled by cp_size (see codex review Q7).
+            dp_size = parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True
+            )
             with nvtx.annotate("## backward ##"):
                 (local_loss_sum * dp_size / global_tokens).backward()
 
@@ -994,7 +1002,15 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             self._prefetch(self._batch_ip1)
         if self._model.training:
             torch.cuda.current_stream().wait_stream(self._prefetch_stream)
-            dp_size = parallel_state.get_data_parallel_world_size()
+            # CP fix: gradient_scaling_factor in MCoreDistributedDataParallel
+            # uses 1/data_parallel_world_size(with_context_parallel=True). The
+            # loss-side scaling here must match (= dp_world_size_with_cp) so
+            # the SUM all-reduce yields the correct mean per-token gradient.
+            # Without with_context_parallel=True, dense weight grads end up
+            # under-scaled by cp_size (see codex review Q7).
+            dp_size = parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True
+            )
             with nvtx.annotate("## backward ##"):
                 (local_loss_sum * dp_size / global_tokens).backward()
 
@@ -1062,7 +1078,15 @@ class JaggedMegatronTrainNonePipeline:
             local_loss_sum = torch.sum(losses)
 
         if self._model.training:
-            dp_size = parallel_state.get_data_parallel_world_size()
+            # CP fix: gradient_scaling_factor in MCoreDistributedDataParallel
+            # uses 1/data_parallel_world_size(with_context_parallel=True). The
+            # loss-side scaling here must match (= dp_world_size_with_cp) so
+            # the SUM all-reduce yields the correct mean per-token gradient.
+            # Without with_context_parallel=True, dense weight grads end up
+            # under-scaled by cp_size (see codex review Q7).
+            dp_size = parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True
+            )
             with nvtx.annotate("## backward ##"):
                 (local_loss_sum * dp_size / global_tokens).backward()
 
