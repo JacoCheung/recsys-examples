@@ -80,45 +80,54 @@ _default_cp_streams: dict[int, "torch.cuda.Stream"] = {}
 
 
 # ----------------------------------------------------------------------------
-# Per-(shape, dtype, device, slot) ping-pong buffer pool.
+# Ring-P2P recv buffer pool — keyed by (dtype, device, slot) ONLY.
 #
-# `_multi_gpu_forward_arbitrary` and `_multi_gpu_backward_arbitrary` allocate
-# fresh `torch.empty_like(k_local)` every layer for the recv side of the ring
-# P2P (recv_k, recv_v, and in backward also recv_dk, recv_dv). Across 8
-# layers × {fwd, bwd, reverse-ring}, that's ~32 fresh ~56 MB allocations per
-# training step. The shape/dtype/device is invariant across layers — every
-# layer's k_local has the same packed-jagged layout — so we reuse one
-# physical tensor per (shape, dtype, device, slot) tuple.
+# `_multi_gpu_forward_arbitrary` and `_multi_gpu_backward_arbitrary` used to
+# allocate fresh `torch.empty_like(k_local)` every layer for the recv side of
+# the ring P2P (recv_k, recv_v, and in backward also recv_dk, recv_dv).
+# Across 8 layers × {fwd, bwd KV-reload, bwd reverse-ring}, that's ~32 fresh
+# ~56 MB allocations per training step.
+#
+# We pool one storage per (dtype, device, slot). Different cu_seqlens between
+# training steps give different total_tokens — and thus different
+# `k_local.shape[0]` — so we DO NOT key by shape (a previous attempt did,
+# leaking ~80 MB/step until OOM at iter ~400 — see commit log "fix(cp):
+# pool recv buffers across layers"). Instead we keep a 1-D max-size storage
+# per slot, grow it on demand, and return a `view(template.shape)` carved
+# out of the front. The view is contiguous because the storage was allocated
+# contiguous and we slice the leading 1-D, which is what NCCL P2P needs.
 #
 # Stream-correctness: each ring step ends with
 # `default_stream.wait_stream(comm_stream)` followed by reading the recv
 # buffer; the next layer's `comm_stream.wait_stream(default_stream)` before
 # the next NCCL P2P guarantees the previous layer's last read on the same
-# buffer has completed before NCCL writes. So reusing across layers is safe
-# even though comm and compute live on separate streams.
-#
-# Memory bound: cap the per-key list at `_RECV_POOL_SLOTS_MAX` to defend
-# against truly unbounded slot keys (production workloads only need 4 slots:
-# recv_k, recv_v, recv_dk, recv_dv).
+# buffer has completed before NCCL writes. Reusing the storage across layers
+# is therefore safe even though comm and compute live on separate streams.
 # ----------------------------------------------------------------------------
-_recv_buffer_pool: dict[tuple, dict[str, torch.Tensor]] = {}
+_recv_buffer_pool: dict[tuple, torch.Tensor] = {}
 
 
 def _get_recv_buffer(template: torch.Tensor, slot: str) -> torch.Tensor:
-    """Return a reusable empty tensor matching `template`'s shape/dtype/device.
+    """Return a `template.shape`-sized contiguous view onto a pooled storage.
 
-    `slot` is a logical name (e.g., "recv_k") — buffers with the same
-    (shape, dtype, device, slot) tuple are physically the same tensor across
-    calls. Use distinct slots when a single layer holds two recv tensors
-    simultaneously (recv_k AND recv_v during the same ring step).
+    Pool key is (template.dtype, template.device, slot). The storage is
+    allocated 1-D with `template.numel()` elements on first use and grown
+    in place if a later call's `template.numel()` exceeds the cached size.
+
+    `slot` is a logical name ("fwd_recv_k" etc.) — distinct slots map to
+    distinct physical storages so a single layer can hold two recv tensors
+    (recv_k AND recv_v) simultaneously without aliasing.
     """
-    key = (tuple(template.shape), template.dtype, template.device)
-    by_slot = _recv_buffer_pool.setdefault(key, {})
-    buf = by_slot.get(slot)
-    if buf is None:
-        buf = torch.empty_like(template)
-        by_slot[slot] = buf
-    return buf
+    key = (template.dtype, template.device, slot)
+    needed = template.numel()
+    cached = _recv_buffer_pool.get(key)
+    if cached is None or cached.numel() < needed:
+        cached = torch.empty(needed, dtype=template.dtype, device=template.device)
+        _recv_buffer_pool[key] = cached
+    # Slice the front then reshape to template.shape. Front-slice on a
+    # contiguous 1-D tensor stays contiguous; .view(shape) is a no-copy
+    # reshape that NCCL P2P consumes natively.
+    return cached.narrow(0, 0, needed).view(template.shape)
 
 
 def cp_recv_buffer_pool_clear() -> None:
