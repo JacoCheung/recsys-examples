@@ -1145,22 +1145,15 @@ def _multi_gpu_forward_arbitrary(
     # buffer) and by `default_stream.wait_stream(comm_stream)` after
     # the wait (read can see NCCL's writes).
     #
-    # `cur_k`/`cur_v` represent "the K/V this rank is currently
-    # attending against". For cp_size==2, the swap pattern executes
-    # exactly ONCE (between step 0 and step 1) — after that, cur_k
-    # points at the pool buffer (peer's K) and recv_k points at
-    # whatever cur_k was before the swap. Since step 1 is the LAST
-    # step, no further P2P writes touch recv_k. So if we let
-    # `cur_k = k_local` without cloning, the post-swap recv_k aliases
-    # k_local for one final no-op step — safe. For cp_size >= 3 the
-    # swap runs multiple times and recv_k is written by NCCL on every
-    # iteration except the last; aliasing k_local would corrupt it.
-    if cp_size == 2:
-        cur_k = k_local
-        cur_v = v_local
-    else:
-        cur_k = k_local.clone()
-        cur_v = v_local.clone()
+    # `cur_k`/`cur_v` are kept as fresh `clone()` even for cp_size==2.
+    # We tried `cur_k = k_local` (no clone) in round-12 to save a
+    # ~56 MB memcpy per layer; NCCL's batch_isend_irecv rejected it
+    # with `ValueError: Tensors for P2P must be non-overlapping and
+    # dense`, presumably because k_local is the autograd Function's
+    # input and shares storage / version metadata that NCCL's
+    # validator doesn't accept as a P2P tensor. The clone is mandatory.
+    cur_k = k_local.clone()
+    cur_v = v_local.clone()
     recv_k = _get_recv_buffer(k_local, slot="fwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="fwd_recv_v")
 
@@ -1698,17 +1691,18 @@ def _multi_gpu_backward_arbitrary(
     comm_stream = _get_cp_stream(q_local.device, cp_stream)
 
     # Re-run the forward ring locally to reconstruct kv_at_step[i]. Same
-    # ping-pong + clone-only-when-needed pattern as the fwd path.
-    # Distinct slot names from the forward path so fwd's autograd-saved
-    # clones and bwd's recv buffers cannot collide (PyTorch autograd may
-    # run bwd on a worker thread, but each pool slot is a single physical
-    # buffer — sharing across fwd/bwd would invite a race).
-    if cp_size == 2:
-        cur_k = k_local
-        cur_v = v_local
-    else:
-        cur_k = k_local.clone()
-        cur_v = v_local.clone()
+    # ping-pong + clone pattern as the fwd path. Distinct slot names
+    # from the forward path so fwd's autograd-saved clones and bwd's
+    # recv buffers cannot collide (PyTorch autograd may run bwd on a
+    # worker thread, but each pool slot is a single physical buffer —
+    # sharing across fwd/bwd would invite a race).
+    #
+    # Same NCCL-validator constraint as the fwd path: `cur_k = k_local`
+    # without clone is rejected at P2P time with `ValueError: Tensors
+    # for P2P must be non-overlapping and dense`. The clone is
+    # mandatory.
+    cur_k = k_local.clone()
+    cur_v = v_local.clone()
     recv_k = _get_recv_buffer(k_local, slot="bwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="bwd_recv_v")
 
