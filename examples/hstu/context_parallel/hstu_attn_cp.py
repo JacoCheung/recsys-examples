@@ -80,6 +80,54 @@ _default_cp_streams: dict[int, "torch.cuda.Stream"] = {}
 
 
 # ----------------------------------------------------------------------------
+# Per-(shape, dtype, device, slot) ping-pong buffer pool.
+#
+# `_multi_gpu_forward_arbitrary` and `_multi_gpu_backward_arbitrary` allocate
+# fresh `torch.empty_like(k_local)` every layer for the recv side of the ring
+# P2P (recv_k, recv_v, and in backward also recv_dk, recv_dv). Across 8
+# layers × {fwd, bwd, reverse-ring}, that's ~32 fresh ~56 MB allocations per
+# training step. The shape/dtype/device is invariant across layers — every
+# layer's k_local has the same packed-jagged layout — so we reuse one
+# physical tensor per (shape, dtype, device, slot) tuple.
+#
+# Stream-correctness: each ring step ends with
+# `default_stream.wait_stream(comm_stream)` followed by reading the recv
+# buffer; the next layer's `comm_stream.wait_stream(default_stream)` before
+# the next NCCL P2P guarantees the previous layer's last read on the same
+# buffer has completed before NCCL writes. So reusing across layers is safe
+# even though comm and compute live on separate streams.
+#
+# Memory bound: cap the per-key list at `_RECV_POOL_SLOTS_MAX` to defend
+# against truly unbounded slot keys (production workloads only need 4 slots:
+# recv_k, recv_v, recv_dk, recv_dv).
+# ----------------------------------------------------------------------------
+_recv_buffer_pool: dict[tuple, dict[str, torch.Tensor]] = {}
+
+
+def _get_recv_buffer(template: torch.Tensor, slot: str) -> torch.Tensor:
+    """Return a reusable empty tensor matching `template`'s shape/dtype/device.
+
+    `slot` is a logical name (e.g., "recv_k") — buffers with the same
+    (shape, dtype, device, slot) tuple are physically the same tensor across
+    calls. Use distinct slots when a single layer holds two recv tensors
+    simultaneously (recv_k AND recv_v during the same ring step).
+    """
+    key = (tuple(template.shape), template.dtype, template.device)
+    by_slot = _recv_buffer_pool.setdefault(key, {})
+    buf = by_slot.get(slot)
+    if buf is None:
+        buf = torch.empty_like(template)
+        by_slot[slot] = buf
+    return buf
+
+
+def cp_recv_buffer_pool_clear() -> None:
+    """Free the pooled recv buffers. Tests / shutdown only."""
+    global _recv_buffer_pool
+    _recv_buffer_pool = {}
+
+
+# ----------------------------------------------------------------------------
 # Cross-training-step `func` tensor cache.
 #
 # `localize_func_for_cp_step` is invoked PER LAYER PER RING STEP inside
@@ -1080,11 +1128,17 @@ def _multi_gpu_forward_arbitrary(
     default_stream = torch.cuda.current_stream()
     comm_stream = _get_cp_stream(q_local.device, cp_stream)
 
-    # Ping-pong KV buffers (same pattern as `_multi_gpu_forward`).
+    # Ping-pong KV buffers. recv_k/recv_v come from the module-level
+    # pool — same physical buffer is reused across all 8 layers'
+    # forwards. Stream-correctness is preserved by the
+    # `comm_stream.wait_stream(default_stream)` issued before each
+    # NCCL P2P (waits for the previous layer's last kernel read on the
+    # buffer) and by `default_stream.wait_stream(comm_stream)` after
+    # the wait (read can see NCCL's writes).
     cur_k = k_local.clone()
     cur_v = v_local.clone()
-    recv_k = torch.empty_like(k_local)
-    recv_v = torch.empty_like(v_local)
+    recv_k = _get_recv_buffer(k_local, slot="fwd_recv_k")
+    recv_v = _get_recv_buffer(v_local, slot="fwd_recv_v")
 
     out_local = torch.zeros_like(q_local, dtype=torch.float32)
 
@@ -1609,11 +1663,15 @@ def _multi_gpu_backward_arbitrary(
     comm_stream = _get_cp_stream(q_local.device, cp_stream)
 
     # Re-run the forward ring locally to reconstruct kv_at_step[i].  Same
-    # ping-pong + clone pattern as `_multi_gpu_backward`.
+    # ping-pong + clone pattern as `_multi_gpu_backward`. Distinct slot
+    # names from the forward path so fwd's autograd-saved clones and
+    # bwd's recv buffers cannot collide (PyTorch autograd may run bwd
+    # on a worker thread, but each pool slot is a single physical
+    # buffer — sharing across fwd/bwd would invite a race).
     cur_k = k_local.clone()
     cur_v = v_local.clone()
-    recv_k = torch.empty_like(k_local)
-    recv_v = torch.empty_like(v_local)
+    recv_k = _get_recv_buffer(k_local, slot="bwd_recv_k")
+    recv_v = _get_recv_buffer(v_local, slot="bwd_recv_v")
 
     dq_acc = torch.zeros_like(q_local, dtype=torch.float32)
     dk_acc = torch.zeros_like(k_local, dtype=torch.float32)
@@ -1691,9 +1749,10 @@ def _multi_gpu_backward_arbitrary(
     # Reverse-ring dKV exchange (same logic as `_multi_gpu_backward`):
     # send dKV computed at step i to peer (cp_rank - i) % cp_size; receive
     # from peer (cp_rank + i) % cp_size who computed dKV for OUR KV at
-    # their step i.
-    recv_dk = torch.empty_like(k_local)
-    recv_dv = torch.empty_like(v_local)
+    # their step i. Distinct pool slot from the bwd KV-reload path so
+    # the two reverse rings don't collide on the same buffer mid-step.
+    recv_dk = _get_recv_buffer(k_local, slot="bwd_recv_dk")
+    recv_dv = _get_recv_buffer(v_local, slot="bwd_recv_dv")
     for step, dk_p, dv_p in dkv_to_send:
         send_dst = cp_global_ranks[(cp_rank - step) % cp_size]
         recv_src = cp_global_ranks[(cp_rank + step) % cp_size]
