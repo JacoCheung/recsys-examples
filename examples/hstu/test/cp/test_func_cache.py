@@ -62,63 +62,39 @@ def _make_kwargs(*, device: torch.device) -> dict:
 
 @pytest.fixture
 def reset_cache_after_test():
-    """Ensure each test starts and ends with no active cache scope.
+    """Ensure each test starts and ends with an empty cache.
 
     Without this, leakage between tests would mask cache-visibility bugs
     (e.g. test B reads test A's residual cache and passes accidentally).
     """
-    from context_parallel import hstu_attn_cp as _cp
+    from context_parallel import cp_func_cache_scope_enter
 
-    _cp._cp_func_cache = None
+    cp_func_cache_scope_enter()  # clear before
     yield
-    _cp._cp_func_cache = None
+    cp_func_cache_scope_enter()  # clear after
 
 
-def test_no_scope_falls_through_no_caching(reset_cache_after_test):
-    """When no scope is active, each call rebuilds the func tensor.
+def test_dedups_across_repeated_calls(reset_cache_after_test):
+    """Repeated calls with the SAME args return the SAME tensor.
 
-    Regression guard: it must be possible to call
-    `_cached_localize_func_for_cp_step` outside any scope (e.g. in unit
-    tests, or in code paths that haven't entered the scope yet) and get
-    a correct result without crashing on a None lookup.
+    Validates both the layer-stack reuse path (8 layers calling for the
+    same step within one HSTUBlock.forward) AND the cross-iteration
+    reuse (training step N+k calling with the same cu_seqlens as step N).
+    Both fold to the same cache hit.
     """
     from context_parallel.hstu_attn_cp import _cached_localize_func_for_cp_step
 
     kw = _make_kwargs(device=torch.device("cpu"))
-    a = _cached_localize_func_for_cp_step(step=0, **kw)
-    b = _cached_localize_func_for_cp_step(step=0, **kw)
-    # Both correct, but DIFFERENT objects (no cache).
-    assert torch.equal(a, b)
-    assert a.data_ptr() != b.data_ptr(), (
-        "outside scope, _cached_localize_func should fall through and "
-        "build a fresh tensor on every call"
-    )
+
+    first = _cached_localize_func_for_cp_step(step=0, **kw)
+    second = _cached_localize_func_for_cp_step(step=0, **kw)
+    third = _cached_localize_func_for_cp_step(step=1, **kw)
+
+    assert first is second, "same kwargs must return cached tensor"
+    assert first is not third, "different `step` must not collide"
 
 
-def test_scope_dedups_across_main_thread_calls(reset_cache_after_test):
-    """Inside a scope, repeated calls for the same step return the SAME tensor.
-
-    This validates the layer-stack reuse path (8 layers calling for the
-    same step within one HSTUBlock.forward).
-    """
-    from context_parallel import cp_func_cache_scope_enter, cp_func_cache_scope_exit
-    from context_parallel.hstu_attn_cp import _cached_localize_func_for_cp_step
-
-    kw = _make_kwargs(device=torch.device("cpu"))
-
-    cp_func_cache_scope_enter()
-    try:
-        first = _cached_localize_func_for_cp_step(step=0, **kw)
-        second = _cached_localize_func_for_cp_step(step=0, **kw)
-        third = _cached_localize_func_for_cp_step(step=1, **kw)
-    finally:
-        cp_func_cache_scope_exit()
-
-    assert first is second, "same step in same scope must return cached tensor"
-    assert first is not third, "different step keys must not collide"
-
-
-def test_scope_visible_from_other_thread(reset_cache_after_test):
+def test_cache_visible_from_other_thread(reset_cache_after_test):
     """The cache populated on thread A must be visible to thread B.
 
     This is the ROOT BUG of cw-dfw round-4: PyTorch autograd backward
@@ -130,28 +106,23 @@ def test_scope_visible_from_other_thread(reset_cache_after_test):
     With a module-level dict, the worker thread reads the same
     dict that the main thread populated.
     """
-    from context_parallel import cp_func_cache_scope_enter, cp_func_cache_scope_exit
     from context_parallel.hstu_attn_cp import _cached_localize_func_for_cp_step
 
     kw = _make_kwargs(device=torch.device("cpu"))
 
-    cp_func_cache_scope_enter()
-    try:
-        # Populate from MAIN thread (mirrors HSTUBlock.forward).
-        main_tensor = _cached_localize_func_for_cp_step(step=0, **kw)
+    # Populate from MAIN thread (mirrors HSTUBlock.forward).
+    main_tensor = _cached_localize_func_for_cp_step(step=0, **kw)
 
-        # Read from a DIFFERENT thread (mirrors autograd worker thread
-        # running the backward `apply()` of the autograd.Function).
-        other: dict[str, torch.Tensor] = {}
+    # Read from a DIFFERENT thread (mirrors autograd worker thread
+    # running the backward `apply()` of the autograd.Function).
+    other: dict[str, torch.Tensor] = {}
 
-        def worker():
-            other["t"] = _cached_localize_func_for_cp_step(step=0, **kw)
+    def worker():
+        other["t"] = _cached_localize_func_for_cp_step(step=0, **kw)
 
-        t = threading.Thread(target=worker)
-        t.start()
-        t.join()
-    finally:
-        cp_func_cache_scope_exit()
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
 
     assert "t" in other, "worker thread did not return a tensor"
     assert other["t"] is main_tensor, (
@@ -161,29 +132,82 @@ def test_scope_visible_from_other_thread(reset_cache_after_test):
     )
 
 
-def test_scope_enter_drops_previous_step_tensors(reset_cache_after_test):
-    """`scope_enter()` MUST replace the dict so step N's tensors get
-    GC'd before step N+1 builds new ones — otherwise we leak `cp_size`
-    func tensors per training step indefinitely.
-    """
-    import weakref
+def test_cache_keys_on_cu_seqlens_content(reset_cache_after_test):
+    """Two distinct cu_seqlens values produce distinct cache entries.
 
-    from context_parallel import cp_func_cache_scope_enter
+    Cross-iteration caching requires content-keyed lookup. If we only
+    keyed on `step`, the cache would silently return a STALE func built
+    against a different batch's cu_seqlens — wrong mask = wrong grads
+    = silent training corruption. This is the most important regression
+    guard for the cross-step caching change.
+    """
     from context_parallel.hstu_attn_cp import _cached_localize_func_for_cp_step
 
-    kw = _make_kwargs(device=torch.device("cpu"))
-
-    cp_func_cache_scope_enter()
-    step_n = _cached_localize_func_for_cp_step(step=0, **kw)
-    ref = weakref.ref(step_n)
-    # Drop the local reference, then start the next step.
-    del step_n
-    cp_func_cache_scope_enter()
-    # The previous step's tensor must now be unreferenced.
-    assert ref() is None, (
-        "scope_enter() must drop the previous step's tensors so "
-        "memory does not grow unboundedly across training steps"
+    cu_a = torch.tensor([0, 8, 16], dtype=torch.int32, device="cpu")
+    cu_b = torch.tensor([0, 4, 16], dtype=torch.int32, device="cpu")  # 4+12 split
+    common_kw = dict(
+        cp_size=2,
+        cp_rank=0,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=(-1, 0),
+        NFUNC=3,
+        device=torch.device("cpu"),
     )
+
+    func_a = _cached_localize_func_for_cp_step(
+        step=0, cu_seqlens_global=cu_a, **common_kw
+    )
+    func_b = _cached_localize_func_for_cp_step(
+        step=0, cu_seqlens_global=cu_b, **common_kw
+    )
+    func_a_again = _cached_localize_func_for_cp_step(
+        step=0, cu_seqlens_global=cu_a, **common_kw
+    )
+
+    assert func_a is not func_b, (
+        "different cu_seqlens MUST produce different cache entries — "
+        "otherwise we'd return a stale func and silently corrupt grads"
+    )
+    assert func_a_again is func_a, (
+        "same cu_seqlens content (even via a fresh tensor object) must "
+        "hit the cache — this is the cross-iteration win"
+    )
+
+
+def test_cache_caps_growth(reset_cache_after_test):
+    """The cache must evict when it grows beyond `_CP_FUNC_CACHE_MAX`.
+
+    Bounding cache size matters for production workloads with truly
+    random per-step batches (memory leak otherwise).
+    """
+    from context_parallel import hstu_attn_cp as _cp
+    from context_parallel.hstu_attn_cp import _cached_localize_func_for_cp_step
+
+    common_kw = dict(
+        cp_size=2,
+        cp_rank=0,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=(-1, 0),
+        NFUNC=3,
+        device=torch.device("cpu"),
+    )
+
+    saved_max = _cp._CP_FUNC_CACHE_MAX
+    _cp._CP_FUNC_CACHE_MAX = 3
+    try:
+        for k in range(5):
+            cu = torch.tensor([0, 4, 8 + k], dtype=torch.int32, device="cpu")
+            _cached_localize_func_for_cp_step(step=0, cu_seqlens_global=cu, **common_kw)
+        assert len(_cp._cp_func_cache) <= 3, (
+            f"cache must not exceed _CP_FUNC_CACHE_MAX={3}; "
+            f"got {len(_cp._cp_func_cache)} entries"
+        )
+    finally:
+        _cp._CP_FUNC_CACHE_MAX = saved_max
 
 
 def test_scope_exit_keeps_cache_alive_for_backward(reset_cache_after_test):

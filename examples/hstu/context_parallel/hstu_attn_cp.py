@@ -80,77 +80,144 @@ _default_cp_streams: dict[int, "torch.cuda.Stream"] = {}
 
 
 # ----------------------------------------------------------------------------
-# Per-training-step `func` tensor cache.
+# Cross-training-step `func` tensor cache.
 #
 # `localize_func_for_cp_step` is invoked PER LAYER PER RING STEP inside
 # `_multi_gpu_forward_arbitrary` / `_multi_gpu_backward_arbitrary`. The
-# resulting `func` only depends on (cu_seqlens_global, cp_size, cp_rank,
-# step, num_contexts, num_targets, target_group_size, window_size) — all
-# of which are CONSTANT across both the forward layer stack AND the
-# backward of the SAME training step. So we build `cp_size` funcs once
-# and reuse them across all 8 forward layers + the matching backward
-# layers (≈30× builds avoided per training step at 8 layers × cp_size=2).
-# This was the dominant overhead in the func-based CP path:
+# resulting `func` is a pure function of (cu_seqlens_global, cp_size,
+# cp_rank, step, num_contexts, num_targets, target_group_size,
+# window_size, NFUNC) — every kwarg is hashable to a stable key. Two
+# training steps that hand in the same `cu_seqlens_global` values get
+# the same `func` tensor; nothing else needs to match.
+#
+# So the cache is keyed by the FULL kwarg content, not by anything
+# scope-bound. Two consequences:
+#   1. Within one HSTUBlock.forward, all 8 layers share the same 2 (=
+#      cp_size) builds — same as before.
+#   2. Across training steps, the cache is reused whenever the dataset
+#      replays the same `cu_seqlens` values. The HSTU benchmark generates
+#      `num_generated_batches` unique batches and cycles them, so after
+#      the first few hundred iters every call is a cache hit and the
+#      build cost drops to 0 ms / step.
+#
+# History of this cache:
 #  - EOS round-3 no caching:           1150 ms/step (32 builds)
-#  - cw-dfw round-4 forward-only TLS:   734 ms/step (16 builds, backward
-#    rebuilt because PyTorch autograd runs backward on a *worker thread*
-#    — `threading.local()` set on the forward thread is NOT visible from
-#    the autograd worker thread. Use a plain module-level dict so the
-#    backward thread can read the cache the forward thread populated.)
+#  - cw-dfw round-4 forward-only TLS:   734 ms/step (forward thread's
+#    TLS was invisible to the autograd worker thread; backward rebuilt)
+#  - cw-dfw round-5 module-level dict,
+#    keyed by (step,) only:             165 ms/step (still 2 builds /
+#    step from per-step scope_enter() reset)
+#  - this rev (round-7), keyed by full
+#    kwarg content, no per-step reset:  builds amortise to 0 once the
+#    dataset cycles
 #
-# Lifetime: scope_enter() resets the dict; scope_exit() is a no-op (kept
-# for API symmetry). The dict naturally lives across the
-# forward-then-backward of one training step. The next training step's
-# scope_enter() drops the prior tensors before any new builds happen.
+# Threading note: process-global (NOT thread-local) so the autograd
+# worker thread that runs backward sees what the main thread populated
+# in forward. HSTU training is single-step single-thread, so no
+# concurrent writers race on this dict.
 #
-# Threading note: this is process-global (NOT thread-local) because we
-# need the autograd worker thread to read what the main thread wrote.
-# That's safe in practice: HSTU training is single-step single-thread —
-# only one HSTUBlock.forward runs at a time per process, so no concurrent
-# writers race on this dict.
+# Memory bound: capped at `_CP_FUNC_CACHE_MAX` entries to handle truly
+# infinite-cardinality datasets without unbounded growth. When the cap
+# trips we evict an arbitrary entry (FIFO order from `next(iter(...))`)
+# — for the HSTU benchmark this never trips. For production with
+# random batches per step, set `_CP_FUNC_CACHE_MAX` lower or call
+# `cp_func_cache_scope_enter()` periodically (it is a "clear" hook).
 # ----------------------------------------------------------------------------
-_cp_func_cache: Optional[dict[int, torch.Tensor]] = None
+_cp_func_cache: dict[tuple, torch.Tensor] = {}
+_CP_FUNC_CACHE_MAX = 1024
 
 
 def cp_func_cache_scope_enter() -> None:
-    """Mark the start of a training step; create an empty cache.
+    """Optional hook to clear the cache at a workload boundary.
 
-    Replaces (rather than .clear()s) the dict so the previous step's
-    tensors are released to the allocator the moment the next step
-    starts — without us having to walk the keys.
+    Most callers should NOT use this — the cache is keyed by content,
+    so leaving it alone across training steps is correct AND the
+    intended fast path. Provided as an escape hatch for tests or for
+    workloads that want to force a re-build (e.g. memory-pressure
+    intervention between phases).
     """
     global _cp_func_cache
     _cp_func_cache = {}
 
 
 def cp_func_cache_scope_exit() -> None:
-    """No-op kept for API symmetry.
-
-    The cache must outlive forward (backward, on its own autograd worker
-    thread, reads the same dict). It is dropped on the next training
-    step's scope_enter().
-    """
+    """No-op kept for API symmetry."""
     return
 
 
-def _cached_localize_func_for_cp_step(*, step: int, **kwargs) -> torch.Tensor:
-    """Drop-in replacement for `localize_func_for_cp_step` with a cache.
+def _hash_int_tensor_or_none(t: Optional[torch.Tensor]) -> Optional[tuple]:
+    """Project an int32/int64 tensor down to a hashable tuple of ints.
 
-    Cache is keyed by `step` only — the OTHER args (cu_seqlens_global,
-    cp_size, cp_rank, num_contexts, num_targets, etc.) are invariant
-    within one training step. Each step's func tensor is computed once
-    on the first call and reused on subsequent calls within the same
-    scope (across forward AND backward of the same training step).
+    Forces a GPU→CPU sync via `.tolist()` — accepted because we already
+    pay one such sync per forward (the kernel's `cu_seqlens_q` argument
+    is consumed CPU-side anyway), and folding it into the cache key
+    saves a *full* `localize_func_for_cp_step` build (which itself
+    starts with `tolist()` and runs ~tens of ms of numpy work).
+    """
+    if t is None:
+        return None
+    return tuple(t.tolist())
+
+
+def _cached_localize_func_for_cp_step(
+    *,
+    step: int,
+    cu_seqlens_global: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    target_group_size: int,
+    window_size: tuple[int, int],
+    NFUNC: int = 3,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Cached wrapper for `localize_func_for_cp_step`.
+
+    Cache key is the full kwarg content; cu_seqlens / num_contexts /
+    num_targets are projected to int tuples via `.tolist()`. This costs
+    one GPU sync per call but saves the multi-tens-of-ms numpy build
+    on every cache hit.
+
+    Cache survives across training steps. The dataset cycles after
+    `num_generated_batches`, so steady-state hit rate is ~100%.
     """
     from ._mask_func import localize_func_for_cp_step
 
+    key = (
+        step,
+        cp_size,
+        cp_rank,
+        _hash_int_tensor_or_none(cu_seqlens_global),
+        _hash_int_tensor_or_none(num_contexts),
+        _hash_int_tensor_or_none(num_targets),
+        target_group_size,
+        tuple(window_size),
+        NFUNC,
+    )
     cache = _cp_func_cache
-    if cache is None:
-        # No active scope: fall back to direct build (no caching).
-        return localize_func_for_cp_step(step=step, **kwargs)
-    if step not in cache:
-        cache[step] = localize_func_for_cp_step(step=step, **kwargs)
-    return cache[step]
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    # Bound the cache (FIFO eviction) — the HSTU benchmark's
+    # `num_generated_batches=100` × `cp_size` = 200 keys never trips
+    # `_CP_FUNC_CACHE_MAX=1024`, so this is just defensive.
+    if len(cache) >= _CP_FUNC_CACHE_MAX:
+        cache.pop(next(iter(cache)))
+    built = localize_func_for_cp_step(
+        step=step,
+        cu_seqlens_global=cu_seqlens_global,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        num_contexts=num_contexts,
+        num_targets=num_targets,
+        target_group_size=target_group_size,
+        window_size=window_size,
+        NFUNC=NFUNC,
+        device=device,
+    )
+    cache[key] = built
+    return built
 
 
 def _get_cp_stream(

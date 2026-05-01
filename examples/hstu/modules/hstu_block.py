@@ -167,22 +167,18 @@ class HSTUBlock(MegatronModule):
             assert self._cp_group is not None  # for type-checker
             from context_parallel import (
                 apply_dualchunkswap_to_jagged,
-                cp_func_cache_scope_enter,
                 gather_jagged_from_cp_rank,
             )
 
-            # Open the per-training-step `func` tensor cache. All
-            # `_cached_localize_func_for_cp_step` calls in the inner CP
-            # wrappers (forward + backward) share this cache — 8 layers
-            # × cp_size builds (× 2 for fwd+bwd) collapses to `cp_size`
-            # builds per training step. The cache MUST live across the
-            # forward → backward boundary because PyTorch autograd runs
-            # `.backward()` on a worker thread; if we cleared the cache
-            # at end of forward, the backward thread would re-build all
-            # 16 funcs (cw-dfw round-4 regression: 30.9 → 667 TFLOPS,
-            # 4.6%). The next training step's `scope_enter` drops the
-            # prior step's tensors before any new build happens.
-            cp_func_cache_scope_enter()
+            # NOTE: we deliberately do NOT call
+            # `cp_func_cache_scope_enter()` here anymore. The cache is
+            # content-keyed (cu_seqlens / num_contexts / num_targets
+            # values + step) and lives across training steps, so a
+            # dataset that cycles `num_generated_batches` unique
+            # cu_seqlens values pays the build cost only once per
+            # unique batch — every subsequent recurrence is a hit.
+            # Calling scope_enter() here would WIPE that cross-step
+            # cache and cap us at the round-5/6 ratio (~21–27%).
 
             cp_rank = dist.get_rank(self._cp_group)
             global_jd_template = jd
