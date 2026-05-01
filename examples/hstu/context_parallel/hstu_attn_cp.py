@@ -1141,13 +1141,7 @@ def _multi_gpu_forward_arbitrary(
             func=func,
             quant_mode=-1,
         )
-        # In-place add with mixed dtype: PyTorch promotes `partial` (bf16)
-        # to fp32 inside the add kernel — no transient HBM allocation,
-        # unlike the explicit `.float()` cast which materialises a fp32
-        # temp of size ~112 MB per ring step. Across 8 layers × cp_size
-        # ring steps this saves ~1.8 GB of HBM churn per training step
-        # (cw-dfw round-7 → round-8 optimisation).
-        out_local += partial
+        out_local += partial.float()
 
         # 3. Wait for P2P + swap.
         if step < cp_size - 1:
@@ -1679,18 +1673,11 @@ def _multi_gpu_backward_arbitrary(
             window_size=(-1, -1),
             func=func,
         )
-        # Mixed-dtype in-place add: avoids the explicit `.float()` cast
-        # which would allocate a transient ~112 MB fp32 temp per
-        # gradient per ring step. PyTorch's add_ kernel handles
-        # bf16 → fp32 promotion in-register. Saves ~5–6 GB of HBM
-        # churn per training step on cw-dfw (8 layers × cp_size × 3
-        # gradients). Same cw-dfw round-7 → round-8 optimisation as
-        # the forward accumulator.
-        dq_acc += dq_p
+        dq_acc += dq_p.float()
         if step == 0:
             # peer == self; dK/dV are ours.
-            dk_acc += dk_p
-            dv_acc += dv_p
+            dk_acc += dk_p.float()
+            dv_acc += dv_p.float()
         else:
             dkv_to_send.append((step, dk_p, dv_p))
 
@@ -1726,10 +1713,8 @@ def _multi_gpu_backward_arbitrary(
         )
         for r in reqs_v:
             r.wait()
-        # Mixed-dtype in-place add: see fwd accumulator comment for
-        # why the explicit `.float()` cast was wasteful.
-        dk_acc += recv_dk
-        dv_acc += recv_dv
+        dk_acc += recv_dk.float()
+        dv_acc += recv_dv.float()
 
     return (
         dq_acc.to(q_local.dtype),
