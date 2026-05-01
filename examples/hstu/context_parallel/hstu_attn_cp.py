@@ -1144,12 +1144,31 @@ def _multi_gpu_forward_arbitrary(
     # NCCL P2P (waits for the previous layer's last kernel read on the
     # buffer) and by `default_stream.wait_stream(comm_stream)` after
     # the wait (read can see NCCL's writes).
-    cur_k = k_local.clone()
-    cur_v = v_local.clone()
+    #
+    # `cur_k`/`cur_v` represent "the K/V this rank is currently
+    # attending against". For cp_size==2, the swap pattern executes
+    # exactly ONCE (between step 0 and step 1) — after that, cur_k
+    # points at the pool buffer (peer's K) and recv_k points at
+    # whatever cur_k was before the swap. Since step 1 is the LAST
+    # step, no further P2P writes touch recv_k. So if we let
+    # `cur_k = k_local` without cloning, the post-swap recv_k aliases
+    # k_local for one final no-op step — safe. For cp_size >= 3 the
+    # swap runs multiple times and recv_k is written by NCCL on every
+    # iteration except the last; aliasing k_local would corrupt it.
+    if cp_size == 2:
+        cur_k = k_local
+        cur_v = v_local
+    else:
+        cur_k = k_local.clone()
+        cur_v = v_local.clone()
     recv_k = _get_recv_buffer(k_local, slot="fwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="fwd_recv_v")
 
-    out_local = torch.zeros_like(q_local, dtype=torch.float32)
+    # `out_local` is initialised by the first partial (step==0), which
+    # also bumps it to fp32 via `.float()`. Skipping the zeros_like
+    # avoids one ~112 MB memset per layer (~1.3 ms / training step
+    # across 8 layers).
+    out_local: Optional[torch.Tensor] = None
 
     for step in range(cp_size):
         # 1. Issue next-step KV exchange.
@@ -1204,7 +1223,13 @@ def _multi_gpu_forward_arbitrary(
             func=func,
             quant_mode=-1,
         )
-        out_local += partial.float()
+        # Step 0 INITIALISES `out_local` with the first partial cast to
+        # fp32 (saves the explicit zeros_like memset). Step 1+
+        # accumulates into the existing fp32 tensor.
+        if out_local is None:
+            out_local = partial.float()
+        else:
+            out_local += partial.float()
 
         # 3. Wait for P2P + swap.
         if step < cp_size - 1:
@@ -1214,6 +1239,7 @@ def _multi_gpu_forward_arbitrary(
             cur_k, recv_k = recv_k, cur_k
             cur_v, recv_v = recv_v, cur_v
 
+    assert out_local is not None  # cp_size >= 1 guard runs the loop
     return out_local.to(q_local.dtype)
 
 
@@ -1671,20 +1697,31 @@ def _multi_gpu_backward_arbitrary(
     default_stream = torch.cuda.current_stream()
     comm_stream = _get_cp_stream(q_local.device, cp_stream)
 
-    # Re-run the forward ring locally to reconstruct kv_at_step[i].  Same
-    # ping-pong + clone pattern as `_multi_gpu_backward`. Distinct slot
-    # names from the forward path so fwd's autograd-saved clones and
-    # bwd's recv buffers cannot collide (PyTorch autograd may run bwd
-    # on a worker thread, but each pool slot is a single physical
+    # Re-run the forward ring locally to reconstruct kv_at_step[i]. Same
+    # ping-pong + clone-only-when-needed pattern as the fwd path.
+    # Distinct slot names from the forward path so fwd's autograd-saved
+    # clones and bwd's recv buffers cannot collide (PyTorch autograd may
+    # run bwd on a worker thread, but each pool slot is a single physical
     # buffer — sharing across fwd/bwd would invite a race).
-    cur_k = k_local.clone()
-    cur_v = v_local.clone()
+    if cp_size == 2:
+        cur_k = k_local
+        cur_v = v_local
+    else:
+        cur_k = k_local.clone()
+        cur_v = v_local.clone()
     recv_k = _get_recv_buffer(k_local, slot="bwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="bwd_recv_v")
 
-    dq_acc = torch.zeros_like(q_local, dtype=torch.float32)
-    dk_acc = torch.zeros_like(k_local, dtype=torch.float32)
-    dv_acc = torch.zeros_like(v_local, dtype=torch.float32)
+    # dq_acc / dk_acc / dv_acc are initialised lazily by the first
+    # partial that contributes — saves three ~112 MB fp32 zeros_like
+    # memsets per layer (~3 ms / training step across 8 layers).
+    # dq_acc is fed every loop iter (always None on entry to step 0).
+    # dk_acc / dv_acc are only populated by step==0's diagonal tile;
+    # step >= 1 routes its dKV through `dkv_to_send` to the
+    # reverse-ring exchange below.
+    dq_acc: Optional[torch.Tensor] = None
+    dk_acc: Optional[torch.Tensor] = None
+    dv_acc: Optional[torch.Tensor] = None
 
     # Collect (step, dk_partial, dv_partial) for the reverse-ring exchange.
     # step==0 dKV is owned by self → added directly. step≥1 dKV belongs to
@@ -1740,11 +1777,20 @@ def _multi_gpu_backward_arbitrary(
             window_size=(-1, -1),
             func=func,
         )
-        dq_acc += dq_p.float()
+        # Lazy-init pattern: step 0 INITIALISES the fp32 accumulator
+        # via `.float()`; step 1+ accumulates with explicit `.float()`
+        # cast (we keep the explicit cast — round-8 attempted to drop
+        # it via PyTorch mixed-dtype `add_` and triggered a CUDA
+        # illegal-memory-access at iter ~400; see commit log
+        # `Revert "perf(cp): drop explicit .float() casts ..."`).
+        if dq_acc is None:
+            dq_acc = dq_p.float()
+        else:
+            dq_acc += dq_p.float()
         if step == 0:
-            # peer == self; dK/dV are ours.
-            dk_acc += dk_p.float()
-            dv_acc += dv_p.float()
+            # peer == self; dK/dV are ours. Init both accumulators.
+            dk_acc = dk_p.float()
+            dv_acc = dv_p.float()
         else:
             dkv_to_send.append((step, dk_p, dv_p))
 
@@ -1755,6 +1801,7 @@ def _multi_gpu_backward_arbitrary(
             cur_k, recv_k = recv_k, cur_k
             cur_v, recv_v = recv_v, cur_v
 
+    assert dq_acc is not None and dk_acc is not None and dv_acc is not None
     # Reverse-ring dKV exchange (same logic as `_multi_gpu_backward`):
     # send dKV computed at step i to peer (cp_rank - i) % cp_size; receive
     # from peer (cp_rank + i) % cp_size who computed dKV for OUR KV at
