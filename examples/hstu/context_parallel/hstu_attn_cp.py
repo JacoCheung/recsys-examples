@@ -1853,20 +1853,26 @@ def _multi_gpu_backward_arbitrary(
     for step, dk_p, dv_p in dkv_to_send:
         send_dst = cp_global_ranks[(cp_rank - step) % cp_size]
         recv_src = cp_global_ranks[(cp_rank + step) % cp_size]
+        # Issue K-pair and V-pair as TWO separate 2-op batches but
+        # WITHOUT waiting on K before issuing V — lets NCCL queue both
+        # transfers and overlap them at the device level. We still
+        # avoid the 4-op single batch which the comment in
+        # `_multi_gpu_backward` notes hangs on the production NCCL.
+        # Wait once at the end before consuming the recv buffers.
         reqs_k = dist.batch_isend_irecv(
             [
                 dist.P2POp(dist.isend, dk_p.contiguous(), send_dst, group=cp_group),
                 dist.P2POp(dist.irecv, recv_dk, recv_src, group=cp_group),
             ]
         )
-        for r in reqs_k:
-            r.wait()
         reqs_v = dist.batch_isend_irecv(
             [
                 dist.P2POp(dist.isend, dv_p.contiguous(), send_dst, group=cp_group),
                 dist.P2POp(dist.irecv, recv_dv, recv_src, group=cp_group),
             ]
         )
+        for r in reqs_k:
+            r.wait()
         for r in reqs_v:
             r.wait()
         dk_acc += recv_dk.float()
