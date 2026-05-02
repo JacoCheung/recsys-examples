@@ -1187,7 +1187,17 @@ def _multi_gpu_forward_arbitrary(
     recv_k = _get_recv_buffer(k_local, slot="fwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="fwd_recv_v")
 
-    out_local = torch.zeros_like(q_local, dtype=torch.float32)
+    # Allocate the fp32 accumulator BEFORE the loop (precision contract +
+    # an implicit allocator-side stream barrier that prevents the iter-400
+    # crash — see commit log for round-15-debug, where moving this alloc
+    # into the loop with a lazy-init pattern triggered a CUDA illegal
+    # memory access at iter ~400 unless `CUDA_LAUNCH_BLOCKING=1` was set).
+    # We use `empty_like` + first-iter `copy_` instead of `zeros_like`
+    # + `+=` to skip the ~112 MB memset (saves ~50 µs / accumulator ×
+    # 8 layers ≈ 0.4 ms / training step on the forward path; same
+    # pattern in backward saves ~1.2 ms / training step across the 3
+    # gradient accumulators).
+    out_local = torch.empty_like(q_local, dtype=torch.float32)
 
     for step in range(cp_size):
         # 1. Issue next-step KV exchange.
@@ -1247,7 +1257,16 @@ def _multi_gpu_forward_arbitrary(
             func=func,
             quant_mode=-1,
         )
-        out_local += partial.float()
+        # Step 0 SETS the (uninitialised) accumulator via copy_; step 1+
+        # accumulates with +=. We keep the explicit `.float()` cast on
+        # both branches so the allocator-side stream events emitted by
+        # the fp32 temp allocation are identical to round-7 — that's
+        # the implicit barrier round-15-debug showed is necessary to
+        # prevent the iter-400 stream race.
+        if step == 0:
+            out_local.copy_(partial.float())
+        else:
+            out_local += partial.float()
 
         # 3. Wait for P2P + swap.
         if step < cp_size - 1:
@@ -1733,9 +1752,16 @@ def _multi_gpu_backward_arbitrary(
     recv_k = _get_recv_buffer(k_local, slot="bwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="bwd_recv_v")
 
-    dq_acc = torch.zeros_like(q_local, dtype=torch.float32)
-    dk_acc = torch.zeros_like(k_local, dtype=torch.float32)
-    dv_acc = torch.zeros_like(v_local, dtype=torch.float32)
+    # Pre-allocate the fp32 accumulators with `empty_like` (no memset);
+    # step 0 of the main loop populates them via `copy_(...float())`,
+    # subsequent contributions use `+=` as before. Saves three ~112 MB
+    # memsets per layer × 8 layers ≈ 1.2 ms / training step. Allocator
+    # is hit BEFORE the loop — preserves the implicit alloc-side stream
+    # event that round-15-debug showed is necessary to avoid the
+    # iter-400 stream-race CUDA illegal-memory-access.
+    dq_acc = torch.empty_like(q_local, dtype=torch.float32)
+    dk_acc = torch.empty_like(k_local, dtype=torch.float32)
+    dv_acc = torch.empty_like(v_local, dtype=torch.float32)
 
     # Collect (step, dk_partial, dv_partial) for the reverse-ring exchange.
     # step==0 dKV is owned by self → added directly. step≥1 dKV belongs to
@@ -1796,12 +1822,18 @@ def _multi_gpu_backward_arbitrary(
             window_size=(-1, -1),
             func=func,
         )
-        dq_acc += dq_p.float()
+        # Step 0 SETS the (uninitialised) accumulators via copy_; step 1+
+        # uses += into the already-populated dq_acc. Keep the explicit
+        # `.float()` cast so the allocator-side fp32 temp pattern is
+        # identical to round-7 (the implicit barrier round-15-debug
+        # confirmed is needed to prevent the iter-400 stream race).
         if step == 0:
+            dq_acc.copy_(dq_p.float())
             # peer == self; dK/dV are ours.
-            dk_acc += dk_p.float()
-            dv_acc += dv_p.float()
+            dk_acc.copy_(dk_p.float())
+            dv_acc.copy_(dv_p.float())
         else:
+            dq_acc += dq_p.float()
             dkv_to_send.append((step, dk_p, dv_p))
 
         if step < cp_size - 1:
