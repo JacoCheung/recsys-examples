@@ -1157,11 +1157,7 @@ def _multi_gpu_forward_arbitrary(
     recv_k = _get_recv_buffer(k_local, slot="fwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="fwd_recv_v")
 
-    # `out_local` is initialised by the first partial (step==0), which
-    # also bumps it to fp32 via `.float()`. Skipping the zeros_like
-    # avoids one ~112 MB memset per layer (~1.3 ms / training step
-    # across 8 layers).
-    out_local: Optional[torch.Tensor] = None
+    out_local = torch.zeros_like(q_local, dtype=torch.float32)
 
     for step in range(cp_size):
         # 1. Issue next-step KV exchange.
@@ -1216,13 +1212,7 @@ def _multi_gpu_forward_arbitrary(
             func=func,
             quant_mode=-1,
         )
-        # Step 0 INITIALISES `out_local` with the first partial cast to
-        # fp32 (saves the explicit zeros_like memset). Step 1+
-        # accumulates into the existing fp32 tensor.
-        if out_local is None:
-            out_local = partial.float()
-        else:
-            out_local += partial.float()
+        out_local += partial.float()
 
         # 3. Wait for P2P + swap.
         if step < cp_size - 1:
@@ -1232,7 +1222,6 @@ def _multi_gpu_forward_arbitrary(
             cur_k, recv_k = recv_k, cur_k
             cur_v, recv_v = recv_v, cur_v
 
-    assert out_local is not None  # cp_size >= 1 guard runs the loop
     return out_local.to(q_local.dtype)
 
 
@@ -1706,16 +1695,9 @@ def _multi_gpu_backward_arbitrary(
     recv_k = _get_recv_buffer(k_local, slot="bwd_recv_k")
     recv_v = _get_recv_buffer(v_local, slot="bwd_recv_v")
 
-    # dq_acc / dk_acc / dv_acc are initialised lazily by the first
-    # partial that contributes — saves three ~112 MB fp32 zeros_like
-    # memsets per layer (~3 ms / training step across 8 layers).
-    # dq_acc is fed every loop iter (always None on entry to step 0).
-    # dk_acc / dv_acc are only populated by step==0's diagonal tile;
-    # step >= 1 routes its dKV through `dkv_to_send` to the
-    # reverse-ring exchange below.
-    dq_acc: Optional[torch.Tensor] = None
-    dk_acc: Optional[torch.Tensor] = None
-    dv_acc: Optional[torch.Tensor] = None
+    dq_acc = torch.zeros_like(q_local, dtype=torch.float32)
+    dk_acc = torch.zeros_like(k_local, dtype=torch.float32)
+    dv_acc = torch.zeros_like(v_local, dtype=torch.float32)
 
     # Collect (step, dk_partial, dv_partial) for the reverse-ring exchange.
     # step==0 dKV is owned by self → added directly. step≥1 dKV belongs to
@@ -1771,20 +1753,11 @@ def _multi_gpu_backward_arbitrary(
             window_size=(-1, -1),
             func=func,
         )
-        # Lazy-init pattern: step 0 INITIALISES the fp32 accumulator
-        # via `.float()`; step 1+ accumulates with explicit `.float()`
-        # cast (we keep the explicit cast — round-8 attempted to drop
-        # it via PyTorch mixed-dtype `add_` and triggered a CUDA
-        # illegal-memory-access at iter ~400; see commit log
-        # `Revert "perf(cp): drop explicit .float() casts ..."`).
-        if dq_acc is None:
-            dq_acc = dq_p.float()
-        else:
-            dq_acc += dq_p.float()
+        dq_acc += dq_p.float()
         if step == 0:
-            # peer == self; dK/dV are ours. Init both accumulators.
-            dk_acc = dk_p.float()
-            dv_acc = dv_p.float()
+            # peer == self; dK/dV are ours.
+            dk_acc += dk_p.float()
+            dv_acc += dv_p.float()
         else:
             dkv_to_send.append((step, dk_p, dv_p))
 
@@ -1795,7 +1768,6 @@ def _multi_gpu_backward_arbitrary(
             cur_k, recv_k = recv_k, cur_k
             cur_v, recv_v = recv_v, cur_v
 
-    assert dq_acc is not None and dk_acc is not None and dv_acc is not None
     # Reverse-ring dKV exchange (same logic as `_multi_gpu_backward`):
     # send dKV computed at step i to peer (cp_rank - i) % cp_size; receive
     # from peer (cp_rank + i) % cp_size who computed dKV for OUR KV at
