@@ -176,6 +176,67 @@ def test_cache_keys_on_cu_seqlens_content(reset_cache_after_test):
     )
 
 
+def test_caller_provided_tuple_keys_skip_internal_sync(reset_cache_after_test):
+    """Caller fast-path: pre-computed tuple keys skip the internal
+    `_hash_int_tensor_or_none` GPU→CPU sync.
+
+    The caller's contract is: `cu_seqlens_global_tuple` MUST equal
+    `tuple(cu_seqlens_global.tolist())`. When provided, the cache key
+    is built from the tuple alone — `cu_seqlens_global` itself is
+    only forwarded to `localize_func_for_cp_step` for the actual
+    build (cold path), never hashed.
+
+    The behavioural test: two calls with the SAME `cu_seqlens_global`
+    tensor but DIFFERENT `cu_seqlens_global_tuple` values must hit
+    DIFFERENT cache entries — proves the tuple drives the key.
+    Two calls with different tensors but the SAME tuple must hit the
+    SAME entry — proves the tensor doesn't sneak into the key.
+    """
+    from context_parallel.hstu_attn_cp import _cached_localize_func_for_cp_step
+
+    cu = torch.tensor([0, 8, 16], dtype=torch.int32, device="cpu")
+    common_kw = dict(
+        cp_size=2,
+        cp_rank=0,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=(-1, 0),
+        NFUNC=3,
+        device=torch.device("cpu"),
+    )
+
+    a = _cached_localize_func_for_cp_step(
+        step=0,
+        cu_seqlens_global=cu,
+        cu_seqlens_global_tuple=(0, 8, 16),
+        **common_kw,
+    )
+    b = _cached_localize_func_for_cp_step(
+        step=0,
+        cu_seqlens_global=cu,
+        cu_seqlens_global_tuple=(0, 4, 16),  # different tuple
+        **common_kw,
+    )
+    assert a is not b, (
+        "different `cu_seqlens_global_tuple` MUST produce distinct "
+        "cache entries — caller's tuple drives the key"
+    )
+
+    # Different fresh tensor, same tuple → cache hit on first key.
+    cu2 = torch.tensor([99, 99, 99], dtype=torch.int32, device="cpu")
+    a_again = _cached_localize_func_for_cp_step(
+        step=0,
+        cu_seqlens_global=cu2,
+        cu_seqlens_global_tuple=(0, 8, 16),
+        **common_kw,
+    )
+    assert a_again is a, (
+        "same `cu_seqlens_global_tuple` MUST hit the same entry, "
+        "regardless of which tensor was passed in"
+    )
+
+
 def test_cache_caps_growth(reset_cache_after_test):
     """The cache must evict when it grows beyond `_CP_FUNC_CACHE_MAX`.
 

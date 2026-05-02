@@ -228,26 +228,53 @@ def _cached_localize_func_for_cp_step(
     window_size: tuple[int, int],
     NFUNC: int = 3,
     device: Optional[torch.device] = None,
+    cu_seqlens_global_tuple: Optional[tuple] = None,
+    num_contexts_tuple: Optional[tuple] = None,
+    num_targets_tuple: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Cached wrapper for `localize_func_for_cp_step`.
 
     Cache key is the full kwarg content; cu_seqlens / num_contexts /
     num_targets are projected to int tuples via `.tolist()`. This costs
-    one GPU sync per call but saves the multi-tens-of-ms numpy build
-    on every cache hit.
+    one GPU→CPU sync per call (per integer tensor) — saves the
+    multi-tens-of-ms numpy build on every cache hit, but the sync
+    itself is wasteful when called repeatedly per layer.
+
+    Caller fast path: if you already have the tuple form (e.g. you
+    `.tolist()`'d once at the autograd Function entry, paying the sync
+    once per training step instead of once per layer × ring step), pass
+    `cu_seqlens_global_tuple` / `num_contexts_tuple` / `num_targets_tuple`
+    to skip the internal hashing sync entirely. The tuples must reflect
+    the SAME values as the corresponding tensor arguments — caller's
+    contract.
 
     Cache survives across training steps. The dataset cycles after
     `num_generated_batches`, so steady-state hit rate is ~100%.
     """
     from ._mask_func import localize_func_for_cp_step
 
+    cu_key = (
+        cu_seqlens_global_tuple
+        if cu_seqlens_global_tuple is not None
+        else _hash_int_tensor_or_none(cu_seqlens_global)
+    )
+    nc_key = (
+        num_contexts_tuple
+        if num_contexts_tuple is not None or num_contexts is None
+        else _hash_int_tensor_or_none(num_contexts)
+    )
+    nt_key = (
+        num_targets_tuple
+        if num_targets_tuple is not None or num_targets is None
+        else _hash_int_tensor_or_none(num_targets)
+    )
     key = (
         step,
         cp_size,
         cp_rank,
-        _hash_int_tensor_or_none(cu_seqlens_global),
-        _hash_int_tensor_or_none(num_contexts),
-        _hash_int_tensor_or_none(num_targets),
+        cu_key,
+        nc_key,
+        nt_key,
         target_group_size,
         tuple(window_size),
         NFUNC,
@@ -1127,6 +1154,9 @@ def _multi_gpu_forward_arbitrary(
     window_size: tuple[int, int],
     cp_group: dist.ProcessGroup,
     cp_global_ranks: Sequence[int],
+    cu_seqlens_global_tuple: Optional[tuple] = None,
+    num_contexts_tuple: Optional[tuple] = None,
+    num_targets_tuple: Optional[tuple] = None,
     cp_rank: int,
     cp_size: int,
     cp_stream: Optional["torch.cuda.Stream"] = None,
@@ -1181,6 +1211,8 @@ def _multi_gpu_forward_arbitrary(
         # in the same `HSTUBlock.forward` scope (set up via
         # `cp_func_cache_scope_enter/exit`). Major perf win:
         # 8 layers × cp_size builds → cp_size builds per training step.
+        # Pre-computed tuple keys (when provided) skip ~30 redundant
+        # CUDA syncs per training step (one per layer × ring step).
         func = _cached_localize_func_for_cp_step(
             cu_seqlens_global=cu_seqlens_global,
             cp_size=cp_size,
@@ -1192,6 +1224,9 @@ def _multi_gpu_forward_arbitrary(
             window_size=window_size,
             NFUNC=3,
             device=q_local.device,
+            cu_seqlens_global_tuple=cu_seqlens_global_tuple,
+            num_contexts_tuple=num_contexts_tuple,
+            num_targets_tuple=num_targets_tuple,
         )
         partial = hstu_attn_varlen_func(
             q=q_local,
@@ -1672,6 +1707,9 @@ def _multi_gpu_backward_arbitrary(
     cp_rank: int,
     cp_size: int,
     cp_stream: Optional["torch.cuda.Stream"] = None,
+    cu_seqlens_global_tuple: Optional[tuple] = None,
+    num_contexts_tuple: Optional[tuple] = None,
+    num_targets_tuple: Optional[tuple] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reverse-ring backward for the arbitrary-mask CP forward."""
     local_max = max_seqlen_q_global // cp_size
@@ -1723,6 +1761,8 @@ def _multi_gpu_backward_arbitrary(
 
         # Per-step `func` tensor (cached: forward already built it for
         # this scope, so backward gets a hit and avoids re-building).
+        # Pre-computed tuple keys (when provided) skip the redundant
+        # CUDA syncs that hashing the tensor would do per layer × step.
         func = _cached_localize_func_for_cp_step(
             cu_seqlens_global=cu_seqlens_global,
             cp_size=cp_size,
@@ -1734,6 +1774,9 @@ def _multi_gpu_backward_arbitrary(
             window_size=window_size,
             NFUNC=3,
             device=q_local.device,
+            cu_seqlens_global_tuple=cu_seqlens_global_tuple,
+            num_contexts_tuple=num_contexts_tuple,
+            num_targets_tuple=num_targets_tuple,
         )
         # Direct kernel-bwd call. Skips the replay-forward + autograd.grad
         # pattern the legacy `_per_tile_partial_grads` uses (see
@@ -1883,6 +1926,20 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         # arbitrary mask` — bake the rebuilt kernel into the deployment
         # container, OR push HSTU_ARBITRARY_NFUNC=3 upstream.
         cu_seqlens_global = cu_seqlens_q * cp_size
+        # Pre-compute the tuple-form of the integer tensors that drive
+        # the func-cache key. ONE GPU→CPU sync per training step here
+        # (vs ~16 if the cache hashes the tensor on every layer × ring
+        # step call inside `_multi_gpu_forward_arbitrary`).
+        # `num_contexts` / `num_targets` are None for our `--no_action
+        # --no_contextual` config, so they have zero sync cost — the
+        # `_hash_int_tensor_or_none` call short-circuits on None.
+        cu_seqlens_global_tuple = tuple(cu_seqlens_global.tolist())
+        num_contexts_tuple = (
+            tuple(num_contexts.tolist()) if num_contexts is not None else None
+        )
+        num_targets_tuple = (
+            tuple(num_targets.tolist()) if num_targets is not None else None
+        )
         out = _multi_gpu_forward_arbitrary(
             q,
             k,
@@ -1898,6 +1955,9 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
             window_size=tuple(window_size),
             cp_group=cp_group,
             cp_global_ranks=cp_global_ranks,
+            cu_seqlens_global_tuple=cu_seqlens_global_tuple,
+            num_contexts_tuple=num_contexts_tuple,
+            num_targets_tuple=num_targets_tuple,
             cp_rank=cp_rank,
             cp_size=cp_size,
             cp_stream=cp_stream,
@@ -1925,6 +1985,12 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         ctx.num_targets = num_targets
         ctx.target_group_size = target_group_size
         ctx.window_size = tuple(window_size)
+        # Stash tuple form so backward can pass them straight through to
+        # the func cache (one tolist sync at fwd entry feeds all ~32
+        # cache lookups across fwd + bwd of one training step).
+        ctx.cu_seqlens_global_tuple = cu_seqlens_global_tuple
+        ctx.num_contexts_tuple = num_contexts_tuple
+        ctx.num_targets_tuple = num_targets_tuple
         return out
 
     @staticmethod
@@ -1952,6 +2018,9 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
             cp_rank=ctx.cp_rank,
             cp_size=ctx.cp_size,
             cp_stream=ctx.cp_stream,
+            cu_seqlens_global_tuple=ctx.cu_seqlens_global_tuple,
+            num_contexts_tuple=ctx.num_contexts_tuple,
+            num_targets_tuple=ctx.num_targets_tuple,
         )
         return (
             *grads,
