@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HSTU-CP DualChunkSwap mask, CP=4</title>
+<style>
+  :root {
+    --accent: #1f77b4;
+    --bg: #fafafa;
+    --fg: #222;
+    --muted: #666;
+    --border: #ddd;
+    --code-bg: #f0f0f0;
+    --green: #9bd99b;
+    --red: #e44;
+    --cell-bg: #fafafa;
+    --cell-grid: #d8d8d8;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    background: var(--accent);
+    color: white;
+    padding: 1.2em 2em 1em;
+  }
+  header h1 {
+    margin: 0 0 0.2em;
+    font-size: 1.4em;
+  }
+  header .specs {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    opacity: 0.9;
+  }
+  nav {
+    background: white;
+    border-bottom: 1px solid var(--border);
+    padding: 0.6em 2em;
+    display: flex;
+    gap: 0.7em;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  nav button, nav select {
+    font: inherit;
+    padding: 0.35em 0.9em;
+    border: 1px solid var(--border);
+    background: white;
+    color: var(--fg);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  nav button:hover:not(:disabled) { background: #eef; }
+  nav button:disabled { opacity: 0.4; cursor: not-allowed; }
+  nav .indicator {
+    margin-left: auto;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--muted);
+  }
+  main {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 1.2em 2em 4em;
+  }
+  .panels {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1em;
+    margin-bottom: 1.2em;
+  }
+  .panel {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8em 0.8em 0.6em;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .panel h3 {
+    margin: 0 0 0.4em;
+    font-size: 0.95em;
+    color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .panel .tiles {
+    margin-top: 0.4em;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78em;
+    color: var(--muted);
+    text-align: center;
+    line-height: 1.35;
+  }
+  .panel svg {
+    display: block;
+  }
+  section.explain {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1.1em 1.4em 1.3em;
+  }
+  section.explain h2 {
+    color: var(--accent);
+    margin: 0 0 0.4em;
+    font-size: 1.1em;
+  }
+  section.explain p { margin: 0.5em 0; }
+  section.explain table {
+    border-collapse: collapse;
+    margin: 0.6em 0 0.2em;
+    font-size: 0.9em;
+  }
+  section.explain th, section.explain td {
+    border: 1px solid var(--border);
+    padding: 0.3em 0.6em;
+    text-align: left;
+  }
+  section.explain th { background: #f6f6f6; font-weight: 600; }
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    background: var(--code-bg);
+    padding: 0 0.25em;
+    border-radius: 3px;
+  }
+  .legend {
+    display: flex;
+    gap: 1.5em;
+    align-items: center;
+    margin: 0.7em 0 0;
+    font-size: 0.88em;
+    color: var(--muted);
+    flex-wrap: wrap;
+  }
+  .legend .swatch {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    margin-right: 0.4em;
+    vertical-align: middle;
+    border: 1px solid #ccc;
+  }
+  .legend .swatch.green { background: var(--green); }
+  .legend .swatch.red-box {
+    background: white;
+    border: 2px solid var(--red);
+  }
+  .legend .swatch.red-dash {
+    background: repeating-linear-gradient(
+      to right, var(--red) 0 3px, transparent 3px 5px);
+    border: none;
+    height: 2px;
+    width: 22px;
+    margin-top: 6px;
+  }
+  footer.hint {
+    margin-top: 1em;
+    color: var(--muted);
+    font-size: 0.85em;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>HSTU-CP DualChunkSwap mask &mdash; per-step tile layout (CP = 4)</h1>
+  <div class="specs">
+    cp_size = 4 &nbsp;|&nbsp; chunks_per_seq = 2&middot;cp_size = 8
+    &nbsp;|&nbsp; rank r owns Q chunks {r, 7-r}
+    &nbsp;|&nbsp; at step s, peer = (r-s) mod 4 owns K chunks {peer, 7-peer}
+  </div>
+</header>
+
+<nav>
+  <button id="prev" type="button">&larr; Prev</button>
+  <button id="next" type="button">Next &rarr;</button>
+  <label for="jump">Jump to:</label>
+  <select id="jump">
+    <option value="0">Step 0</option>
+    <option value="1">Step 1</option>
+    <option value="2">Step 2</option>
+    <option value="3">Step 3</option>
+  </select>
+  <span class="indicator" id="indicator">Step 0 of 3</span>
+</nav>
+
+<main>
+  <div class="panels" id="panels">
+    <div class="panel" data-rank="0">
+      <h3>Rank 0</h3>
+      <svg id="svg-0" width="280" height="280" viewBox="0 0 280 280" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="tiles" id="tiles-0"></div>
+    </div>
+    <div class="panel" data-rank="1">
+      <h3>Rank 1</h3>
+      <svg id="svg-1" width="280" height="280" viewBox="0 0 280 280" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="tiles" id="tiles-1"></div>
+    </div>
+    <div class="panel" data-rank="2">
+      <h3>Rank 2</h3>
+      <svg id="svg-2" width="280" height="280" viewBox="0 0 280 280" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="tiles" id="tiles-2"></div>
+    </div>
+    <div class="panel" data-rank="3">
+      <h3>Rank 3</h3>
+      <svg id="svg-3" width="280" height="280" viewBox="0 0 280 280" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="tiles" id="tiles-3"></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><span class="swatch green"></span>causal region (k &le; q), diagonal cells half-filled</span>
+    <span><span class="swatch red-box"></span>tile this rank computes at this step</span>
+    <span><span class="swatch red-dash"></span>chunk boundaries (heavier at halves: 0, 4, 8)</span>
+  </div>
+
+  <section class="explain" id="explain">
+    <h2 id="explain-title">Step 0 &mdash; own KV (no rotation yet)</h2>
+    <div id="explain-body"></div>
+  </section>
+
+  <footer class="hint">
+    Keyboard: <code>&larr;</code>/<code>&uarr;</code> previous, <code>&rarr;</code>/<code>&darr;</code> next.
+    Prev is disabled at step 0; Next is disabled at step 3 (no wrap-around).
+    Q axis runs top &rarr; bottom, K axis runs left &rarr; right; chunk indices 0..7.
+  </footer>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  const CP = 4;
+  const N = 2 * CP;          // 8 chunks per side
+  const SIZE = 280;          // svg side length in px
+  const CELL = SIZE / N;     // 35 px per chunk-cell
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+
+  // Compute the 4 active tiles for (rank, step):
+  //   peer = (r - s) mod CP
+  //   tiles = {r, N-1-r} x {peer, N-1-peer}
+  function tilesFor(rank, step) {
+    const peer = ((rank - step) % CP + CP) % CP;
+    const qs = [rank, N - 1 - rank];
+    const ks = [peer, N - 1 - peer];
+    const out = [];
+    for (const q of qs) {
+      for (const k of ks) {
+        out.push([q, k]);
+      }
+    }
+    return { peer, qs, ks, tiles: out };
+  }
+
+  function svgEl(name, attrs) {
+    const el = document.createElementNS(SVG_NS, name);
+    for (const k in attrs) {
+      el.setAttribute(k, attrs[k]);
+    }
+    return el;
+  }
+
+  function drawPanel(rank, step) {
+    const svg = document.getElementById("svg-" + rank);
+    // Clear
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    // Background
+    svg.appendChild(svgEl("rect", {
+      x: 0, y: 0, width: SIZE, height: SIZE,
+      fill: "#fafafa", stroke: "#bbb", "stroke-width": 1,
+    }));
+
+    // Causal triangle: lower-left half of the full square.
+    // Vertices (0,0)->(0,SIZE)->(SIZE,SIZE) gives the lower triangle
+    // including a smooth diagonal edge — diagonal cells get exactly the
+    // lower-left triangle, off-diagonal lower cells (k < q) get fully
+    // filled, k > q cells get nothing. This matches the screenshot.
+    svg.appendChild(svgEl("polygon", {
+      points: `0,0 0,${SIZE} ${SIZE},${SIZE}`,
+      fill: "#9bd99b",
+      stroke: "none",
+      opacity: 0.85,
+    }));
+
+    // Faint dotted 8x8 cell grid (light gray).
+    for (let i = 1; i < N; i++) {
+      const p = i * CELL;
+      svg.appendChild(svgEl("line", {
+        x1: p, y1: 0, x2: p, y2: SIZE,
+        stroke: "#cfcfcf", "stroke-width": 0.5,
+        "stroke-dasharray": "1,2",
+      }));
+      svg.appendChild(svgEl("line", {
+        x1: 0, y1: p, x2: SIZE, y2: p,
+        stroke: "#cfcfcf", "stroke-width": 0.5,
+        "stroke-dasharray": "1,2",
+      }));
+    }
+
+    // Red dashed chunk grid lines: 9 lines per axis (boundaries 0..8).
+    // Boundaries at 0, 4, 8 are "halves" — render heavier/solid.
+    for (let i = 0; i <= N; i++) {
+      const p = i * CELL;
+      const isHalf = (i === 0 || i === N / 2 || i === N);
+      const common = {
+        stroke: "#e44",
+        "stroke-width": isHalf ? 1.6 : 1,
+      };
+      if (!isHalf) common["stroke-dasharray"] = "3,2";
+      // vertical
+      svg.appendChild(svgEl("line", Object.assign({
+        x1: p, y1: 0, x2: p, y2: SIZE,
+      }, common)));
+      // horizontal
+      svg.appendChild(svgEl("line", Object.assign({
+        x1: 0, y1: p, x2: SIZE, y2: p,
+      }, common)));
+    }
+
+    // Active tiles for this (rank, step): red rectangle outline (no fill).
+    const info = tilesFor(rank, step);
+    for (const [q, k] of info.tiles) {
+      svg.appendChild(svgEl("rect", {
+        x: k * CELL,
+        y: q * CELL,
+        width: CELL,
+        height: CELL,
+        fill: "none",
+        stroke: "#e44",
+        "stroke-width": 2,
+      }));
+    }
+
+    // Tiny axis labels: q on left, k on top corner.
+    svg.appendChild(svgEl("text", {
+      x: 4, y: 12,
+      "font-size": 10, "font-family": "ui-monospace, monospace",
+      fill: "#888",
+    })).textContent = "q↓ k→";
+
+    // Tile-list caption under the panel.
+    const tilesEl = document.getElementById("tiles-" + rank);
+    const tileStr = info.tiles
+      .map(([q, k]) => `(${q},${k})`)
+      .join(" ");
+    tilesEl.innerHTML =
+      `peer = ${info.peer}<br>K chunks {${info.ks[0]}, ${info.ks[1]}}<br>` +
+      `tiles: ${tileStr}`;
+  }
+
+  // Step-specific narrative text.
+  function explanationFor(step) {
+    const lines = [];
+    lines.push(
+      `<p>At step <code>s = ${step}</code>, every rank <code>r</code> has Q chunks ` +
+      `<code>{r, 7-r}</code> as its local Q (fixed for the whole ring) and is ` +
+      `currently consuming K/V from peer <code>(r - ${step}) mod 4</code>:</p>`
+    );
+    lines.push("<table>");
+    lines.push(
+      "<tr><th>rank r</th><th>Q chunks</th><th>peer = (r-s) mod 4</th>" +
+      "<th>K chunks</th><th>active tiles (q,k)</th></tr>"
+    );
+    for (let r = 0; r < CP; r++) {
+      const info = tilesFor(r, step);
+      const tileStr = info.tiles.map(([q, k]) => `(${q},${k})`).join(" ");
+      lines.push(
+        `<tr><td>${r}</td><td>{${r}, ${N - 1 - r}}</td>` +
+        `<td>${info.peer}</td>` +
+        `<td>{${info.ks[0]}, ${info.ks[1]}}</td>` +
+        `<td><code>${tileStr}</code></td></tr>`
+      );
+    }
+    lines.push("</table>");
+
+    if (step === 0) {
+      lines.push(
+        "<p><strong>Step 0 specifics:</strong> peer = r, so each rank consumes its " +
+        "own K/V (no rotation has happened yet). The four highlighted tiles are " +
+        "always either on the main diagonal (q == k, half-filled by causal mask) " +
+        "or symmetric across it (e.g. rank 0's (0,7) is empty under causal but " +
+        "(7,0) is full). Net work per rank = exactly 2 full chunks " +
+        "(2 diagonals × 0.5 + 1 full + 1 empty = 2)."
+      );
+    } else if (step === 3) {
+      lines.push(
+        "<p><strong>Step 3 specifics:</strong> peer = (r+1) mod 4, the longest " +
+        "rotation distance. Active tiles are maximally off-diagonal &mdash; no " +
+        "diagonal cells are touched at this step on any rank. Each rank&apos;s 4 " +
+        "tiles split cleanly into 2 full and 2 empty under causal, again summing " +
+        "to exactly 2 chunks of work."
+      );
+    } else {
+      lines.push(
+        `<p><strong>Step ${step} specifics:</strong> peer = (r - ${step}) mod 4. ` +
+        "Tiles sit between the diagonal and the anti-diagonal; the DualChunkSwap " +
+        "pairing <code>{r, 7-r}</code> guarantees that whatever the K-pair " +
+        "<code>{peer, 7-peer}</code>, the four resulting tiles always include the " +
+        "same total mass under the causal mask: 2 full chunks worth of work."
+      );
+    }
+
+    lines.push(
+      "<p><strong>Load-balance invariant:</strong> for every <code>(q-chunk, " +
+      "k-chunk)</code> tile the causal mask makes it <em>full</em> when " +
+      "<code>q &gt; k</code>, <em>half</em> when <code>q == k</code>, and " +
+      "<em>empty</em> when <code>q &lt; k</code>. The DualChunkSwap pairing " +
+      "<code>{r, 7-r}</code> on the Q side and <code>{peer, 7-peer}</code> on the " +
+      "K side ensures the four tiles per (rank, step) always sum to <strong>2 full " +
+      "chunks</strong> of effective work &mdash; identical across all ranks at " +
+      "every ring step. That&apos;s why CP scales without per-step skew.</p>"
+    );
+
+    lines.push(
+      "<p class=\"mono\" style=\"color:#888;font-size:0.85em\">" +
+      "Source of truth: <code>localize_func_for_cp_step</code> in " +
+      "<code>examples/hstu/context_parallel/_mask_func.py</code> " +
+      "(own_q_chunks at line ~365, peer / own_k_chunks at line ~366-367); " +
+      "DualChunkSwap dispatch in " +
+      "<code>get_batch_on_this_cp_rank_for_hstu</code> " +
+      "(<code>examples/hstu/context_parallel/hstu_attn_cp.py</code>)." +
+      "</p>"
+    );
+
+    return lines.join("\n");
+  }
+
+  // ---- Navigation state ----
+  const prev = document.getElementById("prev");
+  const next = document.getElementById("next");
+  const jump = document.getElementById("jump");
+  const indicator = document.getElementById("indicator");
+  const explainTitle = document.getElementById("explain-title");
+  const explainBody = document.getElementById("explain-body");
+
+  let current = 0;
+
+  function render(step) {
+    if (step < 0 || step >= CP) return;
+    current = step;
+    for (let r = 0; r < CP; r++) drawPanel(r, step);
+    indicator.textContent = `Step ${step} of ${CP - 1}`;
+    jump.value = String(step);
+    prev.disabled = (step === 0);
+    next.disabled = (step === CP - 1);
+
+    const titles = [
+      "Step 0 — own KV (no rotation yet)",
+      "Step 1 — first ring rotation",
+      "Step 2 — second ring rotation",
+      "Step 3 — third ring rotation (longest distance)",
+    ];
+    explainTitle.textContent = titles[step];
+    explainBody.innerHTML = explanationFor(step);
+  }
+
+  prev.addEventListener("click", () => render(current - 1));
+  next.addEventListener("click", () => render(current + 1));
+  jump.addEventListener("change", (e) => {
+    render(parseInt(e.target.value, 10));
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.target && e.target.tagName === "SELECT") return;
+    if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      if (current > 0) render(current - 1);
+      e.preventDefault();
+    } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+      if (current < CP - 1) render(current + 1);
+      e.preventDefault();
+    }
+  });
+
+  render(0);
+})();
+</script>
+</body>
+</html>
