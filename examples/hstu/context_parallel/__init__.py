@@ -5,8 +5,24 @@ Context Parallelism wrapper for HSTU attention.
 
 The kernel itself ships from the FBGEMM-style `hstu` package; this module
 adds a CP (context-parallel) wrapper around `hstu.hstu_attn_varlen_func`
-plus the DualChunkSwap dispatch helper. See `docs/cp/SPEC.md` for the v0
-contract.
+plus the DualChunkSwap dispatch helper. See `docs/cp/HSTU_CP_DESIGN.html`
+for the full implementation contract; the legacy `docs/cp/SPEC.md` it
+supersedes is no longer maintained.
+
+What's supported (v0):
+- Pure causal, heterogeneous masks (`num_contexts`, `num_targets`,
+  `target_group_size > 1`), and sliding-causal — all routed through the
+  arbitrary-mask `func` path (single kernel per ring step).
+- Two-stream comm/compute overlap (NCCL P2P on `comm_stream`, kernel on
+  `default_stream`).
+- HSTUBlock training-loop integration via `_HSTUVarlenCPFunc.apply`.
+
+What's NOT supported (v0):
+- FP8 quantisation (`quant_mode != -1`).
+- KV cache (`kv_cache` / `page_offsets` / `page_ids` / `last_page_lens`).
+- `rab` / `has_drab`.
+- Ulysses sequence parallel (in-attention all-to-all variant).
+- Megatron-Core striped CP (different chunking scheme).
 
 Public API (re-exported from `hstu_attn_cp`):
 - `hstu_attn_varlen_cp_func` — drop-in replacement for

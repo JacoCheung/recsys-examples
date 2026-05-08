@@ -1,0 +1,1131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HSTU Context-Parallel — Design</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --accent: #1f77b4;
+    --bg: #fafafa;
+    --fg: #222;
+    --muted: #666;
+    --border: #ddd;
+    --code-bg: #f0f0f0;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    background: var(--accent);
+    color: white;
+    padding: 1.2em 2em 1em;
+  }
+  header h1 {
+    margin: 0 0 0.2em;
+    font-size: 1.4em;
+  }
+  header .subtitle {
+    font-size: 0.9em;
+    opacity: 0.9;
+  }
+  header a.see-also {
+    color: white;
+    text-decoration: underline;
+  }
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    gap: 1.5em;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 1em 2em 4em;
+  }
+  nav.toc {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8em 1em;
+    font-size: 0.88em;
+    align-self: start;
+    position: sticky;
+    top: 0.8em;
+    max-height: calc(100vh - 1.6em);
+    overflow-y: auto;
+  }
+  nav.toc h2 {
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin: 0 0 0.4em;
+    border: none;
+    padding: 0;
+  }
+  nav.toc ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  nav.toc li {
+    margin: 0.2em 0;
+  }
+  nav.toc li.toc-h3 {
+    margin-left: 1em;
+    font-size: 0.92em;
+  }
+  nav.toc a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  nav.toc a:hover {
+    text-decoration: underline;
+  }
+  main {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1.4em 2em 2em;
+    min-width: 0;
+  }
+  main h1 {
+    color: var(--accent);
+    margin: 0 0 0.4em;
+    font-size: 1.6em;
+  }
+  main h2 {
+    color: var(--accent);
+    margin: 1.6em 0 0.6em;
+    font-size: 1.25em;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.2em;
+  }
+  main h3 {
+    margin: 1.4em 0 0.4em;
+    font-size: 1.05em;
+    color: var(--fg);
+    font-weight: 600;
+  }
+  main h4 {
+    margin: 1.2em 0 0.4em;
+    font-size: 0.95em;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+  main p { margin: 0.6em 0; }
+  main ul, main ol { margin: 0.6em 0 0.6em 1.4em; padding: 0; }
+  main li { margin: 0.2em 0; }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2em 0;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.8em 0;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.4em 0.7em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: #f6f6f6;
+    font-weight: 600;
+  }
+  code, pre, .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+  }
+  p code, li code, td code, th code {
+    background: var(--code-bg);
+    padding: 0.05em 0.3em;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.7em 1em;
+    border-radius: 4px;
+    overflow-x: auto;
+  }
+  pre code {
+    background: transparent;
+    padding: 0;
+  }
+  pre.mermaid { background: white; padding: 0.4em 0; }
+  .src-ref {
+    font-size: 0.82em;
+    color: var(--muted);
+  }
+  .src-ref code { background: transparent; }
+  @media (max-width: 900px) {
+    .layout {
+      grid-template-columns: 1fr;
+    }
+    nav.toc {
+      position: static;
+      max-height: none;
+    }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>HSTU Context-Parallel — Design</h1>
+  <div class="subtitle">
+    v0 design spec &nbsp;|&nbsp;
+    See also: <a class="see-also" href="HSTU_CP_WALKTHROUGH.html">interactive walkthrough</a>
+  </div>
+</header>
+
+<div class="layout">
+
+<nav class="toc">
+  <h2>Table of contents</h2>
+  <ul>
+    <li><a href="#1-high-level-architecture">§1. High-level architecture</a></li>
+    <li><a href="#2-dualchunkswap-layout">§2. DualChunkSwap layout</a></li>
+    <li class="toc-h3"><a href="#why-paired-chunks-and-not-naive-contiguous-halves">Why paired chunks (and not naive contiguous halves)</a></li>
+    <li><a href="#3-ring-p2p-communication">§3. Ring P2P communication</a></li>
+    <li class="toc-h3"><a href="#nccl-invariant-two-pair-batches-not-one-four-pair-batch">NCCL invariant: two-pair batches, not one four-pair batch</a></li>
+    <li><a href="#4-comm-compute-overlap-gantt">§4. Comm/compute overlap (Gantt)</a></li>
+    <li class="toc-h3"><a href="#the-clone-is-mandatory">The clone is mandatory</a></li>
+    <li><a href="#5-arbitrary-mask-func-tensor">§5. Arbitrary-mask <code>func</code> tensor</a></li>
+    <li class="toc-h3"><a href="#why-func-is-more-flexible-than-is-causal">Why <code>func</code> is more flexible than <code>is_causal</code></a></li>
+    <li class="toc-h3"><a href="#per-step-localisation-localize-func-for-cp-step">Per-step localisation: <code>localize_func_for_cp_step</code></a></li>
+    <li><a href="#6-caching-and-pooling">§6. Caching and pooling</a></li>
+    <li class="toc-h3"><a href="#6-1-cp-func-cache">6.1 <code>_cp_func_cache</code></a></li>
+    <li class="toc-h3"><a href="#6-2-recv-buffer-pool">6.2 <code>_recv_buffer_pool</code></a></li>
+    <li><a href="#7-worked-example-b-2-dp-1-cp-4">§7. Worked example — <code>b=2</code>, <code>DP=1</code>, <code>CP=4</code></a></li>
+    <li class="toc-h3"><a href="#7-1-ring-steps-and-peer-k-layouts">7.1 Ring steps and peer K layouts</a></li>
+    <li class="toc-h3"><a href="#7-2-func-example-for-one-specific-row">7.2 <code>func</code> example for one specific row</a></li>
+    <li class="toc-h3"><a href="#7-3-nccl-exchanges-per-step-forward">7.3 NCCL exchanges per step (forward)</a></li>
+    <li class="toc-h3"><a href="#7-4-fp32-accumulator-after-each-step-rank-0-perspective">7.4 fp32 accumulator after each step (rank 0 perspective)</a></li>
+    <li class="toc-h3"><a href="#7-5-final-gather">7.5 Final gather</a></li>
+    <li class="toc-h3"><a href="#7-6-backward-reverse-ring-dkv-exchange">7.6 Backward — reverse-ring dKV exchange</a></li>
+    <li><a href="#8-out-of-scope-v0">§8. Out-of-scope (v0)</a></li>
+  </ul>
+</nav>
+
+<main>
+
+<p>
+  This document is the design spec for the v0 HSTU context-parallel
+  implementation. Every claim cites a line number in the live source files
+  listed under each section. The matching, interactive walkthrough of the
+  worked example is shipped as
+  <a href="HSTU_CP_WALKTHROUGH.html"><code>HSTU_CP_WALKTHROUGH.html</code></a>.
+</p>
+
+<p>Sources of truth (cited inline by <code>file:line</code>):</p>
+<ul>
+  <li><code>examples/hstu/context_parallel/hstu_attn_cp.py</code> — the wrapper, the
+    <code>_HSTUVarlenCPFunc</code> autograd Function, ring-P2P helpers, the
+    recv-buffer pool, and the cross-step <code>func</code> cache.</li>
+  <li><code>examples/hstu/context_parallel/_mask_func.py</code> — <code>localize_func_for_cp_step</code>,
+    <code>build_global_mask_func</code>, slot packing.</li>
+  <li><code>examples/hstu/modules/hstu_block.py</code> — the call site that dispatches
+    jagged-data to ranks and gathers it back.</li>
+  <li><code>examples/hstu/test/cp/{conftest.py,test_cp_forward.py,test_cp_backward.py,test_func_cache.py,test_recv_buffer_pool.py}</code>
+    — the regression suite.</li>
+</ul>
+
+<hr>
+
+<h2 id="1-high-level-architecture">§1. High-level architecture</h2>
+
+<p>
+  The CP path is plumbed through five layers. Top-down, here's what one
+  training-step iteration looks like.
+</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Trainer as Trainer loop
+    participant Block as HSTUBlock.forward<br/>hstu_block.py:120
+    participant Disp as apply_dualchunkswap_to_jagged<br/>hstu_attn_cp.py:453
+    participant Layer as NativeHSTULayer (×N)
+    participant Wrap as hstu_attn_varlen_cp_func<br/>hstu_attn_cp.py:2094
+    participant Func as _HSTUVarlenCPFunc.forward<br/>hstu_attn_cp.py:1924
+    participant Multi as _multi_gpu_forward_arbitrary<br/>hstu_attn_cp.py:1141
+    participant Ring as _ring_send_recv_kv<br/>hstu_attn_cp.py:911
+    participant Kernel as hstu_attn_varlen_func<br/>(installed FBGEMM kernel)
+    participant Gather as gather_jagged_from_cp_rank<br/>hstu_attn_cp.py:591
+
+    Trainer->>Block: jd (global JaggedData)
+    Block->>Disp: shard jd to this rank<br/>hstu_block.py:185
+    Disp-->>Block: jd_local, local_to_global
+    Block->>Layer: forward jd_local through N layers
+    Layer->>Wrap: q,k,v (DualChunkSwap shard)<br/>cp_group, cp_global_ranks
+    Wrap->>Wrap: _enforce_v0_contract<br/>hstu_attn_cp.py:629
+    Wrap->>Func: apply (autograd boundary)<br/>hstu_attn_cp.py:2213
+    Func->>Multi: cu_seqlens_global = cu_seqlens_q * cp_size<br/>hstu_attn_cp.py:1966
+    loop step in 0..cp_size-1
+        Multi->>Ring: send K,V to (rank+1), recv from (rank-1)<br/>hstu_attn_cp.py:1207
+        Multi->>Func: build per-step `func`<br/>hstu_attn_cp.py:1226
+        Multi->>Kernel: hstu_attn_varlen_func(window=(-1,-1), func=...)<br/>hstu_attn_cp.py:1241
+        Multi->>Multi: out_local += partial.float()<br/>hstu_attn_cp.py:1266
+    end
+    Multi-->>Func: out_local.to(dtype)
+    Func-->>Wrap: out
+    Wrap-->>Layer: out (local DualChunkSwap order)
+    Layer-->>Block: jd with local values
+    Block->>Gather: gather_jagged_from_cp_rank<br/>hstu_block.py:210
+    Gather-->>Block: global values (all-reduce SUM)
+    Block-->>Trainer: postprocessor(jd_global)
+</pre>
+
+<p>
+  The autograd boundary (<code>_HSTUVarlenCPFunc</code>) is what keeps the entire
+  ring transparent to the rest of the trainer: forward saves the local Q/K/V
+  plus the cu_seqlens (<code>hstu_attn_cp.py:2005</code>), and <code>.backward()</code>
+  re-runs the ring in reverse using those saved tensors.
+</p>
+
+<p>
+  The backward path mirrors forward. The reverse ring runs after the local
+  backward kernels so each rank's dK/dV partials get sent back to the
+  peer that owned the K/V originally, then accumulated.
+</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Trainer as Trainer (loss.backward)
+    participant Func as _HSTUVarlenCPFunc.backward<br/>hstu_attn_cp.py:2034
+    participant Multi as _multi_gpu_backward_arbitrary<br/>hstu_attn_cp.py:1709
+    participant Ring as _ring_send_recv_kv (forward dir)<br/>hstu_attn_cp.py:1775
+    participant Kernel as _call_hstu_bwd_kernel<br/>hstu_attn_cp.py:1300
+    participant RR as Reverse-ring dKV exchange<br/>hstu_attn_cp.py:1853
+
+    Trainer->>Func: dout_local
+    Func->>Multi: q k v cu_seqlens saved_for_backward<br/>hstu_attn_cp.py:2036
+    loop step in 0..cp_size-1
+        Multi->>Ring: rotate KV forward to reconstruct kv_at_step s<br/>hstu_attn_cp.py:1775
+        Multi->>Kernel: hstu_varlen_bwd_80 or 90 or 100 with func<br/>hstu_attn_cp.py:1811
+        Multi->>Multi: dq_acc += dq_p and collect step dk_p dv_p<br/>hstu_attn_cp.py:1830
+    end
+    loop step dk_p dv_p in dkv_to_send
+        Multi->>RR: send dKV to rank-step mod cp recv from rank+step mod cp<br/>hstu_attn_cp.py:1853
+        Multi->>Multi: dk_acc += recv_dk.float<br/>hstu_attn_cp.py:1878
+    end
+    Multi-->>Func: dq dk dv cast back to input dtype
+    Func-->>Trainer: grads with Nones for the non-tensor args<br/>hstu_attn_cp.py:2063
+</pre>
+
+<p>
+  Why the backward re-rotates KV in the <strong>same</strong> (forward) direction, then
+  sends dKV in the <strong>reverse</strong> direction at the end: at backward step <code>s</code>
+  the rank holds peer <code>(rank - s) % cp_size</code>'s K/V (reconstructed by
+  re-running the same ring), so the kernel produces dK/dV for that peer's
+  K/V (<code>hstu_attn_cp.py:1739-1745</code>). The dKV reverse-ring then routes those
+  partials home — <code>send_dst = (rank - step) % cp_size</code> (<code>hstu_attn_cp.py:1854</code>)
+  which is exactly that peer.
+</p>
+
+<hr>
+
+<h2 id="2-dualchunkswap-layout">§2. DualChunkSwap layout</h2>
+
+<p>
+  A global sample of length <code>L</code> (<code>L % (2*cp_size) == 0</code> is enforced at
+  dispatch — <code>hstu_attn_cp.py:389-391</code>) is split into <code>2 * cp_size</code>
+  <strong>chunks</strong> of size <code>c = L / (2*cp_size)</code>. Rank <code>r</code> owns chunks
+  <code>{r, 2*cp_size - 1 - r}</code> (<code>hstu_attn_cp.py:379</code>,
+  <code>hstu_attn_cp.py:535</code>). Per-rank local layout per sample is
+  <code>[chunk_r ; chunk_(2*cp_size - 1 - r)]</code> (<code>hstu_attn_cp.py:396-401</code>).
+</p>
+
+<p>For <code>cp_size = 4</code>, <code>chunks_per_seq = 8</code>, the ownership grid is:</p>
+
+<pre><code>chunk:    0     1     2     3     4     5     6     7
+        ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+owner:  │  0  │  1  │  2  │  3  │  3  │  2  │  1  │  0  │
+        └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+                              ↑↑     ↑↑
+                              7-r matched with r
+</code></pre>
+
+<pre class="mermaid">
+graph LR
+    subgraph "Global sample, L = 8 c, cp_size = 4"
+        c0[chunk 0]
+        c1[chunk 1]
+        c2[chunk 2]
+        c3[chunk 3]
+        c4[chunk 4]
+        c5[chunk 5]
+        c6[chunk 6]
+        c7[chunk 7]
+    end
+    R0([rank 0])
+    R1([rank 1])
+    R2([rank 2])
+    R3([rank 3])
+    c0 --> R0
+    c7 --> R0
+    c1 --> R1
+    c6 --> R1
+    c2 --> R2
+    c5 --> R2
+    c3 --> R3
+    c4 --> R3
+</pre>
+
+<h3 id="why-paired-chunks-and-not-naive-contiguous-halves">Why paired chunks (and not naive contiguous halves)</h3>
+
+<p>
+  A naive layout would give rank <code>r</code> the contiguous range
+  <code>[r * L/cp_size, (r+1) * L/cp_size)</code>. Under causal masking that loses
+  load balance hard: rank 0 gets the first quarter (very few K accesses
+  per Q row — every Q row only sees its short prefix), rank 3 gets the
+  last quarter (each Q row sees the full prefix, so kernel work is
+  ~<code>L²</code> per row). The total work then differs by <code>~(cp_size)×</code> between
+  rank 0 and rank <code>cp_size-1</code>.
+</p>
+
+<p>
+  The paired layout <code>{r, 2*cp_size - 1 - r}</code> cancels that imbalance: rank 0
+  takes chunk 0 (cheapest under causal — Q rows only see K rows
+  <code>[0, q+1)</code> ≤ <code>[0, c)</code>) <strong>plus</strong> chunk <code>2*cp_size-1</code> (most expensive —
+  Q rows see almost the entire K). Rank <code>cp_size/2 - 1</code> takes chunk
+  <code>cp_size/2 - 1</code> (medium) plus chunk <code>cp_size/2</code> (medium). Each rank's
+  total K-access count is the same.
+</p>
+
+<p>Concretely for <code>cp_size = 4</code>, <code>c = L/8</code>:</p>
+<ul>
+  <li>Rank 0: chunk 0 (Q rows see ≤ c K rows) + chunk 7 (Q rows see ~<code>8c</code>
+    K rows). Work proxy ≈ <code>c² + 8c² = 9c²</code>.</li>
+  <li>Rank 1: chunk 1 (Q rows see ≤ <code>2c</code>) + chunk 6 (Q rows see ~<code>7c</code>).
+    Work proxy ≈ <code>2c² + 7c² = 9c²</code>.</li>
+  <li>Rank 2: chunk 2 + chunk 5 → <code>3c² + 6c² = 9c²</code>.</li>
+  <li>Rank 3: chunk 3 + chunk 4 → <code>4c² + 5c² = 9c²</code>.</li>
+</ul>
+
+<p>
+  All ranks see ≈ <code>9c²</code> work — flat. This is the load-balancing argument
+  that makes <code>r ↔ 2*cp_size-1-r</code> the right pairing (the same trick
+  Megatron-Core CP uses for its "stripe" layout, ported here at chunk
+  granularity rather than token granularity).
+</p>
+
+<p>
+  The dispatch (<code>get_batch_on_this_cp_rank_for_hstu</code>,
+  <code>hstu_attn_cp.py:337</code>) just permutes rows; no <code>torch.distributed</code> calls
+  (<code>hstu_attn_cp.py:331</code>). The inverse for tests is
+  <code>gather_global_from_cp_rank</code> (<code>hstu_attn_cp.py:414</code>); production uses
+  <code>gather_jagged_from_cp_rank</code> with an all-reduce SUM
+  (<code>hstu_attn_cp.py:591</code>, summing zeros-elsewhere shards reproduces the
+  global tensor — <code>hstu_attn_cp.py:603-605</code>).
+</p>
+
+<hr>
+
+<h2 id="3-ring-p2p-communication">§3. Ring P2P communication</h2>
+
+<p>
+  Each rank exchanges its current K/V tile with its neighbour for
+  <code>cp_size - 1</code> ring steps so that, by the end, every rank has touched
+  every peer's K/V exactly once.
+</p>
+
+<p>Forward direction (<code>_ring_send_recv_kv</code>, <code>hstu_attn_cp.py:911-979</code>):</p>
+<ul>
+  <li><code>dst = (rank + 1) % cp_size</code> (<code>hstu_attn_cp.py:945</code>)</li>
+  <li><code>src = (rank - 1) % cp_size</code> (<code>hstu_attn_cp.py:946</code>)</li>
+</ul>
+
+<p>
+  Backward direction is the same <code>_ring_send_recv_kv</code> helper called with
+  <code>direction="backward"</code> (<code>hstu_attn_cp.py:947-949</code>), which flips the
+  neighbour pair. The forward path of the multi-GPU forward and of the
+  KV-reload portion of the backward use <code>direction="forward"</code>
+  (<code>hstu_attn_cp.py:1573</code>, <code>hstu_attn_cp.py:1784</code>). Only the dKV exchange
+  at the end of <code>_multi_gpu_backward_arbitrary</code> is sent in the <em>reverse</em>
+  direction (<code>hstu_attn_cp.py:1854</code> — <code>send_dst = (cp_rank - step) % cp_size</code>).
+</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R0 as Rank 0
+    participant R1 as Rank 1
+    participant R2 as Rank 2
+    participant R3 as Rank 3
+
+    Note over R0,R3: Forward ring 3 P2P exchanges for cp_size=4. Step 3 has no further P2P.
+
+    Note over R0,R3: step 0 to 1 (each rank also runs kernel on its own KV in step 0)
+    R0->>R1: K0,V0
+    R1->>R2: K1,V1
+    R2->>R3: K2,V2
+    R3->>R0: K3,V3
+    Note over R0,R3: step 1 to 2 (payload received from previous round)
+    R0->>R1: K3,V3
+    R1->>R2: K0,V0
+    R2->>R3: K1,V1
+    R3->>R0: K2,V2
+    Note over R0,R3: step 2 to 3 final rotation
+    R0->>R1: K2,V2
+    R1->>R2: K3,V3
+    R2->>R3: K0,V0
+    R3->>R0: K1,V1
+</pre>
+
+<p>
+  Why no P2P in the last step: at step <code>cp_size - 1</code> each rank already
+  holds the last peer's KV; no further rotation is needed. The code
+  guards this explicitly with <code>if step &lt; cp_size - 1</code> around the
+  <code>_ring_send_recv_kv</code> call (<code>hstu_attn_cp.py:1205</code>).
+</p>
+
+<p>
+  The backward reverse-ring (post-loop dKV exchange,
+  <code>hstu_attn_cp.py:1853-1879</code>) runs exactly <strong>once per non-zero step</strong>,
+  i.e. <code>cp_size - 1</code> exchanges. Each iteration sends <code>dk_p</code>/<code>dv_p</code> to
+  <code>(rank - step) % cp_size</code> and receives from <code>(rank + step) % cp_size</code>.
+  Note this isn't a single direction — at step 1 vs step 3 the same
+  rank sends to different peers. It's not a "ring" in the rotating
+  sense; it's <code>cp_size - 1</code> independent SendRecv pairs (one per
+  forward step where this rank computed grads for somebody else's KV).
+</p>
+
+<h3 id="nccl-invariant-two-pair-batches-not-one-four-pair-batch">NCCL invariant: two-pair batches, not one four-pair batch</h3>
+
+<p>
+  The kernel issues K and V as <strong>two separate 2-op batches</strong>, not a
+  single 4-op batch (<code>hstu_attn_cp.py:961-973</code>). The block comment at
+  <code>hstu_attn_cp.py:957-960</code> records the rationale: bundling all four ops
+  into one <code>batch_isend_irecv</code> call hangs in some NCCL/torch
+  combinations on the production image's NCCL on A100 PCIe. Two 2-op
+  batches is the verified-stable shape.
+</p>
+
+<hr>
+
+<h2 id="4-comm-compute-overlap-gantt">§4. Comm/compute overlap (Gantt)</h2>
+
+<p>
+  Two CUDA streams: the default stream (kernel + accumulator) and a
+  secondary <code>comm_stream</code> allocated lazily per device (<code>_get_cp_stream</code>,
+  <code>hstu_attn_cp.py:307-324</code>). The pattern in
+  <code>_multi_gpu_forward_arbitrary</code> (<code>hstu_attn_cp.py:1202-1277</code>) is:
+</p>
+
+<ol>
+  <li><code>comm_stream.wait_stream(default_stream)</code> — the comm stream waits for
+    the previous kernel's read of the recv buffer (so NCCL doesn't write
+    into a buffer that the kernel is still reading) (<code>hstu_attn_cp.py:1206</code>).</li>
+  <li><code>_ring_send_recv_kv(..., comm_stream=comm_stream)</code> — NCCL issued on
+    <code>comm_stream</code> (<code>hstu_attn_cp.py:1207</code>).</li>
+  <li>The kernel for <strong>this</strong> step (operating on <code>cur_k</code>/<code>cur_v</code> — the KV
+    we already had) runs on the default stream
+    (<code>hstu_attn_cp.py:1241</code>).</li>
+  <li><code>for r in reqs: r.wait()</code> — CPU-blocking; ensures the NCCL Work
+    handles are drained (<code>hstu_attn_cp.py:1273</code>).</li>
+  <li><code>default_stream.wait_stream(comm_stream)</code> — the default stream
+    waits for the comm stream so the next-step kernel sees the
+    recv'd bytes (<code>hstu_attn_cp.py:1275</code>).</li>
+  <li>Pointer swap of <code>cur_k ↔ recv_k</code>, <code>cur_v ↔ recv_v</code>
+    (<code>hstu_attn_cp.py:1276-1277</code>).</li>
+</ol>
+
+<pre class="mermaid">
+gantt
+    title Two-stream overlap cp_size=4 forward
+    dateFormat X
+    axisFormat %s
+
+    section default_stream
+    kernel step 0 own KV       :active, k0, 0, 5
+    kernel step 1 peer r-1 KV  :active, k1, 6, 11
+    kernel step 2 peer r-2 KV  :active, k2, 12, 17
+    kernel step 3 peer r-3 KV  :active, k3, 18, 23
+    cast and accumulate        :crit,   acc, 23, 24
+
+    section comm_stream
+    wait_stream before P2P 0   :         w0, 0, 1
+    NCCL P2P for step 1 KV     :         p0, 1, 5
+    wait_stream before P2P 1   :         w1, 6, 7
+    NCCL P2P for step 2 KV     :         p1, 7, 11
+    wait_stream before P2P 2   :         w2, 12, 13
+    NCCL P2P for step 3 KV     :         p2, 13, 17
+    no P2P after last step     :         pn, 18, 23
+
+    section CPU
+    Work.wait barrier 0        :crit,    cw0, 5, 6
+    Work.wait barrier 1        :crit,    cw1, 11, 12
+    Work.wait barrier 2        :crit,    cw2, 17, 18
+    final to dtype             :crit,    cd, 23, 24
+</pre>
+
+<p>What this diagram makes obvious:</p>
+
+<ul>
+  <li><strong>Overlap succeeds when kernel ≥ NCCL</strong> (the <code>kernel step i</code> bar
+    fully covers the <code>NCCL P2P</code> bar for step <code>i+1</code>'s KV). For typical
+    HSTU shapes the attention kernel runs tens of milliseconds and one
+    P2P of <code>~56 MB</code> runs single-digit milliseconds on NVLink — overlap
+    is real.</li>
+  <li><strong>Overlap stalls when kernel &lt; NCCL or on the last step.</strong> The last
+    step has no further P2P, so the trailing <code>to(dtype)</code> after the loop
+    is straight on the default stream.</li>
+  <li>The CPU-blocking <code>Work.wait()</code> lives on neither stream — it is a
+    synchronous barrier that pauses Python until the NCCL handle is
+    drained (<code>hstu_attn_cp.py:1273-1274</code>). The actual GPU-side ordering
+    is enforced by the wait_stream calls.</li>
+</ul>
+
+<p>
+  The same pattern appears in <code>_multi_gpu_backward_arbitrary</code>
+  (<code>hstu_attn_cp.py:1771-1844</code>) for the KV-reload portion of backward.
+  The dKV reverse-ring at the end uses a slightly relaxed pattern: K and
+  V issuance proceed concurrently inside NCCL without a wait between
+  them, then a single wait at the end (<code>hstu_attn_cp.py:1862-1879</code>).
+</p>
+
+<h3 id="the-clone-is-mandatory">The clone is mandatory</h3>
+
+<p>
+  <code>cur_k = k_local.clone()</code> (<code>hstu_attn_cp.py:1185</code>) cannot be replaced
+  with <code>cur_k = k_local</code> — NCCL's batch_isend_irecv validator rejects
+  the bare reference with <code>ValueError: Tensors for P2P must be
+  non-overlapping and dense</code> (block comment, <code>hstu_attn_cp.py:1180-1184</code>).
+  The clone also prevents a subtler bug: without it, the post-step
+  buffer swap at <code>hstu_attn_cp.py:1276</code> would rebind <code>cur_k = recv_k</code>
+  but the next step's NCCL would write into the original <code>k_local</code>
+  storage — silent data corruption (block comment in the legacy path,
+  <code>hstu_attn_cp.py:1030-1033</code>).
+</p>
+
+<hr>
+
+<h2 id="5-arbitrary-mask-func-tensor">§5. Arbitrary-mask <code>func</code> tensor</h2>
+
+<p>
+  The HSTU FBGEMM kernel exposes an "arbitrary mask" interface where
+  each Q row's allowed K positions are encoded as <strong>disjoint integer
+  intervals</strong> packed into a fixed-width <code>func</code> tensor. Layout
+  (<code>_mask_func.py:19-30</code>, <code>_mask_func.py:213-250</code>):
+</p>
+
+<pre><code>func.shape = (1, NFUNC, total_local_q)   # int32
+
+slot 0  : MaxFunc[0]    upper of interval 0  (lower implicit = 0)
+slot 1  : MinFunc[0]    lower of interval 1
+slot 2  : MaxFunc[1]    upper of interval 1
+slot 3  : MinFunc[1]    lower of interval 2  (NFUNC ≥ 5 only)
+…
+</code></pre>
+
+<p>
+  <code>NFUNC</code> must be odd (<code>_mask_func.py:344</code>); <code>NFUNC = 3</code> supports up to
+  2 disjoint intervals per row (<code>_mask_func.py:482</code>). The HSTU CP
+  wrapper hardcodes <code>NFUNC = 3</code> (<code>hstu_attn_cp.py:1235</code>), enough for
+  history-causal + target-group-band — the standard production family.
+</p>
+
+<p>
+  Note the trailing axis is <strong><code>total_local_q</code></strong> (jagged, sum of per-sample
+  seqlens), not <code>max_seqlen_q</code>. The kernel reads
+  <code>func_ptr + binfo.sum_s_q + (j * func_ids_stride) + q_local</code>, which
+  only resolves correctly with the jagged trailing axis (block comment,
+  <code>_mask_func.py:540-547</code>).
+</p>
+
+<h3 id="why-func-is-more-flexible-than-is-causal">Why <code>func</code> is more flexible than <code>is_causal</code></h3>
+
+<p>
+  Flash-attn (and most fused attentions) take a boolean
+  <code>is_causal</code> plus optional <code>(window_left, window_right)</code> for sliding —
+  that's a <strong>single regular structure</strong> built into the kernel. HSTU's
+  <code>func</code> tensor is a <strong>per-row arbitrary integer interval list</strong>: each
+  Q row independently declares which K positions contribute. That covers:
+</p>
+
+<ul>
+  <li>pure causal: row <code>q</code>'s slot[0] = <code>q+1</code>, no other slots used;</li>
+  <li>contextual prefix: rows <code>[0, nc)</code> see all of <code>[0, history_end)</code>,
+    rows <code>[nc, history_end)</code> see <code>[0, q+1)</code> (<code>_mask_func.py:79-89</code>);</li>
+  <li>target-group: rows in the target region see history <em>and</em> a
+    per-group-aligned target band (<code>_mask_func.py:91-111</code>);</li>
+  <li>sliding-causal: each row's lower bound becomes
+    <code>max(0, q - w_left)</code> (<code>_mask_func.py:77</code>);</li>
+  <li><strong>arbitrary CP-step mask</strong>: rows see only the K positions that landed
+    on the current peer's chunks (the whole reason this module exists).</li>
+</ul>
+
+<p>
+  The structured-mask layer of the kernel runs <em>first</em>, then the kernel
+  <em>intersects</em> its result with <code>func</code> (block comment,
+  <code>hstu_attn_cp.py:1252-1255</code>). To avoid double-application the CP path
+  disables the structured layer (<code>window_size=(-1,-1)</code>,
+  <code>num_contexts=None</code>, <code>num_targets=None</code>, <code>target_group_size=1</code>)
+  when calling the kernel and pushes the entire mask into <code>func</code>
+  (<code>hstu_attn_cp.py:1252-1255</code>).
+</p>
+
+<h3 id="per-step-localisation-localize-func-for-cp-step">Per-step localisation: <code>localize_func_for_cp_step</code></h3>
+
+<p>
+  At ring step <code>s</code> rank <code>r</code> holds K/V from peer
+  <code>(r - s) % cp_size</code> (<code>_mask_func.py:326-328</code>,
+  <code>hstu_attn_cp.py:1226-1240</code>). The local K layout is therefore
+  <code>[chunk_peer ; chunk_(2*cp - 1 - peer)]</code> per sample
+  (<code>_mask_func.py:328</code>). The localizer's job: for each Q row the rank owns,
+  take the global causal/target/contextual interval list and project it
+  onto the local K layout.
+</p>
+
+<p>
+  The hot-path implementation is numpy-vectorised
+  (<code>_mask_func.py:116-210</code>, <code>_mask_func.py:393-518</code>), running on CPU and
+  copying the resulting array to device once per call — block comment
+  <code>_mask_func.py:383-391</code> records that per-element CUDA writes in a
+  Python loop produced ~277× slowdown vs the structured path before the
+  vectorisation. The CPU build + bulk H2D copy is two orders of
+  magnitude faster.
+</p>
+
+<h4 id="concrete-example-cp-size-4-l-16-c-2-cp-rank-0-step-0">Concrete example: <code>cp_size=4</code>, <code>L=16</code>, <code>c=2</code>, <code>cp_rank=0</code>, <code>step=0</code></h4>
+
+<p>
+  Sample 0 of length 16, <code>c = L / (2*cp_size) = 2</code>. Rank 0 owns Q chunks
+  <code>{0, 7}</code>, so local Q maps to global Q rows <code>[0, 1, 14, 15]</code>.
+  At step 0, peer = rank 0 — K layout is <code>[chunk_0 ; chunk_7]</code> =
+  global K rows <code>[0, 1] ∪ [14, 15]</code> (local positions <code>[0, 1, 2, 3]</code>).
+</p>
+
+<p>
+  Causal-only (no contextual, no targets), so each Q row's allowed K is
+  <code>[0, q+1)</code>.
+</p>
+
+<table>
+  <tr><th>local_q</th><th>global_q</th><th>global K interval</th><th>local K interval</th><th>NFUNC=3 slots</th></tr>
+  <tr><td>0</td><td>0</td><td>[0, 1)</td><td>[0, 1)</td><td>(1, 0, 0)</td></tr>
+  <tr><td>1</td><td>1</td><td>[0, 2)</td><td>[0, 2)</td><td>(2, 0, 0)</td></tr>
+  <tr><td>2</td><td>14</td><td>[0, 15)</td><td>[0, 2) ∪ [2, 3) → merge → [0, 3)</td><td>(3, 0, 0)</td></tr>
+  <tr><td>3</td><td>15</td><td>[0, 16)</td><td>[0, 2) ∪ [2, 4) → merge → [0, 4)</td><td>(4, 0, 0)</td></tr>
+</table>
+
+<p>
+  The merge step is in <code>_mask_func.py:498-510</code>: chunk_first contributions
+  land in local <code>[0, c)</code>, chunk_second in <code>[c, 2c)</code>, so when adjacent
+  they are merged into a single interval and slot[0] alone suffices.
+  Sample length 16 with <code>cp_size=4</code> yields 4 local Q rows for sample 0;
+  the full <code>func</code> tensor for two-sample batch (sample 1 of length 32)
+  has trailing axis 12 (4 + 8).
+</p>
+
+<hr>
+
+<h2 id="6-caching-and-pooling">§6. Caching and pooling</h2>
+
+<p>
+  Two module-level data structures back the steady-state perf path. Both
+  are documented at the call site and both have regression tests in
+  <code>examples/hstu/test/cp/</code>.
+</p>
+
+<h3 id="6-1-cp-func-cache">6.1 <code>_cp_func_cache</code></h3>
+
+<p>
+  <code>_cp_func_cache: dict[tuple, torch.Tensor]</code> — module-level (NOT
+  thread-local) at <code>hstu_attn_cp.py:183</code>.
+</p>
+
+<p>
+  <strong>Key</strong>: full content tuple
+  <code>(step, cp_size, cp_rank, cu_seqlens.tolist(), num_contexts.tolist(),
+  num_targets.tolist(), target_group_size, window_size, NFUNC)</code>
+  (<code>hstu_attn_cp.py:271-281</code>).
+</p>
+
+<p>
+  <strong>Why module-level, not TLS</strong>: PyTorch autograd backward runs on a
+  worker thread, not the forward thread. A <code>threading.local()</code> cache
+  populated on the forward thread is invisible from the worker. That was
+  the cw-dfw round-4 regression — <code>~734 ms/step</code> instead of <code>~70 ms</code>
+  because backward rebuilt every layer's func tensor from scratch
+  (block comment, <code>hstu_attn_cp.py:160-174</code>). Pinned by
+  <code>test_func_cache.py:test_cache_visible_from_other_thread</code>
+  (<code>test_func_cache.py:97-132</code>): the test populates from the main thread
+  and asserts the worker thread retrieves the <em>same</em> tensor object.
+</p>
+
+<p>
+  <strong>Why content-keyed, not identifier-keyed</strong>: the HSTU benchmark cycles
+  <code>num_generated_batches</code> (~100) unique <code>cu_seqlens</code> values across
+  training steps. Identifier-only keying would silently return a stale
+  <code>func</code> for a different batch's mask shape — wrong mask = wrong grads
+  = silent training corruption. Pinned by
+  <code>test_func_cache.py:test_cache_keys_on_cu_seqlens_content</code>
+  (<code>test_func_cache.py:135-176</code>): two distinct cu_seqlens values must
+  produce distinct cache entries.
+</p>
+
+<p>
+  <strong>Caller fast-path</strong>: callers that already know <code>cu_seqlens.tolist()</code>
+  (the autograd Function entry computes it once per training step,
+  <code>hstu_attn_cp.py:1974</code>) pass it through <code>cu_seqlens_global_tuple</code> to
+  skip the internal hash sync (<code>hstu_attn_cp.py:256-260</code>,
+  <code>test_func_cache.py:179-237</code>).
+</p>
+
+<p>
+  <strong>Memory bound</strong>: <code>_CP_FUNC_CACHE_MAX = 1024</code>
+  (<code>hstu_attn_cp.py:184</code>); FIFO eviction when exceeded
+  (<code>hstu_attn_cp.py:289-290</code>). Pinned by <code>test_cache_caps_growth</code>
+  (<code>test_func_cache.py:240-271</code>).
+</p>
+
+<p>
+  <strong>Scope hooks</strong>: <code>cp_func_cache_scope_enter()</code>
+  (<code>hstu_attn_cp.py:187-197</code>) clears the dict; <code>cp_func_cache_scope_exit()</code>
+  (<code>hstu_attn_cp.py:200-202</code>) is a no-op kept for symmetry. The hot path
+  never calls <code>scope_enter</code> from inside <code>HSTUBlock.forward</code>
+  (<code>hstu_block.py:173-181</code>) — that would wipe the cross-step cache and
+  re-introduce the round-5/6 hit rate ceiling. Pinned by
+  <code>test_scope_exit_keeps_cache_alive_for_backward</code>
+  (<code>test_func_cache.py:274-293</code>).
+</p>
+
+<h3 id="6-2-recv-buffer-pool">6.2 <code>_recv_buffer_pool</code></h3>
+
+<p>
+  <code>_recv_buffer_pool: dict[tuple, torch.Tensor]</code> — module-level at
+  <code>hstu_attn_cp.py:107</code>. Returned via <code>_get_recv_buffer</code>
+  (<code>hstu_attn_cp.py:110-130</code>).
+</p>
+
+<p>
+  <strong>Key</strong>: <code>(template.dtype, template.device, slot)</code> — <strong>NOT shape</strong>
+  (<code>hstu_attn_cp.py:121</code>). <code>slot</code> is a logical name like
+  <code>"fwd_recv_k"</code>, <code>"fwd_recv_v"</code>, <code>"bwd_recv_k"</code>, <code>"bwd_recv_v"</code>,
+  <code>"bwd_recv_dk"</code>, <code>"bwd_recv_dv"</code> (<code>hstu_attn_cp.py:1187-1188</code>,
+  <code>hstu_attn_cp.py:1752-1753</code>, <code>hstu_attn_cp.py:1851-1852</code>,
+  <code>test_recv_buffer_pool.py:130-137</code>).
+</p>
+
+<p>
+  <strong>Storage layout</strong>: 1-D contiguous, <code>template.numel()</code> elements
+  allocated on first use (<code>hstu_attn_cp.py:124-126</code>); grown in-place if a
+  later call needs more elements (same line). Returned as
+  <code>narrow(0, 0, n).view(template.shape)</code> (<code>hstu_attn_cp.py:130</code>),
+  which stays contiguous because the underlying storage is contiguous
+  and <code>narrow</code> is a front-slice. NCCL P2P consumes it natively
+  (block comment, <code>hstu_attn_cp.py:127-130</code>).
+</p>
+
+<p>
+  <strong>Why not key by shape</strong>: round-10 lesson, recorded at
+  <code>hstu_attn_cp.py:91-97</code>: a shape-keyed pool produces a fresh entry for
+  every distinct <code>total_tokens</code> the dataset emits. The HSTU benchmark
+  cycles 100 unique <code>cu_seqlens</code> × 6 slots = 600 entries × ~56 MB each
+  = ~33 GB — OOM at iter ~400 with <code>CUDA error: an illegal memory
+  access</code>. Pinned by:
+</p>
+
+<ul>
+  <li><code>test_different_shapes_same_slot_share_storage_when_fits</code>
+    (<code>test_recv_buffer_pool.py:73-100</code>): two different-shape templates
+    in the same slot share storage when the smaller fits.</li>
+  <li><code>test_growing_shape_grows_storage_in_place</code>
+    (<code>test_recv_buffer_pool.py:103-120</code>): a larger shape grows the
+    entry, doesn't add a new one.</li>
+  <li><code>test_pool_bounded_under_simulated_jagged_workload</code>
+    (<code>test_recv_buffer_pool.py:123-146</code>): 100 distinct shapes × 6 slots
+    yields 6 entries, not 600.</li>
+</ul>
+
+<p>
+  <strong>Stream correctness</strong>: each ring step ends with
+  <code>default_stream.wait_stream(comm_stream)</code> followed by reading the
+  buffer; the next layer's <code>comm_stream.wait_stream(default_stream)</code>
+  before its NCCL P2P guarantees the previous read has completed before
+  NCCL writes (block comment, <code>hstu_attn_cp.py:99-105</code>). Reusing
+  storage across the 8 layers' forwards is therefore safe.
+</p>
+
+<p>
+  <strong>Distinct slot per logical recv tensor</strong>: <code>recv_k</code> and <code>recv_v</code> are
+  read concurrently within a single ring step, so they MUST be distinct
+  physical storages. Pinned by
+  <code>test_distinct_slots_map_to_distinct_storage</code>
+  (<code>test_recv_buffer_pool.py:59-70</code>). Likewise the bwd KV-reload uses
+  different slots (<code>bwd_recv_k</code>, <code>bwd_recv_v</code>) from the bwd dKV
+  exchange (<code>bwd_recv_dk</code>, <code>bwd_recv_dv</code>) so they don't collide
+  mid-step (<code>hstu_attn_cp.py:1849-1852</code>).
+</p>
+
+<hr>
+
+<h2 id="7-worked-example-b-2-dp-1-cp-4">§7. Worked example — <code>b=2</code>, <code>DP=1</code>, <code>CP=4</code></h2>
+
+<p>
+  This is the centerpiece. The interactive walkthrough at
+  <a href="HSTU_CP_WALKTHROUGH.html"><code>HSTU_CP_WALKTHROUGH.html</code></a> renders the
+  same example with prev/next navigation.
+</p>
+
+<p>
+  <strong>Setup.</strong> Two samples, lengths <code>L_0 = 16</code>, <code>L_1 = 32</code>. Both divisible
+  by <code>2 * cp_size = 8</code> (the dispatch invariant,
+  <code>hstu_attn_cp.py:389</code>). Total global tokens = 48.
+</p>
+
+<ul>
+  <li>Sample 0: <code>c_0 = 16 / 8 = 2</code>. Global rows <code>[0, 16)</code>, chunks of 2:
+    <code>chunk_b0_k = [2k, 2k+2)</code> for <code>k = 0..7</code>.</li>
+  <li>Sample 1: <code>c_1 = 32 / 8 = 4</code>. Global rows <code>[16, 48)</code>, chunks of 4:
+    <code>chunk_b1_k = [16 + 4k, 16 + 4k + 4)</code> for <code>k = 0..7</code>.</li>
+</ul>
+
+<p><code>cu_seqlens_global = [0, 16, 48]</code>.</p>
+
+<p><strong>Ownership table</strong> (rank <code>r</code> owns chunks <code>{r, 7-r}</code>):</p>
+
+<table>
+  <tr><th>rank</th><th>chunks owned</th><th>sample-0 global rows</th><th>sample-1 global rows</th><th>local Q rows total</th></tr>
+  <tr><td>0</td><td>{0, 7}</td><td>[0,2) ∪ [14,16)</td><td>[16,20) ∪ [44,48)</td><td>4 + 8 = <strong>12</strong></td></tr>
+  <tr><td>1</td><td>{1, 6}</td><td>[2,4) ∪ [12,14)</td><td>[20,24) ∪ [40,44)</td><td>4 + 8 = <strong>12</strong></td></tr>
+  <tr><td>2</td><td>{2, 5}</td><td>[4,6) ∪ [10,12)</td><td>[24,28) ∪ [36,40)</td><td>4 + 8 = <strong>12</strong></td></tr>
+  <tr><td>3</td><td>{3, 4}</td><td>[6,8) ∪ [8,10)</td><td>[28,32) ∪ [32,36)</td><td>4 + 8 = <strong>12</strong></td></tr>
+</table>
+
+<p>
+  Each rank holds 12 local Q rows; sum = 48 = global. Every local <code>cu_loc</code>
+  is <code>[0, 4, 12]</code> (sample 0 contributes 4 = <code>2*c_0</code>, sample 1 contributes
+  8 = <code>2*c_1</code>).
+</p>
+
+<h3 id="7-1-ring-steps-and-peer-k-layouts">7.1 Ring steps and peer K layouts</h3>
+
+<p>
+  At step <code>s</code>, <code>peer = (cp_rank - s) % cp_size</code>. Local K layout is
+  <code>[chunk_peer ; chunk_(7 - peer)]</code> per sample (<code>_mask_func.py:328</code>,
+  <code>_mask_func.py:434-444</code>).
+</p>
+
+<table>
+  <tr><th>step</th><th>rank 0 peer</th><th>rank 0 K chunks</th><th>rank 1 peer</th><th>rank 1 K chunks</th><th>rank 2 peer</th><th>rank 2 K chunks</th><th>rank 3 peer</th><th>rank 3 K chunks</th></tr>
+  <tr><td>0</td><td>0</td><td>{0, 7}</td><td>1</td><td>{1, 6}</td><td>2</td><td>{2, 5}</td><td>3</td><td>{3, 4}</td></tr>
+  <tr><td>1</td><td>3</td><td>{3, 4}</td><td>0</td><td>{0, 7}</td><td>1</td><td>{1, 6}</td><td>2</td><td>{2, 5}</td></tr>
+  <tr><td>2</td><td>2</td><td>{2, 5}</td><td>3</td><td>{3, 4}</td><td>0</td><td>{0, 7}</td><td>1</td><td>{1, 6}</td></tr>
+  <tr><td>3</td><td>1</td><td>{1, 6}</td><td>2</td><td>{2, 5}</td><td>3</td><td>{3, 4}</td><td>0</td><td>{0, 7}</td></tr>
+</table>
+
+<p>
+  After step <code>s</code> of P2P (issued before the kernel call), rank <code>r</code>'s
+  <code>cur_k</code>/<code>cur_v</code> is the buffer that originated on peer <code>(r - s) mod 4</code>.
+  The forward ring rotates KV tile → +1 rank, so KV travels backward
+  through ranks (rank 0's KV → rank 1 → rank 2 → rank 3 → rank 0).
+</p>
+
+<h3 id="7-2-func-example-for-one-specific-row">7.2 <code>func</code> example for one specific row</h3>
+
+<p>
+  Rank 0, step 0 (peer = 0, K = <code>[chunk_0 ; chunk_7]</code>). Sample 0,
+  local Q row 0 (= global Q row 0). Causal: allowed K = <code>[0, 1)</code> global.
+</p>
+
+<ul>
+  <li>chunk_first = <code>chunk_0</code> = global K rows <code>[0, 2)</code>.
+    Intersection with <code>[0, 1)</code> = <code>[0, 1)</code> → local K interval <code>[0, 1)</code>.</li>
+  <li>chunk_second = <code>chunk_7</code> = global K rows <code>[14, 16)</code>.
+    Intersection with <code>[0, 1)</code> = empty.</li>
+</ul>
+
+<p>
+  NFUNC=3 slot encoding (<code>_mask_func.py:213-250</code>,
+  <code>_intervals_to_slots</code> with one interval <code>(0, 1)</code>): slot[0] = hi = 1,
+  slot[1] = slot[2] = 0. <code>func[0, :, 0] = (1, 0, 0)</code>.
+</p>
+
+<p>Local Q row 2 (= global Q row 14). Causal allowed K = <code>[0, 15)</code>.</p>
+
+<ul>
+  <li>chunk_first ∩ <code>[0, 15)</code> = <code>[0, 2)</code> → local <code>[0, 2)</code>.</li>
+  <li>chunk_second ∩ <code>[0, 15)</code> = <code>[14, 15)</code> → local <code>[2, 3)</code> (offset by
+    <code>c_b = 2</code>).</li>
+</ul>
+
+<p>
+  The two are adjacent, so the merge step (<code>_mask_func.py:498-510</code>)
+  collapses them to <code>[0, 3)</code>. slot[0] = 3, others 0.
+  <code>func[0, :, 2] = (3, 0, 0)</code>.
+</p>
+
+<h3 id="7-3-nccl-exchanges-per-step-forward">7.3 NCCL exchanges per step (forward)</h3>
+
+<p>
+  3 P2P exchanges total (<code>cp_size - 1 = 3</code>); the last step has none
+  (<code>hstu_attn_cp.py:1205</code>).
+</p>
+
+<table>
+  <tr><th>step → step+1</th><th>rank 0 sends to</th><th>rank 0 recvs from</th><th>rank 1 sends to</th><th>rank 1 recvs from</th><th>rank 2 sends to</th><th>rank 2 recvs from</th><th>rank 3 sends to</th><th>rank 3 recvs from</th></tr>
+  <tr><td>0 → 1</td><td>rank 1</td><td>rank 3</td><td>rank 2</td><td>rank 0</td><td>rank 3</td><td>rank 1</td><td>rank 0</td><td>rank 2</td></tr>
+  <tr><td>1 → 2</td><td>rank 1</td><td>rank 3</td><td>rank 2</td><td>rank 0</td><td>rank 3</td><td>rank 1</td><td>rank 0</td><td>rank 2</td></tr>
+  <tr><td>2 → 3</td><td>rank 1</td><td>rank 3</td><td>rank 2</td><td>rank 0</td><td>rank 3</td><td>rank 1</td><td>rank 0</td><td>rank 2</td></tr>
+</table>
+
+<p>
+  The <code>dst</code>/<code>src</code> pair is <strong>the same every step</strong> —
+  <code>dst = (rank + 1) % 4</code>, <code>src = (rank - 1) % 4</code>
+  (<code>hstu_attn_cp.py:945-946</code>); only the <strong>payload</strong> rotates.
+</p>
+
+<h3 id="7-4-fp32-accumulator-after-each-step-rank-0-perspective">7.4 fp32 accumulator after each step (rank 0 perspective)</h3>
+
+<p>
+  <code>out_local: torch.float32</code> of shape <code>(12, num_heads, head_dim)</code>,
+  allocated via <code>empty_like</code> <em>before</em> the loop
+  (<code>hstu_attn_cp.py:1200</code>).
+</p>
+
+<table>
+  <tr><th>after step</th><th>accumulator state</th></tr>
+  <tr><td>0</td><td><code>out_local.copy_(partial_step0.float())</code> — initial copy, not zeros + add (<code>hstu_attn_cp.py:1267</code>)</td></tr>
+  <tr><td>1</td><td><code>out_local += partial_step1.float()</code></td></tr>
+  <tr><td>2</td><td><code>out_local += partial_step2.float()</code></td></tr>
+  <tr><td>3</td><td><code>out_local += partial_step3.float()</code> — every peer's contribution now folded in</td></tr>
+</table>
+
+<p>
+  The <code>empty_like</code> + first-iteration <code>copy_</code> pattern (vs <code>zeros_like</code> +
+  <code>+=</code>) skips the ~112 MB memset per accumulator, saving ~50 µs per
+  accumulator × 8 layers ≈ 0.4 ms / training step on the forward side
+  and ~1.2 ms / training step across the 3 backward accumulators
+  (block comment, <code>hstu_attn_cp.py:1190-1199</code>,
+  <code>hstu_attn_cp.py:1755-1764</code>).
+</p>
+
+<h3 id="7-5-final-gather">7.5 Final gather</h3>
+
+<p>
+  Each rank's local 12-row output (after dtype cast back from fp32,
+  <code>hstu_attn_cp.py:1279</code>) is scattered into a <code>(48, num_heads, head_dim)</code>
+  zeros buffer via <code>local_to_global</code> and SUM-all-reduced:
+  <code>gather_jagged_from_cp_rank</code> at <code>hstu_attn_cp.py:591-622</code>. Each global
+  row is owned by exactly one rank, so SUM is identity
+  (<code>hstu_attn_cp.py:603-605</code>). Test uses the same pattern at
+  <code>test_cp_forward.py:159-165</code>.
+</p>
+
+<h3 id="7-6-backward-reverse-ring-dkv-exchange">7.6 Backward — reverse-ring dKV exchange</h3>
+
+<p>
+  Backward forward-ring <strong>reload</strong> (re-running the same forward ring to
+  reconstruct <code>kv_at_step[i]</code>) drives the kernel-bwd at each step
+  (<code>hstu_attn_cp.py:1771-1844</code>). Then the dKV reverse-ring at
+  <code>hstu_attn_cp.py:1853-1879</code>:
+</p>
+
+<p>
+  For each <code>(step, dk_p, dv_p)</code> collected at forward steps <code>1..cp_size-1</code>
+  (step 0's dKV is already self-owned, added directly at
+  <code>hstu_attn_cp.py:1833-1834</code>):
+</p>
+
+<ul>
+  <li><code>send_dst = (cp_rank - step) % cp_size</code>
+    (<code>hstu_attn_cp.py:1854</code>)</li>
+  <li><code>recv_src = (cp_rank + step) % cp_size</code>
+    (<code>hstu_attn_cp.py:1855</code>)</li>
+</ul>
+
+<p>For rank 0:</p>
+
+<table>
+  <tr><th>step</th><th>send dKV to (peer's K/V)</th><th>recv dKV from (computed for our K/V)</th></tr>
+  <tr><td>1</td><td>rank 3 (peer at step 1)</td><td>rank 1</td></tr>
+  <tr><td>2</td><td>rank 2</td><td>rank 2</td></tr>
+  <tr><td>3</td><td>rank 1</td><td>rank 3</td></tr>
+</table>
+
+<p>
+  Each rank receives 3 incoming partials (one per non-zero step), each
+  of which is <code>peer_at_their_step_s.dk_for_us</code>. SUM-accumulated into
+  <code>dk_acc</code> / <code>dv_acc</code> (<code>hstu_attn_cp.py:1878-1879</code>); cast back to input
+  dtype on return (<code>hstu_attn_cp.py:1881-1885</code>).
+</p>
+
+<hr>
+
+<h2 id="8-out-of-scope-v0">§8. Out-of-scope (v0)</h2>
+
+<p>
+  Hard rejections live in <code>_enforce_v0_contract</code>
+  (<code>hstu_attn_cp.py:629-753</code>). The list:
+</p>
+
+<ul>
+  <li><strong>Megatron-Core striped CP layout</strong>. v0 uses DualChunkSwap. Striped
+    CP is not implemented; no entry point exists in
+    <code>_HSTUVarlenCPFunc.forward</code>.</li>
+  <li><strong>Ulysses sequence parallel</strong>. <code>cp_comm_type</code> only accepts
+    <code>"p2p"</code>; anything else raises (<code>hstu_attn_cp.py:2208-2211</code>,
+    <code>hstu_attn_cp.py:1945-1948</code>). Ulysses would correspond to
+    <code>cp_comm_type="a2a"</code>; not wired.</li>
+  <li><strong>CP + sequence_parallel composition</strong>. Rejected at the block level
+    (<code>hstu_block.py:66-72</code>) because the SP preprocessor scatters
+    <code>jd.values</code> along the row dim while CP dispatch indexes with global
+    offsets — shape/index mismatch.</li>
+  <li><strong>FP8 quantisation</strong>. <code>quant_mode != -1</code> rejected at
+    <code>hstu_attn_cp.py:711-714</code>. The CP reduction is in fp32 by SPEC §2,
+    which the FP8 quant path would conflict with.</li>
+  <li><strong><code>kv_cache</code> / paging</strong>. Rejected at
+    <code>hstu_attn_cp.py:700-707</code> — <code>kv_cache</code>, <code>page_offsets</code>, <code>page_ids</code>,
+    <code>last_page_lens</code> all must be <code>None</code>.</li>
+  <li><strong><code>rab</code> / <code>has_drab</code></strong>. Rejected at <code>hstu_attn_cp.py:695-698</code>.</li>
+  <li><strong><code>seqused_q</code> / <code>seqused_k</code></strong>. Rejected at
+    <code>hstu_attn_cp.py:716-719</code> — the wrapper does not pass them through
+    to the kernel for <code>cp_size > 1</code>.</li>
+  <li><strong>Sliding-causal under CP with <code>num_contexts</code> or <code>num_targets</code></strong>.
+    Mirrors the FBGEMM kernel ABI invariant: contextual / target masks
+    require <code>window_size = (-1, 0)</code> (<code>hstu_attn_cp.py:670-684</code>). At
+    <code>cp_size > 1</code> the wrapper enforces the same — keeps behaviour
+    identical to <code>cp_size == 1</code> (which is rejected by the kernel
+    itself).</li>
+  <li><strong>Explicit <code>func</code> tensor</strong> under CP. The CP-step localisation
+    requires the analytical predicate, not an opaque tensor.
+    <code>func is not None</code> rejected at <code>hstu_attn_cp.py:686-693</code>.</li>
+  <li><strong><code>max_seqlen_q != max_seqlen_k</code></strong>. Rejected at
+    <code>hstu_attn_cp.py:2159-2163</code> — HSTU is self-attention only.</li>
+  <li><strong>HSTU layer types other than NATIVE under CP</strong>. Rejected at
+    <code>hstu_block.py:60-65</code> — CP plumbing is wired only through the
+    NATIVE layer.</li>
+  <li><strong>Heterogeneous mask under CP backward</strong>. Forward is supported via
+    the <code>func</code> path (<code>_multi_gpu_forward_arbitrary</code>). Backward under
+    het-mask is the same code path
+    (<code>_multi_gpu_backward_arbitrary</code>); the broader het-mask track
+    details are in <code>het_mask_design.md</code>.</li>
+  <li><strong><code>apply_dualchunkswap_to_jagged</code> with <code>padding_length > 0</code></strong>.
+    Rejected at <code>hstu_attn_cp.py:521-526</code> — SP+CP composition out of
+    v0 scope.</li>
+</ul>
+
+</main>
+
+</div>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose' });
+</script>
+</body>
+</html>

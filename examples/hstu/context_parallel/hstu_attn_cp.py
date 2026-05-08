@@ -24,11 +24,33 @@ What this module provides for v0
   partials ride the reverse ring back to their owning rank with
   copy-on-first-receive / add-after semantics.
 
-What this module does NOT do (v0 / SPEC §2)
-===========================================
-- Sliding-causal, `rab`, heterogeneous mask (`num_contexts`,
-  `num_targets`, `target_group_size > 1`), FP8, KV-cache, Ulysses,
-  comm/compute overlap (Slice 5), training-loop integration (Slice 6).
+What this module DOES support (v0 superseding the original SPEC §2 list)
+========================================================================
+All CP attention variants now route through the arbitrary-mask `func`
+path (`_multi_gpu_forward_arbitrary` / `_multi_gpu_backward_arbitrary`):
+- Pure-causal (the original v0 scope) — encoded by `localize_func_for_cp_step`
+  as `[0, q+1)` per row.
+- Heterogeneous masks (`num_contexts > 0`, `num_targets > 0`,
+  `target_group_size > 1`) — `_per_sample_intervals_array` packs the
+  contextual / history / target predicates into the same `func` slots.
+- Sliding-causal (`window_size = (w_left, 0)` with `w_left >= 0`) — the
+  vectorised builder lower-bounds each row's K interval at `q - w_left`.
+- Two-stream comm/compute overlap (`comm_stream` issues NCCL ring P2P
+  while `default_stream` runs the kernel; see `_multi_gpu_forward_arbitrary`
+  step loop) — replaces the Slice-5 single-stream path.
+- Training-loop integration via `HSTUBlock` and `_HSTUVarlenCPFunc.apply`
+  — replaces the Slice-6 standalone-tests-only scope.
+
+What this module STILL does NOT do
+==================================
+- FP8 quantisation (`quant_mode != -1` paths); the wrapper hard-codes
+  `quant_mode=-1` on the inner kernel call.
+- KV cache (`kv_cache` / `page_offsets` / `page_ids` / `last_page_lens`).
+- `rab` / `has_drab`.
+- Ulysses sequence parallel (the in-attention all-to-all variant).
+- Megatron-Core striped CP (a different chunking scheme).
+- See `docs/cp/HSTU_CP_DESIGN.html §8` for the rationale and the
+  rejection sites in `_HSTUVarlenCPFunc.forward`.
 """
 
 from __future__ import annotations
@@ -1963,6 +1985,18 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         # raise `RuntimeError: This hstu attention build does not support
         # arbitrary mask` — bake the rebuilt kernel into the deployment
         # container, OR push HSTU_ARBITRARY_NFUNC=3 upstream.
+        #
+        # `cu_seqlens_q` MUST already be the *local* (post-DualChunkSwap)
+        # cu_seqlens — every per-sample local length is exactly
+        # `global_length / cp_size`, so multiplying by `cp_size` recovers
+        # the global cu_seqlens that `localize_func_for_cp_step` consumes.
+        # The only intended caller is `apply_dualchunkswap_to_jagged` →
+        # `hstu_attn_varlen_cp_func` → `_HSTUVarlenCPFunc.apply`. Direct
+        # callers that bypass DualChunkSwap (e.g., feeding a global
+        # cu_seqlens_q) would silently build the wrong mask. The
+        # divisibility guard inside `apply_dualchunkswap_to_jagged`
+        # (each per-sample seqlen must be divisible by `2*cp_size`) is
+        # what enforces this contract upstream — see SPEC §3 / `_mask_func`.
         cu_seqlens_global = cu_seqlens_q * cp_size
         # Pre-compute the tuple-form of the integer tensors that drive
         # the func-cache key. ONE GPU→CPU sync per training step here
@@ -2036,6 +2070,9 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         q, k, v, cu_seqlens_q, _cu_seqlens_k = ctx.saved_tensors
         # All paths route through `_multi_gpu_backward_arbitrary` for
         # symmetry with forward (single kernel per ring step via `func`).
+        # `cu_seqlens_q` was saved by `forward()`; it is the local
+        # (post-DualChunkSwap) cu_seqlens — see the matching comment in
+        # `forward()` for the per-sample local-length invariant.
         cu_seqlens_global = cu_seqlens_q * ctx.cp_size
         grads = _multi_gpu_backward_arbitrary(
             q,

@@ -198,10 +198,13 @@ class HSTUBlock(MegatronModule):
 
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
-        # NOTE: do NOT call `cp_func_cache_scope_exit()` here. The cache
-        # must outlive forward so the autograd worker thread (which runs
-        # backward) can read what this thread wrote. The next training
-        # step's `cp_func_cache_scope_enter` will drop these tensors.
+        # NOTE: we deliberately do NOT call `cp_func_cache_scope_exit()`
+        # here. The func cache is content-keyed and process-global (see
+        # `hstu_attn_cp._cp_func_cache`); it must outlive forward so the
+        # autograd worker thread that runs backward can read what this
+        # thread wrote. Cross-step lifetime is also intentional — the
+        # cache is bounded by `_CP_FUNC_CACHE_MAX` with FIFO eviction,
+        # NOT by any scope boundary. See `docs/cp/HSTU_CP_DESIGN.html §6.1`.
 
         if cp_active:
             assert global_jd_template is not None

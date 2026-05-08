@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HSTU CP Walkthrough — b=2, L_0=16, L_1=32, CP=4</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --accent: #1f77b4;
+    --bg: #fafafa;
+    --fg: #222;
+    --muted: #666;
+    --border: #ddd;
+    --code-bg: #f0f0f0;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    background: var(--accent);
+    color: white;
+    padding: 1.2em 2em 1em;
+  }
+  header h1 {
+    margin: 0 0 0.2em;
+    font-size: 1.4em;
+  }
+  header .specs {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    opacity: 0.9;
+  }
+  nav {
+    background: white;
+    border-bottom: 1px solid var(--border);
+    padding: 0.6em 2em;
+    display: flex;
+    gap: 0.7em;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  nav button, nav select {
+    font: inherit;
+    padding: 0.35em 0.9em;
+    border: 1px solid var(--border);
+    background: white;
+    color: var(--fg);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  nav button:hover { background: #eef; }
+  nav button:disabled { opacity: 0.4; cursor: not-allowed; }
+  nav .indicator {
+    margin-left: auto;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--muted);
+  }
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 1em 2em 4em;
+  }
+  section.step {
+    display: none;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1.2em 1.6em 1.6em;
+    margin-bottom: 1em;
+  }
+  section.step.active { display: block; }
+  section.step h2 {
+    color: var(--accent);
+    margin: 0 0 0.5em;
+    font-size: 1.2em;
+  }
+  section.step h3 {
+    margin: 1.4em 0 0.4em;
+    font-size: 1em;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+  }
+  section.step p { margin: 0.5em 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.8em 0;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.4em 0.7em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: #f6f6f6;
+    font-weight: 600;
+  }
+  code, pre, .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.7em 1em;
+    border-radius: 4px;
+    overflow-x: auto;
+  }
+  .mermaid { background: white; }
+  details {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.4em 0.8em;
+    margin: 0.6em 0;
+  }
+  details summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .src-ref {
+    font-size: 0.82em;
+    color: var(--muted);
+  }
+  .src-ref code { background: transparent; }
+</style>
+</head>
+<body>
+<header>
+  <h1>HSTU Context-Parallel — interactive walkthrough</h1>
+  <div class="specs">
+    batch_size = 2 &nbsp;|&nbsp; L<sub>0</sub> = 16 &nbsp;|&nbsp; L<sub>1</sub> = 32
+    &nbsp;|&nbsp; cp_size = 4 &nbsp;|&nbsp; chunks_per_seq = 8
+    &nbsp;|&nbsp; c<sub>0</sub> = 2, c<sub>1</sub> = 4
+    &nbsp;|&nbsp; total local Q rows / rank = 12
+  </div>
+</header>
+
+<nav>
+  <button id="prev">&larr; Prev</button>
+  <button id="next">Next &rarr;</button>
+  <label for="jump">Jump to:</label>
+  <select id="jump"></select>
+  <span class="indicator" id="indicator">Step 1 of 9</span>
+</nav>
+
+<main>
+
+<!-- ====================================================================== -->
+<!-- STEP 1 — Initial state -->
+<!-- ====================================================================== -->
+<section class="step active" data-title="1. Initial state — DualChunkSwap dispatch">
+  <h2>Step 1 — Initial state: DualChunkSwap dispatch</h2>
+  <p>
+    Two samples are concatenated into one global jagged batch.
+    Sample 0 has length 16 with chunk size <code>c<sub>0</sub> = 2</code>;
+    sample 1 has length 32 with chunk size <code>c<sub>1</sub> = 4</code>.
+    Each rank pulls its DualChunkSwap shard via
+    <code>get_batch_on_this_cp_rank_for_hstu</code>
+    (rank <code>r</code> owns chunks <code>{r, 7-r}</code> per sample).
+    Local Q layout per rank is <code>[chunk_r ; chunk_(7-r)]</code> per
+    sample, concatenated across samples.
+  </p>
+
+  <div class="mermaid">
+graph TD
+    subgraph Global["Global jagged batch (48 rows total)"]
+        S0["Sample 0: rows [0,16) — 8 chunks of 2"]
+        S1["Sample 1: rows [16,48) — 8 chunks of 4"]
+    end
+    Disp{{"apply_dualchunkswap_to_jagged<br/>hstu_attn_cp.py:453"}}
+    R0["Rank 0: chunks {0,7}<br/>local rows = [0,2)∪[14,16) ∪ [16,20)∪[44,48)<br/>= 12 rows"]
+    R1["Rank 1: chunks {1,6}<br/>local rows = [2,4)∪[12,14) ∪ [20,24)∪[40,44)<br/>= 12 rows"]
+    R2["Rank 2: chunks {2,5}<br/>local rows = [4,6)∪[10,12) ∪ [24,28)∪[36,40)<br/>= 12 rows"]
+    R3["Rank 3: chunks {3,4}<br/>local rows = [6,8)∪[8,10) ∪ [28,32)∪[32,36)<br/>= 12 rows"]
+    Global --> Disp
+    Disp --> R0
+    Disp --> R1
+    Disp --> R2
+    Disp --> R3
+  </div>
+
+  <h3>Per-rank shapes (after dispatch, before any P2P)</h3>
+  <table>
+    <tr>
+      <th>rank</th><th>chunks owned</th><th>q_local.shape</th>
+      <th>k_local.shape</th><th>cu_loc</th>
+    </tr>
+    <tr>
+      <td>0</td><td>{0, 7}</td>
+      <td><code>(12, H, D)</code></td><td><code>(12, H, D)</code></td>
+      <td><code>[0, 4, 12]</code></td>
+    </tr>
+    <tr>
+      <td>1</td><td>{1, 6}</td>
+      <td><code>(12, H, D)</code></td><td><code>(12, H, D)</code></td>
+      <td><code>[0, 4, 12]</code></td>
+    </tr>
+    <tr>
+      <td>2</td><td>{2, 5}</td>
+      <td><code>(12, H, D)</code></td><td><code>(12, H, D)</code></td>
+      <td><code>[0, 4, 12]</code></td>
+    </tr>
+    <tr>
+      <td>3</td><td>{3, 4}</td>
+      <td><code>(12, H, D)</code></td><td><code>(12, H, D)</code></td>
+      <td><code>[0, 4, 12]</code></td>
+    </tr>
+  </table>
+
+  <h3>fp32 accumulator</h3>
+  <pre>out_local = empty_like(q_local, dtype=float32)   # shape (12, H, D), uninitialised</pre>
+  <p class="src-ref">
+    Allocated <em>before</em> the loop on purpose
+    (<code>hstu_attn_cp.py:1200</code>) — round-15-debug showed that
+    moving this alloc inside the loop with lazy-init triggers a CUDA
+    illegal-memory-access at iter ~400 unless
+    <code>CUDA_LAUNCH_BLOCKING=1</code>.
+  </p>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 2 — Ring step 0 -->
+<!-- ====================================================================== -->
+<section class="step" data-title="2. Ring step 0 — kernel on own KV; P2P launches step-1 KV">
+  <h2>Step 2 — Ring step 0</h2>
+  <p>
+    Each rank already holds its own K/V (fresh <code>clone()</code> of
+    <code>k_local</code>/<code>v_local</code> at
+    <code>hstu_attn_cp.py:1185-1186</code>). The kernel runs on the
+    default stream consuming this self-KV; in parallel the comm stream
+    issues NCCL P2P to deliver step-1's KV from rank <code>(r-1) % 4</code>.
+  </p>
+
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant DS as default_stream
+    participant CS as comm_stream
+    participant R as Rank r
+    participant Peer as Peer (r-1)%4
+
+    Note over R: cur_k = k_local.clone()<br/>cur_v = v_local.clone()<br/>(hstu_attn_cp.py:1185)
+    CS->>CS: comm_stream.wait_stream(default_stream)<br/>(hstu_attn_cp.py:1206)
+    CS->>Peer: isend(cur_k) to (r+1)%4
+    Peer-->>CS: irecv(recv_k) from (r-1)%4
+    CS->>Peer: isend(cur_v) to (r+1)%4
+    Peer-->>CS: irecv(recv_v) from (r-1)%4
+    DS->>DS: build func via _cached_localize_func_for_cp_step(step=0)<br/>(hstu_attn_cp.py:1226)
+    DS->>DS: hstu_attn_varlen_func(q,cur_k,cur_v,window=(-1,-1),func=func)<br/>(hstu_attn_cp.py:1241)
+    DS->>DS: out_local.copy_(partial.float())<br/>(hstu_attn_cp.py:1267)
+    Note over DS,CS: for r in reqs: r.wait()<br/>default_stream.wait_stream(comm_stream)<br/>swap cur_k ↔ recv_k, cur_v ↔ recv_v
+  </div>
+
+  <h3>Per-rank state at step 0</h3>
+  <table>
+    <tr>
+      <th>rank</th><th>peer at step 0</th><th>local K layout (global rows)</th>
+      <th>accumulator after copy_</th>
+    </tr>
+    <tr><td>0</td><td>0</td><td>chunks {0, 7} — sample 0 [0,2)∪[14,16); sample 1 [16,20)∪[44,48)</td>
+      <td>fp32 partial<sub>step0</sub></td></tr>
+    <tr><td>1</td><td>1</td><td>chunks {1, 6} — sample 0 [2,4)∪[12,14); sample 1 [20,24)∪[40,44)</td>
+      <td>fp32 partial<sub>step0</sub></td></tr>
+    <tr><td>2</td><td>2</td><td>chunks {2, 5} — sample 0 [4,6)∪[10,12); sample 1 [24,28)∪[36,40)</td>
+      <td>fp32 partial<sub>step0</sub></td></tr>
+    <tr><td>3</td><td>3</td><td>chunks {3, 4} — sample 0 [6,8)∪[8,10); sample 1 [28,32)∪[32,36)</td>
+      <td>fp32 partial<sub>step0</sub></td></tr>
+  </table>
+
+  <h3>Wire payload for the in-flight P2P (rank 0 → rank 1)</h3>
+  <pre>send_k.shape = (12, H, D)  # rank 0's K_local (chunks {0,7} of both samples)
+send_v.shape = (12, H, D)
+recv_k.shape = (12, H, D)  # arriving from rank 3 (chunks {3,4})
+recv_v.shape = (12, H, D)
+recv_k[:2]   ≈ K[6:8]      # sample 0's chunk 3 (will be cur_k at step 1)</pre>
+
+  <h3>Worked <code>func</code> for rank 0, sample 0, step 0</h3>
+  <table>
+    <tr><th>local_q</th><th>global_q</th><th>causal interval (global K)</th><th>local K interval</th><th>NFUNC=3 slots</th></tr>
+    <tr><td>0</td><td>0</td><td>[0, 1)</td><td>[0, 1)</td><td>(1, 0, 0)</td></tr>
+    <tr><td>1</td><td>1</td><td>[0, 2)</td><td>[0, 2)</td><td>(2, 0, 0)</td></tr>
+    <tr><td>2</td><td>14</td><td>[0, 15)</td><td>[0, 2) ∪ [2, 3) → merge → [0, 3)</td><td>(3, 0, 0)</td></tr>
+    <tr><td>3</td><td>15</td><td>[0, 16)</td><td>[0, 2) ∪ [2, 4) → merge → [0, 4)</td><td>(4, 0, 0)</td></tr>
+  </table>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 3 — Ring step 1 -->
+<!-- ====================================================================== -->
+<section class="step" data-title="3. Ring step 1 — KV rotated; new kernel runs">
+  <h2>Step 3 — Ring step 1</h2>
+  <p>
+    Rank <code>r</code> now holds peer <code>(r-1) % 4</code>'s KV
+    (<code>peer = (cp_rank - step) % cp_size</code>,
+    <code>_mask_func.py:326-328</code>). The kernel runs on this peer
+    KV; in parallel the comm stream issues the next-step P2P.
+    The <code>func</code> tensor is rebuilt for <code>step=1</code> —
+    cache key includes <code>step</code> so this is a fresh build the
+    first time this <code>cu_seqlens</code> is seen, then a hit on
+    every subsequent training step that reuses the same
+    <code>cu_seqlens</code>.
+  </p>
+
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R0 as Rank 0 holds rank 3 KV chunks 3 and 4
+    participant R1 as Rank 1 holds rank 0 KV chunks 0 and 7
+    participant R2 as Rank 2 holds rank 1 KV chunks 1 and 6
+    participant R3 as Rank 3 holds rank 2 KV chunks 2 and 5
+
+    Note over R0,R3: Each rank now operates on a peer KV
+    R0->>R0: hstu_attn_varlen_func with func_step1 then out_local += partial.float
+    R1->>R1: hstu_attn_varlen_func with func_step1 then out_local += partial.float
+    R2->>R2: hstu_attn_varlen_func with func_step1 then out_local += partial.float
+    R3->>R3: hstu_attn_varlen_func with func_step1 then out_local += partial.float
+    Note over R0,R3: comm_stream waits then issues NCCL for step 2 KV
+  </div>
+
+  <h3>Per-rank state at step 1</h3>
+  <table>
+    <tr><th>rank</th><th>peer at step 1</th><th>local K layout</th><th>accumulator</th></tr>
+    <tr><td>0</td><td>3</td><td>chunks {3, 4} — sample 0 [6,8)∪[8,10); sample 1 [28,32)∪[32,36)</td>
+      <td>partial<sub>0</sub> + partial<sub>1</sub></td></tr>
+    <tr><td>1</td><td>0</td><td>chunks {0, 7} — sample 0 [0,2)∪[14,16); sample 1 [16,20)∪[44,48)</td>
+      <td>partial<sub>0</sub> + partial<sub>1</sub></td></tr>
+    <tr><td>2</td><td>1</td><td>chunks {1, 6} — sample 0 [2,4)∪[12,14); sample 1 [20,24)∪[40,44)</td>
+      <td>partial<sub>0</sub> + partial<sub>1</sub></td></tr>
+    <tr><td>3</td><td>2</td><td>chunks {2, 5} — sample 0 [4,6)∪[10,12); sample 1 [24,28)∪[36,40)</td>
+      <td>partial<sub>0</sub> + partial<sub>1</sub></td></tr>
+  </table>
+
+  <h3>Worked <code>func</code> example — rank 0, sample 0, step 1</h3>
+  <p>
+    Local K = <code>[chunk_3 ; chunk_4]</code> = global rows
+    <code>[6, 8) ∪ [8, 10)</code>.
+  </p>
+  <table>
+    <tr><th>local_q</th><th>global_q</th><th>causal interval (global K)</th><th>local K interval</th><th>NFUNC=3 slots</th></tr>
+    <tr><td>0</td><td>0</td><td>[0, 1)</td><td>(empty — no overlap with [6,10))</td><td>(0, 0, 0)</td></tr>
+    <tr><td>1</td><td>1</td><td>[0, 2)</td><td>(empty)</td><td>(0, 0, 0)</td></tr>
+    <tr><td>2</td><td>14</td><td>[0, 15)</td><td>[0, 2) ∪ [2, 4) → merge → [0, 4)</td><td>(4, 0, 0)</td></tr>
+    <tr><td>3</td><td>15</td><td>[0, 16)</td><td>[0, 2) ∪ [2, 4) → merge → [0, 4)</td><td>(4, 0, 0)</td></tr>
+  </table>
+
+  <h3>Wire payload for rank 0 ↔ rank 1, this step's P2P</h3>
+  <pre>send_k = cur_k          # what rank 0 currently holds (rank 3's KV → forwards to rank 1)
+recv_k.shape = (12, H, D)
+recv_k[:2]  ≈ K[4:6]    # sample 0 chunk 2 — incoming from rank 3, originated rank 2</pre>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 4 — Ring step 2 -->
+<!-- ====================================================================== -->
+<section class="step" data-title="4. Ring step 2 — second-to-last rotation">
+  <h2>Step 4 — Ring step 2</h2>
+  <p>
+    Rank <code>r</code> now holds peer <code>(r-2) % 4</code>'s KV.
+    Same kernel/comm-overlap pattern as steps 0/1.
+  </p>
+
+  <h3>Per-rank state at step 2</h3>
+  <table>
+    <tr><th>rank</th><th>peer at step 2</th><th>local K layout</th><th>accumulator</th></tr>
+    <tr><td>0</td><td>2</td><td>chunks {2, 5} — sample 0 [4,6)∪[10,12); sample 1 [24,28)∪[36,40)</td>
+      <td>Σ<sub>0..2</sub> partial<sub>i</sub></td></tr>
+    <tr><td>1</td><td>3</td><td>chunks {3, 4} — sample 0 [6,8)∪[8,10); sample 1 [28,32)∪[32,36)</td>
+      <td>Σ<sub>0..2</sub> partial<sub>i</sub></td></tr>
+    <tr><td>2</td><td>0</td><td>chunks {0, 7} — sample 0 [0,2)∪[14,16); sample 1 [16,20)∪[44,48)</td>
+      <td>Σ<sub>0..2</sub> partial<sub>i</sub></td></tr>
+    <tr><td>3</td><td>1</td><td>chunks {1, 6} — sample 0 [2,4)∪[12,14); sample 1 [20,24)∪[40,44)</td>
+      <td>Σ<sub>0..2</sub> partial<sub>i</sub></td></tr>
+  </table>
+
+  <h3>Wire payload (last rotation issued from this step)</h3>
+  <pre>send_k = cur_k                   # what rank holds at step 2 → forward neighbour
+# After r.wait() and stream sync, cur_k = recv_k for step 3
+recv_k.shape = (12, H, D)        # peer (r-3) % 4 == (r+1) % 4's KV
+                                  # for rank 0 this is rank 1 (chunks {1,6})</pre>
+
+  <h3>func cache hit on layer 2..N</h3>
+  <p>
+    The <code>step=2</code> func tensor was already built by layer 0
+    of this <code>HSTUBlock.forward</code> for this
+    <code>cu_seqlens</code>. Layers 1..N-1 hit the cached entry
+    (<code>hstu_attn_cp.py:282-285</code>). Across training steps that
+    cycle the same <code>cu_seqlens</code> values, every call after the
+    first iteration is a hit
+    (block comment <code>hstu_attn_cp.py:152-169</code>).
+  </p>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 5 — Ring step 3 (last) -->
+<!-- ====================================================================== -->
+<section class="step" data-title="5. Ring step 3 — last; no further P2P">
+  <h2>Step 5 — Ring step 3 (last step, no P2P)</h2>
+  <p>
+    At <code>step = cp_size - 1 = 3</code> the ring is fully traversed:
+    rank <code>r</code> now holds peer <code>(r-3) % 4 = (r+1) % 4</code>'s
+    KV. No further P2P — the <code>if step &lt; cp_size - 1</code> guard
+    at <code>hstu_attn_cp.py:1205</code> skips the
+    <code>_ring_send_recv_kv</code> call. The kernel runs once more on
+    this last peer's KV; the accumulator now contains every peer's
+    contribution.
+  </p>
+
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R0 as Rank 0 (peer = 1)
+    participant R1 as Rank 1 (peer = 2)
+    participant R2 as Rank 2 (peer = 3)
+    participant R3 as Rank 3 (peer = 0)
+
+    Note over R0,R3: No P2P this step
+    R0->>R0: hstu_attn_varlen_func with peer-1 KV
+    R0->>R0: out_local += partial.float()
+    R1->>R1: hstu_attn_varlen_func with peer-2 KV
+    R1->>R1: out_local += partial.float()
+    R2->>R2: hstu_attn_varlen_func with peer-3 KV
+    R2->>R2: out_local += partial.float()
+    R3->>R3: hstu_attn_varlen_func with peer-0 KV
+    R3->>R3: out_local += partial.float()
+  </div>
+
+  <h3>Per-rank state at step 3</h3>
+  <table>
+    <tr><th>rank</th><th>peer at step 3</th><th>local K layout</th><th>accumulator</th></tr>
+    <tr><td>0</td><td>1</td><td>chunks {1, 6} — sample 0 [2,4)∪[12,14); sample 1 [20,24)∪[40,44)</td>
+      <td>Σ<sub>0..3</sub> partial<sub>i</sub></td></tr>
+    <tr><td>1</td><td>2</td><td>chunks {2, 5} — sample 0 [4,6)∪[10,12); sample 1 [24,28)∪[36,40)</td>
+      <td>Σ<sub>0..3</sub> partial<sub>i</sub></td></tr>
+    <tr><td>2</td><td>3</td><td>chunks {3, 4} — sample 0 [6,8)∪[8,10); sample 1 [28,32)∪[32,36)</td>
+      <td>Σ<sub>0..3</sub> partial<sub>i</sub></td></tr>
+    <tr><td>3</td><td>0</td><td>chunks {0, 7} — sample 0 [0,2)∪[14,16); sample 1 [16,20)∪[44,48)</td>
+      <td>Σ<sub>0..3</sub> partial<sub>i</sub></td></tr>
+  </table>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 6 — fp32 → bf16 → gather -->
+<!-- ====================================================================== -->
+<section class="step" data-title="6. Cast → gather to global">
+  <h2>Step 6 — fp32 cast → gather to global</h2>
+  <p>
+    The fp32 accumulator is cast back to the input dtype
+    (<code>hstu_attn_cp.py:1279</code>), returning a
+    <code>(12, H, D)</code> bf16 tensor on each rank. Each rank
+    scatters its 12 rows into a globally-shaped zeros buffer via
+    <code>local_to_global</code>, then SUM-all-reduce gathers all
+    contributions (each global row owned by exactly one rank → SUM is
+    identity). The implementation is
+    <code>gather_jagged_from_cp_rank</code> at
+    <code>hstu_attn_cp.py:591-622</code>; the test driver does the
+    same at <code>test_cp_forward.py:159-165</code>.
+  </p>
+
+  <pre>
+out_local_bf16 = out_local.to(q_local.dtype)   # (12, H, D)
+
+# scatter into (48, H, D) zeros buffer
+contrib = zeros((48, H, D), dtype=fp32)
+contrib[local_to_global] = out_local_bf16.float()
+dist.all_reduce(contrib, op=SUM, group=cp_group)
+
+out_global = contrib.to(bf16)                  # shape (48, H, D)
+</pre>
+
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R0 as Rank 0 (12 rows)
+    participant R1 as Rank 1 (12 rows)
+    participant R2 as Rank 2 (12 rows)
+    participant R3 as Rank 3 (12 rows)
+    participant G as Global buffer (48 rows)
+
+    R0->>G: scatter rows {0,1,14,15,16,17,18,19,44,45,46,47}
+    R1->>G: scatter rows {2,3,12,13,20,21,22,23,40,41,42,43}
+    R2->>G: scatter rows {4,5,10,11,24,25,26,27,36,37,38,39}
+    R3->>G: scatter rows {6,7,8,9,28,29,30,31,32,33,34,35}
+    G->>G: dist.all_reduce(SUM)<br/>each row owned by exactly 1 rank → SUM == identity
+  </div>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 7 — Backward begins -->
+<!-- ====================================================================== -->
+<section class="step" data-title="7. Backward begins — re-run ring with saved KV">
+  <h2>Step 7 — Backward begins: re-run forward ring on saved KV</h2>
+  <p>
+    The autograd Function saves <code>q, k, v, cu_seqlens_q,
+    cu_seqlens_k</code> (<code>hstu_attn_cp.py:2005</code>).
+    <code>_HSTUVarlenCPFunc.backward</code>
+    (<code>hstu_attn_cp.py:2034</code>) calls
+    <code>_multi_gpu_backward_arbitrary</code>
+    (<code>hstu_attn_cp.py:1709</code>) which re-runs the **same
+    forward** ring direction so each step's KV matches what forward
+    saw. The kernel-bwd is called directly via
+    <code>_call_hstu_bwd_kernel</code>
+    (<code>hstu_attn_cp.py:1300</code>) — bypassing
+    <code>_per_tile_partial_grads</code>'s replay-forward (which costs
+    ~80 ms / step on cw-dfw round-5;
+    <code>hstu_attn_cp.py:1296-1298</code>).
+  </p>
+
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Func as _HSTUVarlenCPFunc.backward
+    participant Multi as _multi_gpu_backward_arbitrary
+    participant Ring as forward-direction _ring_send_recv_kv
+    participant K as _call_hstu_bwd_kernel
+    participant Cache as _cp_func_cache (already populated)
+
+    Func->>Multi: dout, saved q/k/v
+    loop step 0..cp_size-1 (=4)
+        Multi->>Ring: rotate KV forward to reconstruct kv_at_step[s]<br/>(hstu_attn_cp.py:1775)
+        Multi->>Cache: lookup func_step{s} — cross-thread visible<br/>(test_cache_visible_from_other_thread)
+        Cache-->>Multi: cached func tensor
+        Multi->>K: hstu_varlen_bwd_{80,90,100}(dout, q, cur_k, cur_v, func)
+        K-->>Multi: dq_p, dk_p, dv_p
+        Multi->>Multi: dq_acc += dq_p<br/>collect (step, dk_p, dv_p)
+    end
+  </div>
+
+  <h3>Why the func cache is critical here</h3>
+  <p>
+    Backward runs on a PyTorch autograd worker thread, NOT the forward
+    thread. A <code>threading.local()</code> cache would be invisible
+    to this thread and force <code>localize_func_for_cp_step</code>
+    to rebuild every layer × ring step. That was the cw-dfw round-4
+    regression (<code>hstu_attn_cp.py:160-174</code>); the
+    module-level dict at <code>hstu_attn_cp.py:183</code> is
+    pinned by <code>test_func_cache.py:test_cache_visible_from_other_thread</code>.
+  </p>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 8 — Reverse-ring dKV exchange -->
+<!-- ====================================================================== -->
+<section class="step" data-title="8. Reverse-ring dKV exchange">
+  <h2>Step 8 — Reverse-ring dKV exchange</h2>
+  <p>
+    After the local backward kernel calls finish, each rank has a
+    list of <code>(step, dk_p, dv_p)</code> for steps <code>1..3</code>
+    where the dKV partial was computed against a peer's K/V (step 0's
+    is self-owned and folded in directly,
+    <code>hstu_attn_cp.py:1832-1834</code>). Each entry is sent home:
+    <code>send_dst = (cp_rank - step) % cp_size</code>
+    (<code>hstu_attn_cp.py:1854</code>),
+    <code>recv_src = (cp_rank + step) % cp_size</code>
+    (<code>hstu_attn_cp.py:1855</code>). 3 P2P exchanges total.
+  </p>
+
+  <details open>
+    <summary>Sub-step 8a — exchange for forward step 1 partials</summary>
+    <table>
+      <tr><th>rank r</th><th>send dKV to</th><th>recv dKV from</th></tr>
+      <tr><td>0</td><td>(0-1)%4 = rank 3</td><td>(0+1)%4 = rank 1</td></tr>
+      <tr><td>1</td><td>(1-1)%4 = rank 0</td><td>(1+1)%4 = rank 2</td></tr>
+      <tr><td>2</td><td>(2-1)%4 = rank 1</td><td>(2+1)%4 = rank 3</td></tr>
+      <tr><td>3</td><td>(3-1)%4 = rank 2</td><td>(3+1)%4 = rank 0</td></tr>
+    </table>
+    <pre>
+send_dk.shape = (12, H, D)   # dK for the peer whose KV we held at step 1
+recv_dk.shape = (12, H, D)
+# After: dk_acc += recv_dk.float()      (hstu_attn_cp.py:1878)
+</pre>
+  </details>
+
+  <details>
+    <summary>Sub-step 8b — exchange for forward step 2 partials</summary>
+    <table>
+      <tr><th>rank r</th><th>send dKV to</th><th>recv dKV from</th></tr>
+      <tr><td>0</td><td>(0-2)%4 = rank 2</td><td>(0+2)%4 = rank 2</td></tr>
+      <tr><td>1</td><td>(1-2)%4 = rank 3</td><td>(1+2)%4 = rank 3</td></tr>
+      <tr><td>2</td><td>(2-2)%4 = rank 0</td><td>(2+2)%4 = rank 0</td></tr>
+      <tr><td>3</td><td>(3-2)%4 = rank 1</td><td>(3+2)%4 = rank 1</td></tr>
+    </table>
+    <p>
+      Notice for step=2 (which is exactly cp_size/2), <em>send_dst ==
+      recv_src</em>. Each pair of opposite ranks swaps dKV directly.
+    </p>
+  </details>
+
+  <details>
+    <summary>Sub-step 8c — exchange for forward step 3 partials</summary>
+    <table>
+      <tr><th>rank r</th><th>send dKV to</th><th>recv dKV from</th></tr>
+      <tr><td>0</td><td>(0-3)%4 = rank 1</td><td>(0+3)%4 = rank 3</td></tr>
+      <tr><td>1</td><td>(1-3)%4 = rank 2</td><td>(1+3)%4 = rank 0</td></tr>
+      <tr><td>2</td><td>(2-3)%4 = rank 3</td><td>(2+3)%4 = rank 1</td></tr>
+      <tr><td>3</td><td>(3-3)%4 = rank 0</td><td>(3+3)%4 = rank 2</td></tr>
+    </table>
+    <p>
+      The reverse-ring uses <code>_get_recv_buffer</code> with distinct
+      slots (<code>"bwd_recv_dk"</code>, <code>"bwd_recv_dv"</code>,
+      <code>hstu_attn_cp.py:1851-1852</code>) — different physical
+      storage from the bwd KV-reload's <code>"bwd_recv_k/v"</code>
+      so the two reverse rings cannot collide.
+    </p>
+  </details>
+
+  <h3>Accumulator state per rank, after all three sub-steps</h3>
+  <pre>dk_acc  = dk_step0 (own)
+        + recv from step1 peer (peer (r+1)%4 had OUR KV at their step 1)
+        + recv from step2 peer (peer (r+2)%4 had OUR KV at their step 2)
+        + recv from step3 peer (peer (r+3)%4 had OUR KV at their step 3)
+        # all three "recv from" are summed in the loop at hstu_attn_cp.py:1878</pre>
+</section>
+
+<!-- ====================================================================== -->
+<!-- STEP 9 — Final dQ/dK/dV global view -->
+<!-- ====================================================================== -->
+<section class="step" data-title="9. Final dQ / dK / dV global view">
+  <h2>Step 9 — Final dQ / dK / dV global view</h2>
+  <p>
+    The fp32 accumulators are cast back to the input dtype
+    (<code>hstu_attn_cp.py:1881-1885</code>) and returned as
+    <code>(dq, dk, dv)</code> from
+    <code>_multi_gpu_backward_arbitrary</code>.
+    <code>_HSTUVarlenCPFunc.backward</code> packages those into the
+    autograd return tuple along with <code>None</code>s for every
+    non-tensor argument (<code>hstu_attn_cp.py:2063-2079</code>).
+    The trainer then sees per-rank gradients in DualChunkSwap order;
+    its DDP / FSDP / TP all-reduce plumbing handles the
+    cross-replica accumulation.
+  </p>
+
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Multi as _multi_gpu_backward_arbitrary
+    participant Func as _HSTUVarlenCPFunc.backward
+    participant DP as Trainer (downstream gradient handling)
+
+    Multi->>Multi: dq = dq_acc.to(q.dtype) then dk = dk_acc.to(k.dtype) then dv = dv_acc.to(v.dtype)
+    Multi-->>Func: dq dk dv all 12 by H by D per rank
+    Func-->>DP: dq dk dv plus 14 None grads for non-tensor inputs
+    Note over DP: each rank holds local DualChunkSwap shard. Parameter grads aggregated by DDP or FSDP or TP
+  </div>
+
+  <h3>Per-rank final shapes (this layer's q/k/v grads)</h3>
+  <table>
+    <tr><th>rank</th><th>dq shape</th><th>dk shape</th><th>dv shape</th>
+        <th>covers global rows</th></tr>
+    <tr><td>0</td><td>(12, H, D)</td><td>(12, H, D)</td><td>(12, H, D)</td>
+        <td>{0,1,14,15,16-19,44-47}</td></tr>
+    <tr><td>1</td><td>(12, H, D)</td><td>(12, H, D)</td><td>(12, H, D)</td>
+        <td>{2,3,12,13,20-23,40-43}</td></tr>
+    <tr><td>2</td><td>(12, H, D)</td><td>(12, H, D)</td><td>(12, H, D)</td>
+        <td>{4,5,10,11,24-27,36-39}</td></tr>
+    <tr><td>3</td><td>(12, H, D)</td><td>(12, H, D)</td><td>(12, H, D)</td>
+        <td>{6-9,28-35}</td></tr>
+  </table>
+
+  <h3>Test driver assembles the global view (oracle comparison)</h3>
+  <pre>
+# test_cp_backward.py:159-167
+def _scatter_allreduce(local: Tensor) -> Tensor:
+    contrib = zeros_like(q_global, dtype=fp32)
+    contrib[l2g] = local.float()
+    dist.all_reduce(contrib, op=SUM, group=cp_group)
+    return contrib.to(q_global.dtype)
+
+dq_global = _scatter_allreduce(dq_loc)   # shape (48, H, D)
+dk_global = _scatter_allreduce(dk_loc)
+dv_global = _scatter_allreduce(dv_loc)
+# Compared against single_gpu_baseline_fwd_bwd at rtol=atol=5e-2
+</pre>
+  <p class="src-ref">
+    Tolerance per <code>test_cp_backward.py:189-208</code>: forward
+    rtol=atol=2e-2, gradient rtol=atol=5e-2 (bwd has multiplier 5 vs
+    fwd multiplier 2).
+  </p>
+</section>
+
+</main>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose' });
+
+  const sections = Array.from(document.querySelectorAll('section.step'));
+  const indicator = document.getElementById('indicator');
+  const prev = document.getElementById('prev');
+  const next = document.getElementById('next');
+  const jump = document.getElementById('jump');
+
+  // Populate jump dropdown.
+  sections.forEach((sec, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = sec.dataset.title || ('Step ' + (i + 1));
+    jump.appendChild(opt);
+  });
+
+  let current = 0;
+
+  function show(idx) {
+    if (idx < 0 || idx >= sections.length) return;
+    sections[current].classList.remove('active');
+    sections[idx].classList.add('active');
+    current = idx;
+    indicator.textContent = `Step ${idx + 1} of ${sections.length}`;
+    prev.disabled = idx === 0;
+    next.disabled = idx === sections.length - 1;
+    jump.value = String(idx);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  prev.addEventListener('click', () => show(current - 1));
+  next.addEventListener('click', () => show(current + 1));
+  jump.addEventListener('change', (e) => show(parseInt(e.target.value, 10)));
+
+  // Keyboard nav.
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'SELECT') return;
+    if (e.key === 'ArrowLeft')  show(current - 1);
+    if (e.key === 'ArrowRight') show(current + 1);
+  });
+
+  show(0);
+</script>
+</body>
+</html>
