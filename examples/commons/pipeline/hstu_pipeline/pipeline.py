@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import Any, Callable, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 from commons.pipeline.engine import (
@@ -280,6 +280,21 @@ class HSTUPipeline:
         self._threaded = threaded
         self._thread_map = thread_map
 
+        # Auto-scheduler hook: when env var
+        # ``HSTU_AUTOSCHED_COST_FILE`` points at a JSON cost model,
+        # the engine first builds a default schedule, then runs
+        # :func:`auto_assign_lookaheads` against the cost model and
+        # rebuilds the schedule with the recommended per-task
+        # lookaheads. ``HSTU_AUTOSCHED_MAX_IN_FLIGHT`` (default 5)
+        # caps the in-flight batch budget. Bit-exact contract is
+        # enforced by the auto-scheduler.
+        self._autosched_cost_file: Optional[str] = (
+            os.environ.get("HSTU_AUTOSCHED_COST_FILE", "").strip() or None
+        )
+        self._autosched_max_in_flight: int = int(
+            os.environ.get("HSTU_AUTOSCHED_MAX_IN_FLIGHT", "5")
+        )
+
         # Default shuffler is identity (no-op) — matches legacy default.
         if batch_shuffler is None:
             from commons.distributed.batch_shuffler import IdentityBalancedBatchShuffler
@@ -331,7 +346,10 @@ class HSTUPipeline:
     # Engine construction (lazy)
     # ------------------------------------------------------------------
 
-    def _build_schedule(self) -> Tuple[Schedule, StreamPool]:
+    def _build_schedule(
+        self,
+        la_overrides: Optional[Dict[str, int]] = None,
+    ) -> Tuple[Schedule, StreamPool]:
         """Construct the Schedule + StreamPool based on variant.
 
         Offset layout — **both variants carry 3 batches in flight at
@@ -354,15 +372,44 @@ class HSTUPipeline:
         """
         depth = self._prefetch_depth
         h2d_lookahead = depth + 1  # = 2 for depth=1
-        input_dist_lookahead = depth  # = 1 for depth=1
+        start_shuffle_lookahead = h2d_lookahead
+        finish_shuffle_lookahead = h2d_lookahead
+        start_input_dist_lookahead = depth  # = 1 for depth=1
+        wait_input_dist_lookahead = depth
         prefetch_lookahead = 1 if self._prefetch else None
+
+        # Apply auto-scheduler / explicit overrides. Only the off-default
+        # tasks accept lookahead via factory args; default-stream tasks
+        # (zero_grad / forward / backward / opt / etc.) are bit-exact
+        # at la=0 and never overridden — see
+        # ``commons.pipeline.engine.autosched.fire_order``.
+        if la_overrides:
+            h2d_lookahead = la_overrides.get("h2d", h2d_lookahead)
+            start_shuffle_lookahead = la_overrides.get(
+                "start_shuffle", start_shuffle_lookahead
+            )
+            finish_shuffle_lookahead = la_overrides.get(
+                "finish_shuffle", finish_shuffle_lookahead
+            )
+            start_input_dist_lookahead = la_overrides.get(
+                "start_input_dist", start_input_dist_lookahead
+            )
+            wait_input_dist_lookahead = la_overrides.get(
+                "wait_input_dist", wait_input_dist_lookahead
+            )
+            if prefetch_lookahead is not None:
+                prefetch_lookahead = la_overrides.get(
+                    "prefetch_embeddings", prefetch_lookahead
+                )
 
         tasks = [
             make_h2d_task(self._state, lookahead=h2d_lookahead),
-            make_start_shuffle_task(self._state, lookahead=h2d_lookahead),
-            make_finish_shuffle_task(self._state, lookahead=h2d_lookahead),
-            make_start_input_dist_task(self._state, lookahead=input_dist_lookahead),
-            make_wait_input_dist_task(self._state, lookahead=input_dist_lookahead),
+            make_start_shuffle_task(self._state, lookahead=start_shuffle_lookahead),
+            make_finish_shuffle_task(self._state, lookahead=finish_shuffle_lookahead),
+            make_start_input_dist_task(
+                self._state, lookahead=start_input_dist_lookahead
+            ),
+            make_wait_input_dist_task(self._state, lookahead=wait_input_dist_lookahead),
         ]
         # Note: for the prefetch variant, prefetch_embeddings is
         # declared AFTER forward (not before). Same-iter ordering
@@ -540,6 +587,40 @@ class HSTUPipeline:
         # bootstrap had no stream context, risking NCCL submission
         # on the wrong stream.
         schedule, pool = self._build_schedule()
+
+        # Auto-scheduler hook: rebuild the schedule with recommended
+        # per-task lookaheads if a cost model is supplied via env. This
+        # is bit-exact (default-stream tasks frozen at la=0); the
+        # scheduler raises ValueError if any author-supplied
+        # constraint can't be satisfied.
+        if self._autosched_cost_file:
+            from commons.pipeline.engine.autosched import (
+                CostModel,
+                auto_assign_lookaheads,
+            )
+
+            cost_model = CostModel.from_json(self._autosched_cost_file)
+            recommended = auto_assign_lookaheads(
+                schedule,
+                cost_model,
+                max_in_flight=self._autosched_max_in_flight,
+            )
+            # Diff vs current schedule for visibility in the log.
+            current_la = {t.name: t.batch_offset for t in schedule.all_tasks()}
+            changed = {
+                name: (current_la[name], recommended[name])
+                for name in recommended
+                if current_la.get(name) != recommended[name]
+            }
+            if changed:
+                # Engine-internal logger (single line summary so a
+                # multi-rank training run doesn't spam the log).
+                print(
+                    f"[HSTUPipeline] auto-scheduler recommended "
+                    f"lookahead overrides: {changed}",
+                    flush=True,
+                )
+                schedule, pool = self._build_schedule(la_overrides=recommended)
 
         memcpy_stream = pool.get("memcpy")
         data_dist_stream = pool.get("data_dist")

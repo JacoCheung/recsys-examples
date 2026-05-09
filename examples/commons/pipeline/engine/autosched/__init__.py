@@ -16,14 +16,30 @@
 """Auto-scheduler package — V5 validator, V9 cost model + list scheduler."""
 
 from .cost_model import CostModel, CostProfiler, TaskCost
+from .fire_order import (
+    DEFAULT_BIT_EXACT_TASKS,
+    TaskResource,
+    auto_assign_lookaheads,
+    compute_overlap_matrix,
+    default_stream_critical_path_us,
+    describe_overlap_matrix,
+    task_resources,
+)
 from .list_scheduler import schedule_tasks
 from .validator import ScheduleValidationError, validate
 
 __all__ = [
     "CostModel",
     "CostProfiler",
+    "DEFAULT_BIT_EXACT_TASKS",
     "ScheduleValidationError",
     "TaskCost",
+    "TaskResource",
+    "auto_assign_lookaheads",
+    "compute_overlap_matrix",
+    "default_stream_critical_path_us",
+    "describe_overlap_matrix",
     "schedule_tasks",
+    "task_resources",
     "validate",
 ]
