@@ -38,7 +38,11 @@ from typing import Any, Callable, Generic, Iterable, Iterator, Optional, TypeVar
 import torch
 
 from .context import BatchRing, TaskContext
-from .deps import infer_cross_stream_event_deps, infer_cross_stream_waits
+from .deps import (
+    infer_cross_stream_event_deps,
+    infer_cross_stream_waits,
+    producers_with_cross_stream_consumers,
+)
 from .executor import SequentialExecutor, ThreadedExecutor
 from .schedule import Schedule, Stage
 from .streams import StreamPool
@@ -138,6 +142,10 @@ class SchedulablePipeline(Generic[In, Out]):
         # producer's completion event is on the ring slot).
         self._cross_stream_waits = infer_cross_stream_waits(schedule)
         self._cross_stream_event_deps = infer_cross_stream_event_deps(schedule)
+        # Only producers some cross-stream consumer actually waits on
+        # need ``cudaEventRecord`` after running; the rest skip the
+        # record (same-stream FIFO already orders their work).
+        self._producers_to_record = producers_with_cross_stream_consumers(schedule)
 
         # SPEC §4.8 state: iter_count is the internal iteration
         # counter; pulled is the running count of batches pulled from
@@ -284,6 +292,7 @@ class SchedulablePipeline(Generic[In, Out]):
                 self._cross_stream_waits,
                 self._stream_pool,
                 event_deps=self._cross_stream_event_deps,
+                producers_to_record=self._producers_to_record,
             )
 
         # Restore active offset for any external inspection.

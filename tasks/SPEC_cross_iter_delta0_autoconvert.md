@@ -157,9 +157,10 @@ thing twice).
    identical logits / weights as the manual baseline.
 
 4. **GPU repro script** `tasks/cross_iter_delta0_repro.py` (the
-   monkey-patched bypass demonstrator) becomes obsolete; replace
-   with `tasks/cross_iter_delta0_correctness.py` showing both
-   field forms produce equal outputs.
+   monkey-patched bypass demonstrator) became obsolete and was
+   removed; the role is now covered by
+   `examples/tests/commons/test_engine_same_progress_sync_correctness.py`,
+   which parametrizes over both field forms.
 
 5. **Future-read and rotated-out tests** unchanged — those rejection
    paths stay.
