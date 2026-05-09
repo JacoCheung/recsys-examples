@@ -235,8 +235,18 @@ def validate(schedule: Schedule, stream_pool: Optional[StreamPool] = None) -> No
                             f"the reader."
                         )
 
-    # --- Rule 6: depends_on resolves to an earlier task ------------
+    # --- Rule 6: depends_on resolves to a known task ----------------
     # `name_to_position` already computed above for rule 5.
+    #
+    # SPEC_p4 v2 §5: ``depends_on=("X",)`` is an ordering edge whose
+    # within-iter / cross-iter nature is derived from the lookahead
+    # diff. For within-iter (same lookahead) the producer must precede
+    # the consumer in declaration order. For cross-iter (producer
+    # lookahead > consumer lookahead) the producer can appear later in
+    # declaration order — its event from a prior iteration carries
+    # through the ring. So the strict "earlier in declaration order"
+    # rule applies ONLY to same-lookahead pairs.
+    name_to_task: Dict[str, "Task"] = {t.name: t for t in tasks}
     for idx, task in enumerate(tasks):
         for dep_name in task.depends_on:
             if dep_name not in name_to_position:
@@ -245,14 +255,36 @@ def validate(schedule: Schedule, stream_pool: Optional[StreamPool] = None) -> No
                     f"{dep_name!r} which is not a task name in the "
                     f"schedule."
                 )
-            if name_to_position[dep_name] >= idx:
+            producer = name_to_task[dep_name]
+            if producer.batch_offset == task.batch_offset:
+                # Within-iter — declaration order matters.
+                if name_to_position[dep_name] >= idx:
+                    raise ScheduleValidationError(
+                        f"[rule 6] Task {task.name!r}.depends_on "
+                        f"references {dep_name!r} which is NOT "
+                        f"strictly earlier in declaration order (dep "
+                        f"is at position {name_to_position[dep_name]}, "
+                        f"consumer at position {idx}). Both have "
+                        f"lookahead={task.batch_offset}, so this is a "
+                        f"within-iter edge that requires the producer "
+                        f"to run before the consumer in the same "
+                        f"iteration."
+                    )
+            elif producer.batch_offset < task.batch_offset:
+                # Future-read: producer has not yet run by the
+                # consumer's iteration. Independently caught by
+                # ``deps.infer_cross_stream_event_deps`` but worth
+                # surfacing here too.
                 raise ScheduleValidationError(
                     f"[rule 6] Task {task.name!r}.depends_on references "
-                    f"{dep_name!r} which is NOT strictly earlier in "
-                    f"declaration order (dep is at position "
-                    f"{name_to_position[dep_name]}, consumer at "
-                    f"position {idx})."
+                    f"{dep_name!r} but {dep_name!r}.lookahead="
+                    f"{producer.batch_offset} < {task.name!r}.lookahead="
+                    f"{task.batch_offset}. Cannot wait for a producer "
+                    f"that has not yet run by the consumer's iteration."
                 )
+            # else: producer.batch_offset > task.batch_offset — pure
+            # cross-iter, declaration order is irrelevant (the event
+            # comes from an earlier iteration via ring rotation).
 
     # --- Rule 7: intra-iter DAG acyclic ----------------------------
     # Build adjacency: edge A → B iff B reads-slot-written-by-A with

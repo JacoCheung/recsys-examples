@@ -52,6 +52,7 @@ def test_engine_public_api_exact_surface() -> None:
 
     expected = {
         "DataSlot",
+        "Pipeline",
         "Schedule",
         "SchedulablePipeline",
         "ScheduleValidationError",

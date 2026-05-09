@@ -43,10 +43,11 @@ Thread mapping strategies (``thread_map`` parameter):
       Arbitrary function mapping each task to a thread id string.
 """
 
+import contextlib
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -54,6 +55,14 @@ from .context import TaskContext
 from .schedule import Stage
 from .streams import StreamPool
 from .task import DataSlot, Task
+
+# NVTX is optional — used only for profiler annotation. The engine
+# stays framework-agnostic w.r.t. nvtx by treating its absence as a
+# no-op (CPU-only test hosts may not have it installed).
+try:
+    import nvtx as _nvtx
+except ImportError:  # pragma: no cover - nvtx absence
+    _nvtx = None
 
 __all__ = ["SequentialExecutor", "ThreadedExecutor"]
 
@@ -65,17 +74,100 @@ def _apply_cross_stream_waits(
     task: Task,
     cross_stream_waits: Dict[str, Tuple[str, ...]],
     stream_pool: StreamPool,
+    *,
+    event_deps: Optional[Dict[str, Tuple[Tuple[str, str, int], ...]]] = None,
+    ctx: Optional[TaskContext] = None,
 ) -> None:
-    """Apply GPU-side ``wait_stream`` calls before a task runs."""
+    """Apply GPU-side cross-stream waits before a task runs.
+
+    Prefers fine-grained ``wait_event(producer_event)`` (event-based
+    sync) when ``event_deps`` and ``ctx`` are provided AND the producer
+    has already recorded its completion event onto the ring slot for
+    this iteration. Falls back to ``wait_stream(producer_stream)`` for
+    edges that have no event yet — typically iteration 1 before the
+    ring is fully primed, or producers that did not run this iteration.
+
+    The fallback uses ``cross_stream_waits`` (stream-name list, computed
+    by ``deps.infer_cross_stream_waits``). The fine-grained mode uses
+    ``event_deps`` (triples of producer task / producer stream / slot
+    offset, computed by ``deps.infer_cross_stream_event_deps``).
+    """
     anchor = stream_pool.anchor_device
+    if anchor is None:
+        return
+
+    consumer = torch.cuda.current_stream()
+
+    if event_deps is not None and ctx is not None:
+        # Fine-grained path. For each producer triple, prefer
+        # wait_event over wait_stream when the event is on the slot.
+        triples = event_deps.get(task.name, ())
+        for producer_name, producer_stream, slot_offset in triples:
+            slot = ctx.slots_at(slot_offset)
+            event = slot.get_event(producer_name)
+            if event is not None:
+                consumer.wait_event(event)
+            else:
+                # Fallback: ring slot has no event for this producer
+                # yet (first-iter / not-run-this-iter). Use the
+                # coarser stream-level wait so we don't drop a
+                # required ordering edge.
+                prod = stream_pool.get(producer_stream)
+                if prod is None:
+                    prod = torch.cuda.default_stream(anchor)
+                consumer.wait_stream(prod)
+        return
+
+    # Legacy path: stream-list only, no event lookup.
     waits = cross_stream_waits.get(task.name, ())
-    if waits and anchor is not None:
-        consumer = torch.cuda.current_stream()
-        for producer_name in waits:
-            prod = stream_pool.get(producer_name)
+    if waits:
+        for producer_stream in waits:
+            prod = stream_pool.get(producer_stream)
             if prod is None:
                 prod = torch.cuda.default_stream(anchor)
             consumer.wait_stream(prod)
+
+
+@contextlib.contextmanager
+def _nvtx_range(task: Task) -> Iterator[None]:
+    """Wrap a task's execution in an NVTX range labelled by
+    ``task.nvtx_tag`` (falling back to ``task.name`` when the tag is
+    unset). No-op when nvtx is not importable or when CUDA is not
+    available — the range would have no profiler to record into.
+    """
+    if _nvtx is None or not torch.cuda.is_available():
+        yield
+        return
+    tag = task.nvtx_tag or task.name
+    with _nvtx.annotate(tag):
+        yield
+
+
+def _record_completion_event(task: Task, ctx: TaskContext) -> None:
+    """Record a CUDA event on the task's current stream and store it on
+    the ring slot at ``task.batch_offset``, keyed by ``task.name``.
+
+    Called after the task body returns successfully, while still inside
+    the ``stream_pool.use(task.stream)`` context — so
+    ``torch.cuda.current_stream()`` is the task's stream.
+
+    The event object is **reused across iterations**: SlotStore preserves
+    its event registry across ``BatchRing.advance()`` (the slot rotates
+    in place), so the same ``torch.cuda.Event`` is re-recorded each iter
+    that this task runs at this offset. ``Event.record()`` overwriting
+    the previous record is the intended semantics — see SPEC §4.2 rule 8
+    (event-based cross-stream sync).
+
+    No-op on CPU-only runs (no CUDA available).
+    """
+    if not torch.cuda.is_available():
+        return
+    slot = ctx.slots_at(task.batch_offset)
+    event = slot.get_event(task.name)
+    if event is None:
+        event = torch.cuda.Event()
+        slot.set_event(task.name, event)
+    event.record(torch.cuda.current_stream())
 
 
 def _resolve_thread_id(task: Task, thread_map: ThreadMap) -> str:
@@ -179,6 +271,8 @@ class SequentialExecutor:
         should_run: Callable[[Task], bool],
         cross_stream_waits: Dict[str, Tuple[str, ...]],
         stream_pool: StreamPool,
+        *,
+        event_deps: Optional[Dict[str, Tuple[Tuple[str, str, int], ...]]] = None,
     ) -> None:
         for task in stage.tasks:
             if not should_run(task):
@@ -186,8 +280,16 @@ class SequentialExecutor:
             ctx._active_offset = task.batch_offset
             ctx.iter_count = iter_count
             with stream_pool.use(task.stream):
-                _apply_cross_stream_waits(task, cross_stream_waits, stream_pool)
-                task.run(ctx)
+                _apply_cross_stream_waits(
+                    task,
+                    cross_stream_waits,
+                    stream_pool,
+                    event_deps=event_deps,
+                    ctx=ctx,
+                )
+                with _nvtx_range(task):
+                    task.run(ctx)
+                _record_completion_event(task, ctx)
 
     def shutdown(self) -> None:
         """No-op for sequential executor."""
@@ -307,6 +409,8 @@ class ThreadedExecutor:
         should_run: Callable[[Task], bool],
         cross_stream_waits: Dict[str, Tuple[str, ...]],
         stream_pool: StreamPool,
+        *,
+        event_deps: Optional[Dict[str, Tuple[Tuple[str, str, int], ...]]] = None,
     ) -> None:
         active: List[Task] = [t for t in stage.tasks if should_run(t)]
         if not active:
@@ -318,8 +422,16 @@ class ThreadedExecutor:
             ctx._active_offset = task.batch_offset
             ctx.iter_count = iter_count
             with stream_pool.use(task.stream):
-                _apply_cross_stream_waits(task, cross_stream_waits, stream_pool)
-                task.run(ctx)
+                _apply_cross_stream_waits(
+                    task,
+                    cross_stream_waits,
+                    stream_pool,
+                    event_deps=event_deps,
+                    ctx=ctx,
+                )
+                with _nvtx_range(task):
+                    task.run(ctx)
+                _record_completion_event(task, ctx)
             return
 
         # Resolve thread assignment for each task
@@ -338,8 +450,16 @@ class ThreadedExecutor:
                 ctx._active_offset = task.batch_offset
                 ctx.iter_count = iter_count
                 with stream_pool.use(task.stream):
-                    _apply_cross_stream_waits(task, cross_stream_waits, stream_pool)
-                    task.run(ctx)
+                    _apply_cross_stream_waits(
+                        task,
+                        cross_stream_waits,
+                        stream_pool,
+                        event_deps=event_deps,
+                        ctx=ctx,
+                    )
+                    with _nvtx_range(task):
+                        task.run(ctx)
+                    _record_completion_event(task, ctx)
             return
 
         pool = self._ensure_pool(len(thread_to_tasks))
@@ -384,19 +504,27 @@ class ThreadedExecutor:
                     ctx.iter_count = iter_count
 
                     with stream_pool.use(task.stream):
-                        _apply_cross_stream_waits(task, cross_stream_waits, stream_pool)
-                        if task.name in nccl_tickets:
-                            nccl_failed = False
-                            self._nccl_lock.acquire(nccl_tickets[task.name])
-                            try:
+                        _apply_cross_stream_waits(
+                            task,
+                            cross_stream_waits,
+                            stream_pool,
+                            event_deps=event_deps,
+                            ctx=ctx,
+                        )
+                        with _nvtx_range(task):
+                            if task.name in nccl_tickets:
+                                nccl_failed = False
+                                self._nccl_lock.acquire(nccl_tickets[task.name])
+                                try:
+                                    task.run(ctx)
+                                except BaseException:
+                                    nccl_failed = True
+                                    raise
+                                finally:
+                                    self._nccl_lock.release(failed=nccl_failed)
+                            else:
                                 task.run(ctx)
-                            except BaseException:
-                                nccl_failed = True
-                                raise
-                            finally:
-                                self._nccl_lock.release(failed=nccl_failed)
-                        else:
-                            task.run(ctx)
+                        _record_completion_event(task, ctx)
 
                     completion[task.name].set()
             except BaseException as e:

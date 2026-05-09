@@ -119,7 +119,7 @@ def _make_h2d_task(
         reads=(DataSlot("batch_cpu", batch_offset=batch_offset),),
         writes=(DataSlot("batch_gpu", batch_offset=batch_offset),),
         stream=stream,
-        batch_offset=batch_offset,
+        lookahead=batch_offset,
     )
 
 

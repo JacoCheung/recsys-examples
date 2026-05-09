@@ -136,7 +136,7 @@ def test_analyzer_multiple_producers_sorted_deterministic() -> None:
 
 
 def test_analyzer_cross_iter_prefetch_edge_emits_wait() -> None:
-    """V4 prefetch: writer@batch_offset=1 on `memcpy`, reader@batch_offset=0
+    """V4 prefetch: writer@lookahead=1 on `memcpy`, reader@lookahead=0
     on `default`, both for slot name "batch_gpu". The underlying
     slot store is the same tensor (migrated via ring advance), so
     the reader's stream must wait on the writer's stream."""
@@ -145,14 +145,14 @@ def test_analyzer_cross_iter_prefetch_edge_emits_wait() -> None:
         fn=_trivial,
         writes=(DataSlot("batch_gpu", batch_offset=1),),
         stream="memcpy",
-        batch_offset=1,
+        lookahead=1,
     )
     compute = Task.from_fn(
         name="compute",
         fn=_trivial,
         reads=(DataSlot("batch_gpu", batch_offset=0),),
         stream="default",
-        batch_offset=0,
+        lookahead=0,
     )
     schedule = Schedule(
         stages=(Stage(tasks=(h2d, compute)),),
@@ -174,14 +174,14 @@ def test_analyzer_rejects_same_name_writers_on_different_streams() -> None:
         fn=_trivial,
         writes=(DataSlot("X", batch_offset=1),),
         stream="memcpy",
-        batch_offset=1,
+        lookahead=1,
     )
     w_b = Task.from_fn(
         name="w_b",
         fn=_trivial,
         writes=(DataSlot("X", batch_offset=0),),
         stream="comm",
-        batch_offset=0,
+        lookahead=0,
     )
     schedule = Schedule(
         stages=(Stage(tasks=(w_a, w_b)),),
@@ -372,11 +372,22 @@ def test_stream_pool_use_none_resolves_to_anchor_default() -> None:
         assert torch.cuda.current_stream() == outer_stream
 
 
-def test_wait_stream_is_actually_emitted() -> None:
-    """Spy on `torch.cuda.Stream.wait_stream` and verify the engine
-    emits it at least once for a cross-stream schedule. Complements
-    the race test — even if a race happened to produce the correct
-    answer, this test still catches a missing wait_stream."""
+def test_cross_stream_sync_is_actually_emitted() -> None:
+    """Spy on cross-stream sync primitives and verify the engine emits
+    one for a cross-stream schedule.
+
+    After the followup-#1 fix, the engine prefers fine-grained
+    ``wait_event(producer_event)`` over coarse ``wait_stream(producer_
+    stream)``: a writer task records a CUDA event on its stream, and
+    the reader task waits on that specific event from the ring slot.
+    Both forms serve the same ordering goal — what matters here is
+    that *some* cross-stream sync was issued. Stream-granularity
+    ``wait_stream`` is still emitted as a first-iter fallback when the
+    ring slot has no producer event yet.
+
+    Complements the race test — even if a race happened to produce the
+    correct answer, this test still catches a missing cross-stream
+    edge."""
     device = _cuda_or_skip()
 
     memcpy_stream = torch.cuda.Stream(device)
@@ -411,26 +422,37 @@ def test_wait_stream_is_actually_emitted() -> None:
     )
     pipe = SchedulablePipeline(schedule, pool)
 
-    # Monkey-patch wait_stream to record calls.
-    original = torch.cuda.Stream.wait_stream
-    calls = []
+    # Monkey-patch both wait_stream and wait_event to record calls.
+    original_wait_stream = torch.cuda.Stream.wait_stream
+    original_wait_event = torch.cuda.Stream.wait_event
+    stream_calls = []
+    event_calls = []
 
-    def _spy(self, other):
-        calls.append((int(self.stream_id), int(other.stream_id)))
-        return original(self, other)
+    def _stream_spy(self, other):
+        stream_calls.append((int(self.stream_id), int(other.stream_id)))
+        return original_wait_stream(self, other)
 
-    torch.cuda.Stream.wait_stream = _spy
+    def _event_spy(self, event):
+        event_calls.append(int(self.stream_id))
+        return original_wait_event(self, event)
+
+    torch.cuda.Stream.wait_stream = _stream_spy
+    torch.cuda.Stream.wait_event = _event_spy
     try:
         pipe.progress(iter([None]))
     finally:
-        torch.cuda.Stream.wait_stream = original
+        torch.cuda.Stream.wait_stream = original_wait_stream
+        torch.cuda.Stream.wait_event = original_wait_event
 
     default_id = int(torch.cuda.default_stream(device).stream_id)
     memcpy_id = int(memcpy_stream.stream_id)
-    assert (default_id, memcpy_id) in calls, (
-        f"Expected default.wait_stream(memcpy) to be called at least "
-        f"once; observed calls: {calls}. Engine is not emitting "
-        f"auto-inferred wait_stream edges."
+    saw_stream_wait = (default_id, memcpy_id) in stream_calls
+    saw_event_wait = default_id in event_calls
+    assert saw_stream_wait or saw_event_wait, (
+        f"Expected default to wait on memcpy via wait_stream or "
+        f"wait_event at least once; observed wait_stream calls: "
+        f"{stream_calls}, wait_event calls on stream_id: {event_calls}. "
+        f"Engine is not emitting cross-stream sync."
     )
 
 
