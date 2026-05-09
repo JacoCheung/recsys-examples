@@ -234,15 +234,32 @@ class HSTUPipeline:
             make_start_input_dist_task(self._state, batch_offset=input_dist_offset),
             make_wait_input_dist_task(self._state, batch_offset=input_dist_offset),
         ]
-        if self._prefetch:
-            tasks.append(make_prefetch_task(self._state, batch_offset=prefetch_offset))
+        # Note: for the prefetch variant, prefetch_embeddings is
+        # declared AFTER forward (not before). Same-iter ordering
+        # is: forward consumes prev iter's prefetched data first,
+        # THEN prefetch_embeddings adds new keys for next iter.
+        # This keeps dynamicemb cache outstanding peak at ~1 batch
+        # (matches legacy JaggedMegatronPrefetch progress order at
+        # train_pipeline.py:993-997). Reversing the order would
+        # peak at ~2-3 batches and overflow cache capacity.
         tasks.extend(
             [
                 make_zero_grad_task(self._state),
                 make_global_tokens_task(self._state),
                 make_nccl_safety_barrier_task(self._state),
                 make_forward_task(self._state),
-                make_backward_task(self._state),
+            ]
+        )
+        if self._prefetch:
+            tasks.append(make_prefetch_task(self._state, batch_offset=prefetch_offset))
+        # backward depends_on prefetch_embeddings only in prefetch
+        # variant — the engine emits wait_stream(prefetch) on default
+        # stream because they're on different streams. Mirrors legacy
+        # train_pipeline.py:996-997.
+        backward_deps = ("prefetch_embeddings",) if self._prefetch else ()
+        tasks.extend(
+            [
+                make_backward_task(self._state, depends_on=backward_deps),
                 make_finalize_grads_task(self._state),
                 make_optimizer_step_task(self._state),
                 make_watchdog_task(),
@@ -282,20 +299,25 @@ class HSTUPipeline:
         return schedule, StreamPool(pool_dict)
 
     def _rewrite_model(
-        self, peek_batch: Any, data_dist_stream: Any, default_stream: Any
+        self,
+        peek_batch: Any,
+        data_dist_stream: Any,
+        default_stream: Any,
+        memcpy_stream: Any = None,
     ):
         """Call torchrec's _rewrite_model once, using the SAME streams
         that will later be installed in the engine's StreamPool, and
         return the **real per-batch context** that was used for the
         monkey-patch bootstrap.
 
-        Previously this context was abandoned after ``_override_input_dist_forwards``
-        — leaking dynamicemb cache reservations when caching is on
-        (prefetch + use_dynamic_emb combo). The context is now
-        returned to the caller, which seeds it into the engine's
-        ring as the peek batch's real ctx so the batch flows through
-        the pipeline normally and its cache entries get consumed by
-        forward.
+        Bootstrap stream discipline (Codex HIGH-1): the peek batch was
+        H2D'd on ``memcpy_stream``. Before reading it on
+        ``data_dist_stream`` for ``_start_data_dist``, ``data_dist``
+        must wait on ``memcpy``. We also enter the ``data_dist`` stream
+        context for the bootstrap call so any NCCL it issues lands on
+        the right communicator path — same discipline torchrec's own
+        ``start_sparse_data_dist`` follows
+        (``train_pipeline.py:440 with self._stream_context(self._data_dist_stream):``).
         """
         from commons.pipeline.utils import (
             PipelinedForward,
@@ -340,13 +362,20 @@ class HSTUPipeline:
         self._state.pipelined_modules = pipelined_modules
         self._state.pipelined_postprocs = pipelined_postprocs
 
-        # Bootstrap the input_dist. This populates peek_ctx's
-        # splits_requests AND ensures the module's _input_dists
-        # attribute exists so KJTAllToAllForward monkeypatch can
-        # install. The ctx is REAL — it's seeded into the engine ring
-        # below so the peek batch goes through forward/backward like
-        # any other batch and its cache entries get consumed.
-        _start_data_dist(pipelined_modules, peek_batch, peek_ctx)
+        # Bootstrap the input_dist on the engine's data_dist stream
+        # AFTER ensuring the peek H2D on memcpy_stream is visible
+        # there. Mirrors legacy stream discipline.
+        device = self._state.device
+        if (
+            device.type == "cuda"
+            and data_dist_stream is not None
+            and memcpy_stream is not None
+        ):
+            data_dist_stream.wait_stream(memcpy_stream)
+            with torch.cuda.stream(data_dist_stream):
+                _start_data_dist(pipelined_modules, peek_batch, peek_ctx)
+        else:
+            _start_data_dist(pipelined_modules, peek_batch, peek_ctx)
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
             pipelined_modules
         )
@@ -382,26 +411,52 @@ class HSTUPipeline:
                 f"them on the same thread in your custom map."
             )
 
-    def _ensure_pipe(self, peek_batch_cpu: Any, peek_batch_gpu: Any) -> None:
+    def _ensure_pipe(self, peek_batch_cpu: Any) -> None:
         if self._pipe is not None:
             return
-        # Build StreamPool FIRST so we can pass the final data_dist /
-        # default streams into _rewrite_model — Codex flagged that
-        # using throwaway streams causes PipelinedForward to capture
-        # wrong handles.
+        # Build StreamPool FIRST so the peek H2D + bootstrap
+        # _start_data_dist run on the engine's actual streams (Codex
+        # HIGH-1 fix) — previously H2D used a throwaway stream and
+        # bootstrap had no stream context, risking NCCL submission
+        # on the wrong stream.
         schedule, pool = self._build_schedule()
 
         # Codex C-LOW: refuse any thread_map that lets set_context
         # calls race across threads. Check at construction time.
         self._validate_set_context_colocation(schedule)
 
+        memcpy_stream = pool.get("memcpy")
         data_dist_stream = pool.get("data_dist")
         default_stream = pool.get("default")
-        # _rewrite_model now runs bootstrap on a REAL per-batch ctx
-        # (instead of a throwaway) and returns it. We seed it into
-        # the engine ring below so the peek batch flows through the
-        # pipeline normally.
-        peek_ctx = self._rewrite_model(peek_batch_gpu, data_dist_stream, default_stream)
+
+        # H2D peek batch on engine's memcpy stream (not throwaway).
+        from commons.pipeline.utils import _to_device
+
+        device = self._state.device
+        if device.type == "cuda" and memcpy_stream is not None:
+            with torch.cuda.stream(memcpy_stream):
+                peek_batch_gpu = _to_device(peek_batch_cpu, device, non_blocking=True)
+            # record_stream so the seeded tensor stays alive across
+            # all consumer streams (default for forward, data_dist
+            # for input_dist, prefetch for prefetch_embeddings —
+            # the prefetch slot only exists in prefetch mode).
+            consumers = [default_stream, data_dist_stream]
+            if self._prefetch:
+                consumers.append(pool.get("prefetch"))
+            for consumer in consumers:
+                if consumer is not None:
+                    peek_batch_gpu.record_stream(consumer)
+        else:
+            peek_batch_gpu = _to_device(peek_batch_cpu, device, non_blocking=True)
+
+        # _rewrite_model bootstraps on a REAL per-batch ctx on the
+        # engine's data_dist stream (after wait_stream on memcpy).
+        peek_ctx = self._rewrite_model(
+            peek_batch_gpu,
+            data_dist_stream,
+            default_stream,
+            memcpy_stream=memcpy_stream,
+        )
 
         executor = (
             ThreadedExecutor(thread_map=self._thread_map) if self._threaded else None
@@ -426,7 +481,7 @@ class HSTUPipeline:
         # finish_shuffle tasks still need to run on the peek batch.
         # The shuffler's start/finish collectives are idempotent at
         # the NCCL level — they'll happen exactly once per batch.)
-        self._pipe.seed_first_batch(seeded)
+        self._pipe._seed_first_batch(seeded)
 
     # ------------------------------------------------------------------
     # Public API (legacy-matching)
@@ -443,29 +498,19 @@ class HSTUPipeline:
         """
         if self._pipe is None:
             # Peek one batch to drive FX tracing + monkeypatch
-            # bootstrap. Unlike the earlier throwaway design, the peek
-            # batch is now SEEDED into the engine ring so it flows
-            # through the pipeline as the first real batch (no data
-            # loss, no dynamicemb cache leak).
+            # bootstrap. The peek batch is SEEDED into the engine
+            # ring so it flows through the pipeline as the first
+            # real batch (no data loss, no dynamicemb cache leak).
+            # H2D + bootstrap stream context happen INSIDE
+            # _ensure_pipe on the engine's actual streams (Codex
+            # HIGH-1).
             try:
                 peek_cpu = next(dataloader_iter)
             except StopIteration as e:
                 raise StopIteration(
                     "HSTUPipeline: dataloader was empty on first progress() call"
                 ) from e
-            # H2D the peek batch on memcpy to mirror legacy
-            # copy_batch_to_gpu_and_shuffle so FX sees a GPU batch.
-            from commons.pipeline.utils import _to_device
-
-            if self._state.device.type == "cuda":
-                memcpy_stream = torch.cuda.Stream(self._state.device, priority=-1)
-                with torch.cuda.stream(memcpy_stream):
-                    peek_gpu = _to_device(
-                        peek_cpu, self._state.device, non_blocking=True
-                    )
-            else:
-                peek_gpu = _to_device(peek_cpu, self._state.device, non_blocking=True)
-            self._ensure_pipe(peek_cpu, peek_gpu)
+            self._ensure_pipe(peek_cpu)
 
         # Engine does the rest.
         return self._pipe.progress(dataloader_iter)

@@ -788,3 +788,82 @@ def test_basic_thread_map_passthrough() -> None:
     )
     assert isinstance(pipe._executor, ThreadedExecutor)
     assert pipe._executor._thread_map == "per_task"
+
+
+# ------------------------------------------------------------------
+# Test: NCCL deadlock on cancellation (Codex CRITICAL regression guard)
+# ------------------------------------------------------------------
+
+
+def test_nccl_lock_does_not_deadlock_on_early_failure() -> None:
+    """Regression guard for the deadlock Codex flagged:
+
+    Setup: two NCCL-tagged tasks (tickets 0 + 1) on different threads,
+    plus a non-NCCL task that fails BEFORE ticket 0 has a chance to
+    release. Without ``_NcclOrderedLock.abort()``, the worker that
+    holds ticket 1's wait would block forever — no one ever advances
+    ``next_ticket`` past 0.
+
+    With the fix, the failing thread calls ``self._nccl_lock.abort()``
+    in its except block; the waiter wakes and re-raises. Stage exits
+    within ``timeout``.
+    """
+    barrier = threading.Barrier(2, timeout=5)
+
+    def _fail_first(ctx):
+        # Fire BEFORE the NCCL chain has any release. Sync with the
+        # NCCL worker so we KNOW it's already inside acquire(1).
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        # Sleep just enough for the other thread to enter acquire(1)
+        time.sleep(0.05)
+        raise RuntimeError("fail before NCCL chain progresses")
+
+    def _nccl_ticket_0(ctx):
+        # Wait until the failing task is about to fail
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        # Block here — the failing task will raise and abort the lock
+        time.sleep(1.0)
+
+    def _nccl_ticket_1(ctx):
+        pass  # never gets here in the deadlock scenario
+
+    tasks = (
+        Task.from_fn("fail_first", _fail_first, stream="stream_a"),
+        Task.from_fn("nccl_0", _nccl_ticket_0, stream="stream_b", nccl=True),
+        Task.from_fn("nccl_1", _nccl_ticket_1, stream="stream_c", nccl=True),
+    )
+    schedule = Schedule(
+        stages=(Stage(tasks=tasks),),
+        stream_slots=("default", "stream_a", "stream_b", "stream_c"),
+    )
+    pool = StreamPool(
+        {
+            "default": None,
+            "stream_a": None,
+            "stream_b": None,
+            "stream_c": None,
+        }
+    )
+    pipe = SchedulablePipeline(schedule, pool, executor="threaded")
+
+    # If abort() is missing, this hangs forever. Cap with a soft
+    # deadline via Python — pytest will reap, but worse, CI hangs.
+    # We rely on the fix making this fast (well under 1s after the
+    # 0.05s sleep + 1s nccl_0 sleep, totaling ~1.05s in the worst
+    # ordering).
+    start = time.perf_counter()
+    with pytest.raises(RuntimeError, match="fail before NCCL"):
+        pipe.progress(iter([torch.tensor(1.0)]))
+    elapsed = time.perf_counter() - start
+    # 5s ceiling: deadlock would take >> this. Real fix unblocks
+    # within ~1s.
+    assert elapsed < 5.0, (
+        f"NCCL lock deadlock — stage took {elapsed:.1f}s; "
+        f"fix should unblock within 1s of the failing task raising"
+    )

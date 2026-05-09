@@ -53,7 +53,7 @@ import torch
 from .context import TaskContext
 from .schedule import Stage
 from .streams import StreamPool
-from .task import Task
+from .task import DataSlot, Task
 
 __all__ = ["SequentialExecutor", "ThreadedExecutor"]
 
@@ -105,25 +105,39 @@ def _compute_cpu_deps(
     edges that need CPU-side ordering.  Same-thread edges are handled by
     sequential execution within the thread.
 
+    Also: when ``thread_map`` splits same-stream tasks across worker
+    threads (e.g. ``thread_map="per_task"``), CUDA stream FIFO order
+    is determined by host-thread enqueue race rather than declaration
+    order. We add a CPU dep from each same-stream predecessor (declared
+    earlier) on a different thread, so submission order matches the
+    schedule.
+
     GPU-side cross-stream waits are separate and handled by
     ``_apply_cross_stream_waits``.
     """
-    # Build writer map: slot_name -> last writer task name
-    writers: Dict[str, str] = {}
+    # Build writer map for CPU-side ordering. Unlike GPU stream-wait
+    # inference, host thread events should only model dependencies
+    # within the same logical slot. A read of X@0 consumes data that
+    # was produced in an earlier internal iteration, not the active
+    # stage's producer of X@2.
+    writers: Dict[DataSlot, str] = {}
     for task in active:
         for slot in task.writes:
-            writers[slot.name] = task.name
+            writers[slot] = task.name
 
     active_names = {t.name for t in active}
     cpu_deps: Dict[str, List[threading.Event]] = defaultdict(list)
+    # Track the most recent task on each stream in declaration order.
+    last_on_stream: Dict[str, str] = {}
 
     for task in active:
         my_thread = thread_id_of[task.name]
+        my_stream = task.stream or "default"
         dep_names: set = set()
 
-        # Slot-based deps: any writer of a slot I read
+        # Slot-based deps: any active writer of the exact slot I read.
         for slot in task.reads:
-            writer_name = writers.get(slot.name)
+            writer_name = writers.get(slot)
             if writer_name and writer_name != task.name:
                 dep_names.add(writer_name)
 
@@ -131,6 +145,15 @@ def _compute_cpu_deps(
         for dep_name in task.depends_on or ():
             if dep_name in active_names:
                 dep_names.add(dep_name)
+
+        # Same-stream predecessor (declaration order) — preserves
+        # CUDA stream FIFO when thread_map splits same-stream tasks.
+        # No-op when thread_map keeps them on the same thread (the
+        # cross-thread filter below skips it).
+        prev_same_stream = last_on_stream.get(my_stream)
+        if prev_same_stream is not None:
+            dep_names.add(prev_same_stream)
+        last_on_stream[my_stream] = task.name
 
         # Only need CPU event for deps on DIFFERENT threads
         for dep_name in dep_names:
@@ -202,6 +225,20 @@ class _NcclOrderedLock:
             if failed:
                 self._failed = True
             self._next_ticket += 1
+            self._cond.notify_all()
+
+    def abort(self) -> None:
+        """Wake up every waiter and force them to raise.
+
+        Used when a non-NCCL task on another thread fails before its
+        expected NCCL ticket has been released — without this, a worker
+        already inside ``acquire(later_ticket)`` would block forever
+        because no one will ever call ``release()`` for the missing
+        earlier ticket. The cancellation flag in the executor only
+        prevents NEW acquires; this wakes the existing wait().
+        """
+        with self._cond:
+            self._failed = True
             self._cond.notify_all()
 
     def reset(self) -> None:
@@ -364,6 +401,12 @@ class ThreadedExecutor:
                     completion[task.name].set()
             except BaseException as e:
                 cancelled.set()
+                # Wake any worker still blocked inside
+                # _NcclOrderedLock.acquire() — without this, a thread
+                # waiting for ticket=k can deadlock forever if the
+                # thread that was supposed to release ticket=(k-1)
+                # died before getting there.
+                self._nccl_lock.abort()
                 with errors_lock:
                     errors.append(e)
             finally:
