@@ -41,7 +41,7 @@ from typing import Any, Callable, List, Optional
 
 import nvtx
 import torch
-from commons.pipeline.engine import DataSlot, Task
+from commons.pipeline.engine import Task
 
 
 @dataclass
@@ -108,7 +108,7 @@ class PipelineState:
 
 
 def make_h2d_task(
-    state: PipelineState, *, batch_offset: int, stream: str = "memcpy"
+    state: PipelineState, *, lookahead: int, stream: str = "memcpy"
 ) -> Task:
     """Copies engine-populated ``batch_cpu`` to GPU and stamps a fresh
     ``torchrec_ctx`` into the same slot store."""
@@ -142,11 +142,11 @@ def make_h2d_task(
         "h2d",
         _fn,
         stream=stream,
-        batch_offset=batch_offset,
-        reads=(DataSlot("batch_cpu", batch_offset),),
+        lookahead=lookahead,
+        reads=("batch_cpu",),
         writes=(
-            DataSlot("batch_gpu", batch_offset),
-            DataSlot("torchrec_ctx", batch_offset),
+            "batch_gpu",
+            "torchrec_ctx",
         ),
     )
 
@@ -167,7 +167,7 @@ def make_zero_grad_task(state: PipelineState) -> Task:
                 model_inner.zero_grad_buffer()
             state.optimizer.zero_grad()
 
-    return Task.from_fn("zero_grad", _fn, stream="default", batch_offset=0)
+    return Task.from_fn("zero_grad", _fn, stream="default", lookahead=0)
 
 
 # ----------------------------------------------------------------------
@@ -195,9 +195,9 @@ def make_global_tokens_task(state: PipelineState) -> Task:
         "global_tokens_allreduce",
         _fn,
         stream="default",
-        batch_offset=0,
-        reads=(DataSlot("batch_gpu", 0),),
-        writes=(DataSlot("global_tokens", 0),),
+        lookahead=0,
+        reads=("batch_gpu",),
+        writes=("global_tokens",),
         nccl=True,
     )
 
@@ -207,7 +207,7 @@ def make_global_tokens_task(state: PipelineState) -> Task:
 # ----------------------------------------------------------------------
 
 
-def make_start_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task:
+def make_start_shuffle_task(state: PipelineState, *, lookahead: int) -> Task:
     """Phase 1 of 2-phase KK shuffler. Runs on memcpy stream.
 
     Emits an AllGather (NCCL) for non-identity shuffler; identity
@@ -240,9 +240,9 @@ def make_start_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task:
         "start_shuffle",
         _fn,
         stream="memcpy",
-        batch_offset=batch_offset,
-        reads=(DataSlot("batch_gpu", batch_offset),),
-        writes=(DataSlot("shuffle_handle", batch_offset),),
+        lookahead=lookahead,
+        reads=("batch_gpu",),
+        writes=("shuffle_handle",),
         nccl=not state.is_identity_shuffler,
     )
 
@@ -252,7 +252,7 @@ def make_start_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task:
 # ----------------------------------------------------------------------
 
 
-def make_finish_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task:
+def make_finish_shuffle_task(state: PipelineState, *, lookahead: int) -> Task:
     from megatron.core import parallel_state
 
     def _fn(ctx):
@@ -279,12 +279,12 @@ def make_finish_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task
         "finish_shuffle",
         _fn,
         stream="memcpy",
-        batch_offset=batch_offset,
+        lookahead=lookahead,
         reads=(
-            DataSlot("batch_gpu", batch_offset),
-            DataSlot("shuffle_handle", batch_offset),
+            "batch_gpu",
+            "shuffle_handle",
         ),
-        writes=(DataSlot("shuffled_batch", batch_offset),),
+        writes=("shuffled_batch",),
         # NCCL only for non-identity shuffler (identity is a no-op).
         nccl=not state.is_identity_shuffler,
     )
@@ -295,7 +295,7 @@ def make_finish_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task
 # ----------------------------------------------------------------------
 
 
-def make_start_input_dist_task(state: PipelineState, *, batch_offset: int) -> Task:
+def make_start_input_dist_task(state: PipelineState, *, lookahead: int) -> Task:
     """Calls torchrec's start_sparse_data_dist. Mutates torchrec_ctx in place."""
 
     def _fn(ctx):
@@ -333,10 +333,10 @@ def make_start_input_dist_task(state: PipelineState, *, batch_offset: int) -> Ta
         "start_input_dist",
         _fn,
         stream="data_dist",
-        batch_offset=batch_offset,
+        lookahead=lookahead,
         reads=(
-            DataSlot("shuffled_batch", batch_offset),
-            DataSlot("torchrec_ctx", batch_offset),
+            "shuffled_batch",
+            "torchrec_ctx",
         ),
         # Mutates torchrec_ctx in place; we don't redeclare it as
         # writes since the slot already exists (single-writer rule
@@ -350,7 +350,7 @@ def make_start_input_dist_task(state: PipelineState, *, batch_offset: int) -> Ta
 # ----------------------------------------------------------------------
 
 
-def make_wait_input_dist_task(state: PipelineState, *, batch_offset: int) -> Task:
+def make_wait_input_dist_task(state: PipelineState, *, lookahead: int) -> Task:
     def _fn(ctx):
         torchrec_ctx = ctx.slots.get("torchrec_ctx", None)
         if torchrec_ctx is None:
@@ -366,7 +366,7 @@ def make_wait_input_dist_task(state: PipelineState, *, batch_offset: int) -> Tas
         "wait_input_dist",
         _fn,
         stream="data_dist",
-        batch_offset=batch_offset,
+        lookahead=lookahead,
         depends_on=("start_input_dist",),
         # awaitable.wait() triggers the tensors all_to_all NCCL op —
         # must participate in the declaration-order NCCL chain.
@@ -379,7 +379,7 @@ def make_wait_input_dist_task(state: PipelineState, *, batch_offset: int) -> Tas
 # ----------------------------------------------------------------------
 
 
-def make_prefetch_task(state: PipelineState, *, batch_offset: int) -> Task:
+def make_prefetch_task(state: PipelineState, *, lookahead: int) -> Task:
     """Calls ShardedModule.prefetch on the prefetch stream and stores
     the result into the context's ``module_input_post_prefetch`` /
     ``module_contexts_post_prefetch`` — matching legacy ``_prefetch``
@@ -426,7 +426,7 @@ def make_prefetch_task(state: PipelineState, *, batch_offset: int) -> Task:
         "prefetch_embeddings",
         _fn,
         stream="prefetch",
-        batch_offset=batch_offset,
+        lookahead=lookahead,
         depends_on=("wait_input_dist",),
     )
 
@@ -436,8 +436,17 @@ def make_prefetch_task(state: PipelineState, *, batch_offset: int) -> Task:
 # ----------------------------------------------------------------------
 
 
-def make_forward_task(state: PipelineState) -> Task:
-    """Sets module context, runs model(batch), writes losses + output."""
+def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
+    """Sets module context, runs model(batch), writes losses + output.
+
+    If ``prefetch=True``, ``forward`` declares an ordering edge to
+    ``prefetch_embeddings`` via bare-name ``depends_on``; the engine
+    derives the cross-iter offset from the lookahead diff
+    (``prefetch_embeddings.lookahead=1`` vs ``forward.lookahead=0``)
+    and emits the appropriate ``wait_event`` so the first iteration
+    is structurally synchronized — without the user writing the
+    iteration arithmetic.
+    """
 
     def _fn(ctx):
         batch_gpu = ctx.slots.get("batch_gpu", None)
@@ -453,17 +462,18 @@ def make_forward_task(state: PipelineState) -> Task:
         ctx.slots.set("losses", losses)
         ctx.slots.set("output", output)
 
+    depends_on: tuple = ()
+    if prefetch:
+        depends_on = ("prefetch_embeddings",)
+
     return Task.from_fn(
         "forward",
         _fn,
         stream="default",
-        batch_offset=0,
-        reads=(
-            DataSlot("batch_gpu", 0),
-            DataSlot("torchrec_ctx", 0),
-            DataSlot("shuffled_batch", 0),
-        ),
-        writes=(DataSlot("losses", 0), DataSlot("output", 0)),
+        lookahead=0,
+        reads=("batch_gpu", "torchrec_ctx", "shuffled_batch"),
+        writes=("losses", "output"),
+        depends_on=depends_on,
         # forward does NOT AllReduce; DDP hooks fire during backward.
     )
 
@@ -493,7 +503,7 @@ def make_nccl_safety_barrier_task(state: PipelineState) -> Task:
         "nccl_safety_barrier",
         _fn,
         stream="default",
-        batch_offset=0,
+        lookahead=0,
         depends_on=("finish_shuffle",),
     )
 
@@ -537,9 +547,9 @@ def make_backward_task(state: PipelineState, *, depends_on: tuple = ()) -> Task:
         "backward",
         _fn,
         stream="default",
-        batch_offset=0,
-        reads=(DataSlot("losses", 0), DataSlot("global_tokens", 0)),
-        writes=(DataSlot("local_loss_sum", 0),),
+        lookahead=0,
+        reads=("losses", "global_tokens"),
+        writes=("local_loss_sum",),
         depends_on=depends_on,
         # DDP backward AllReduce fires inside .backward() — mark NCCL.
         nccl=True,
@@ -566,7 +576,7 @@ def make_finalize_grads_task(state: PipelineState) -> Task:
         "finalize_model_grads",
         _fn,
         stream="default",
-        batch_offset=0,
+        lookahead=0,
         depends_on=("backward",),
         nccl=True,
     )
@@ -591,9 +601,9 @@ def make_optimizer_step_task(state: PipelineState) -> Task:
         "optimizer_step",
         _fn,
         stream="default",
-        batch_offset=0,
+        lookahead=0,
         depends_on=("finalize_model_grads",),
-        writes=(DataSlot("step_result", 0),),
+        writes=("step_result",),
     )
 
 
@@ -616,6 +626,6 @@ def make_watchdog_task() -> Task:
         "watchdog_step",
         _fn,
         stream="default",
-        batch_offset=0,
+        lookahead=0,
         depends_on=("optimizer_step",),
     )

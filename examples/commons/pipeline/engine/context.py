@@ -40,10 +40,24 @@ class SlotStore:
     Keyed by slot name (str). V1 does not key on `(name, batch_offset)`
     because `in_flight_batches=1` → offset is always 0. V4 promotes
     this to a `(name, batch_offset)` map.
+
+    Each SlotStore also carries a registry of **producer-completion
+    events**, keyed by task name. After a task runs on its stream, the
+    executor records a CUDA event on that stream and stores it here on
+    the slot the task wrote (or, for cross-iter handoff, on the slot
+    matching the task's batch_offset). A consumer task that reads from
+    that slot can then `wait_event(producer_event)` instead of
+    `wait_stream(producer_stream)` — fine-grained sync at task
+    granularity, not stream granularity.
+
+    Events are typed `Any` here so this module remains
+    framework-agnostic; the executor (which already imports torch)
+    populates them with `torch.cuda.Event` instances.
     """
 
     def __init__(self) -> None:
         self._data: Dict[str, Any] = {}
+        self._events: Dict[str, Any] = {}
 
     def __contains__(self, name: str) -> bool:
         return name in self._data
@@ -62,8 +76,39 @@ class SlotStore:
     def get(self, name: str, default: Any = None) -> Any:
         return self._data.get(name, default)
 
+    def get_event(self, task_name: str) -> Any:
+        """Producer-completion event for `task_name`, or None if no
+        producer has recorded one on this slot yet."""
+        return self._events.get(task_name)
+
+    def set_event(self, task_name: str, event: Any) -> None:
+        """Register the producer-completion event for `task_name`.
+
+        Called by the executor right after the task body returns; the
+        executor records the event on the task's CUDA stream first.
+        Subsequent re-recording on the same `torch.cuda.Event` is
+        intentional — `Event.record()` overwrites the prior record, so
+        the same event object is reused across iterations as the slot
+        rotates through the ring.
+        """
+        self._events[task_name] = event
+
+    def has_event(self, task_name: str) -> bool:
+        return task_name in self._events
+
     def clear(self) -> None:
+        """Clear data only; events persist across `BatchRing.advance()`
+        so the same `torch.cuda.Event` objects are reused (re-recorded
+        in the next iteration when this slot rotates back to the high
+        offset). Callers wanting full reset should use `clear_all()`.
+        """
         self._data.clear()
+
+    def clear_all(self) -> None:
+        """Clear both data and the event registry. Used at shutdown
+        or when discarding pipeline state — not in the hot loop."""
+        self._data.clear()
+        self._events.clear()
 
 
 class BatchRing(Generic[In]):
@@ -112,15 +157,29 @@ class BatchRing(Generic[In]):
     def advance(self) -> None:
         """End-of-iteration: shift ring toward offset=0.
 
-        The store at offset=0 is dropped; the one at offset=1
-        becomes the new current; a fresh empty store is appended
-        at the highest offset (ready to receive the next pulled
-        batch's data).
+        The slot at offset=0 is **recycled** — its data is cleared, but
+        the SlotStore object itself (and its event registry) are
+        preserved and rotated to the highest offset. This lets producer
+        tasks at the high offset re-record onto the same
+        `torch.cuda.Event` objects iteration after iteration, so we
+        don't churn CUDA events. (See `SlotStore.set_event` for the
+        re-record contract.)
+
+        After advance:
+          - old offset=0 slot is now empty at offset=N-1, ready to
+            receive a freshly pulled batch;
+          - old offset=k for k>0 slides to offset=k-1.
+
+        Callers must not hold long-lived references to a SlotStore
+        across `advance()` — the object identity is stable, but its
+        offset (and therefore its semantic role) changes.
         """
-        # Drop offset=0 store; its refcounts release.
-        self._slots.pop(0)
-        # New empty store at the tail (furthest-ahead slot).
-        self._slots.append(SlotStore())
+        recycled = self._slots[0]
+        recycled.clear()  # data cleared; events kept for re-record
+        # Shift slots[1..n-1] to slots[0..n-2]
+        self._slots[:-1] = self._slots[1:]
+        # Recycled slot lands at the highest offset
+        self._slots[-1] = recycled
 
 
 class TaskContext(Generic[In]):

@@ -33,17 +33,17 @@ V3 adds cross-stream `wait_stream` insertion; V4 adds N-batch ring +
 prefill/drain; V5 adds validator; V9 adds auto-scheduler.
 """
 
-from typing import Any, Callable, Generic, Iterator, Optional, TypeVar
+from typing import Any, Callable, Generic, Iterable, Iterator, Optional, TypeVar
 
 import torch
 
 from .context import BatchRing, TaskContext
-from .deps import infer_cross_stream_waits
+from .deps import infer_cross_stream_event_deps, infer_cross_stream_waits
 from .executor import SequentialExecutor, ThreadedExecutor
 from .schedule import Schedule, Stage
 from .streams import StreamPool
 
-__all__ = ["SchedulablePipeline"]
+__all__ = ["Pipeline", "SchedulablePipeline"]
 
 
 In = TypeVar("In")
@@ -112,10 +112,13 @@ class SchedulablePipeline(Generic[In, Out]):
         self._ctx: TaskContext = TaskContext(self._ring, stream_pool)
         self._max_offset: int = schedule.in_flight_batches - 1
 
-        # Cross-stream wait_stream inference (SPEC §4.2 rule 8, §4.8
-        # deps.py). Computed once at construction; applied before each
-        # task run().
+        # Cross-stream wait inference (SPEC §4.2 rule 8, §4.8 deps.py).
+        # Computed once at construction; applied before each task run().
+        # Two views: stream-list (legacy, used as first-iter fallback)
+        # and event-deps (fine-grained, prefers wait_event when the
+        # producer's completion event is on the ring slot).
         self._cross_stream_waits = infer_cross_stream_waits(schedule)
+        self._cross_stream_event_deps = infer_cross_stream_event_deps(schedule)
 
         # SPEC §4.8 state: iter_count is the internal iteration
         # counter; pulled is the running count of batches pulled from
@@ -254,6 +257,7 @@ class SchedulablePipeline(Generic[In, Out]):
                 mask,
                 self._cross_stream_waits,
                 self._stream_pool,
+                event_deps=self._cross_stream_event_deps,
             )
 
         # Restore active offset for any external inspection.
@@ -430,3 +434,94 @@ class SchedulablePipeline(Generic[In, Out]):
         if executor is None and threaded:
             executor = ThreadedExecutor(thread_map=thread_map)
         return cls(schedule, pool, executor=executor)
+
+
+class Pipeline(Generic[In]):
+    """SPEC_p4 v2 user-facing declarative pipeline.
+
+    Thin wrapper over :class:`SchedulablePipeline` that takes a flat
+    list of tasks and constructs the underlying ``Schedule``
+    internally. The user describes the per-batch DAG once via
+    ``Task(...)`` declarations; ring depth, stream slots, and stage
+    layout are derived.
+
+    Differences from :class:`SchedulablePipeline` (the imperative API):
+
+    - Single argument ``tasks=[Task(...), ...]``. No ``Stage`` /
+      ``Schedule`` object construction at the call site.
+    - ``stream_slots`` is the union of ``task.stream`` across all
+      tasks (``"default"`` is always included so the engine has an
+      anchor).
+    - All tasks land in a single ``Stage``. Stage boundaries were
+      already cosmetic — engine cross-stream wait inference is
+      stage-agnostic per SPEC §4.2.
+    - Ring depth is ``max(t.lookahead) + 1`` via the existing
+      ``Schedule.in_flight_batches`` derivation; tasks can use either
+      ``lookahead=...`` (SPEC_p4 v2) or ``batch_offset=...`` (legacy)
+      since both alias the same field.
+
+    The user still constructs and passes a :class:`StreamPool` —
+    stream resources are device-specific and outside the engine's
+    pure-Python scope.
+
+    Adapter authors that need explicit multi-stage layout or other
+    ``Schedule`` controls can keep using :class:`SchedulablePipeline`
+    directly; nothing about this class makes that path go away.
+    """
+
+    def __init__(
+        self,
+        tasks: "Iterable[Task]",
+        stream_pool: StreamPool,
+        *,
+        executor: Optional[object] = None,
+        nvtx: bool = True,
+    ) -> None:
+        from .task import Task as _Task  # local import keeps top-level lean
+
+        task_tuple = tuple(tasks)
+        if not task_tuple:
+            raise ValueError("Pipeline requires at least one task.")
+        for t in task_tuple:
+            if not isinstance(t, _Task):
+                raise TypeError(
+                    f"Pipeline.tasks entries must be Task instances, got "
+                    f"{type(t).__name__}: {t!r}"
+                )
+
+        slots = {t.stream for t in task_tuple}
+        slots.add("default")
+        stream_slots = tuple(sorted(slots))
+
+        schedule = Schedule(
+            stages=(Stage(tasks=task_tuple),),
+            stream_slots=stream_slots,
+        )
+
+        self._impl: SchedulablePipeline = SchedulablePipeline(
+            schedule, stream_pool, executor=executor, nvtx=nvtx
+        )
+
+    @property
+    def schedule(self) -> Schedule:
+        """Engine-side ``Schedule`` synthesized from the task list."""
+        return self._impl._schedule
+
+    def progress(self, batch_iter) -> Optional[object]:
+        """Run one user-facing iteration. See
+        :meth:`SchedulablePipeline.progress`."""
+        return self._impl.progress(batch_iter)
+
+    def step(self, batch) -> Optional[object]:
+        """Run one iteration on a single batch."""
+        return self._impl.step(batch)
+
+    def shutdown(self) -> None:
+        """Release engine resources (e.g. thread pool)."""
+        return self._impl.shutdown()
+
+    def __enter__(self) -> "Pipeline":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.shutdown()

@@ -79,7 +79,7 @@ def _make_instrumented_schedule(max_offset: int, ks: list, record: dict):
                 name=f"task_k{k}",
                 fn=_make_fn(),
                 stream="default",
-                batch_offset=k,
+                lookahead=k,
             )
         )
     return Schedule(
@@ -147,7 +147,7 @@ def test_drain_mask() -> None:
 
 def test_prefetch_correctness_m_in_m_out() -> None:
     """Basic driver contract: M calls → M results → (M+1)th raises
-    StopIteration. Uses a schedule with batch_offset=1 prefetch."""
+    StopIteration. Uses a schedule with lookahead=1 prefetch."""
     record: dict = {}
 
     def _h2d(ctx):
@@ -165,7 +165,7 @@ def test_prefetch_correctness_m_in_m_out() -> None:
         reads=(DataSlot("batch_cpu", batch_offset=1),),
         writes=(DataSlot("batch_gpu", batch_offset=1),),
         stream="default",
-        batch_offset=1,
+        lookahead=1,
     )
     compute = Task.from_fn(
         name="compute",
@@ -173,7 +173,7 @@ def test_prefetch_correctness_m_in_m_out() -> None:
         reads=(DataSlot("batch_gpu"),),
         writes=(DataSlot("step_result"),),
         stream="default",
-        batch_offset=0,
+        lookahead=0,
     )
     schedule = Schedule(
         stages=(Stage(tasks=(h2d, compute)),), stream_slots=("default",)
@@ -219,7 +219,7 @@ def test_short_dataloader_m_less_than_max_offset() -> None:
 
 def test_empty_dataloader_first_call_raises() -> None:
     """M=0: first `progress` call raises StopIteration without running
-    any task with batch_offset=0."""
+    any task with lookahead=0."""
     record: dict = {}
     schedule = _make_instrumented_schedule(1, [0, 1], record)
     pool = StreamPool({"default": None})
@@ -358,7 +358,7 @@ def test_preset_prefetch_parity() -> None:
 def test_in_flight_batches_derived_from_max_offset() -> None:
     """`Schedule.in_flight_batches` is a `@property` — never authored.
     Confirms §4.2 rule 4 derivation survives V4 multi-batch."""
-    t0 = Task.from_fn(name="t0", fn=lambda ctx: None, stream="default", batch_offset=0)
-    t2 = Task.from_fn(name="t2", fn=lambda ctx: None, stream="default", batch_offset=2)
+    t0 = Task.from_fn(name="t0", fn=lambda ctx: None, stream="default", lookahead=0)
+    t2 = Task.from_fn(name="t2", fn=lambda ctx: None, stream="default", lookahead=2)
     schedule = Schedule(stages=(Stage(tasks=(t0, t2)),), stream_slots=("default",))
     assert schedule.in_flight_batches == 3  # max(0, 2) + 1

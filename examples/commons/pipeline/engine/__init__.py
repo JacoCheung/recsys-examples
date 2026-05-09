@@ -23,13 +23,14 @@ examples/tests/commons/test_engine_import_hygiene.py.
 from .autosched import ScheduleValidationError
 from .context import TaskContext
 from .executor import SequentialExecutor, ThreadedExecutor
-from .pipeline import SchedulablePipeline
+from .pipeline import Pipeline, SchedulablePipeline
 from .schedule import Schedule, Stage
 from .streams import StreamPool
 from .task import DataSlot, Task
 
 __all__ = [
     "DataSlot",
+    "Pipeline",
     "Schedule",
     "SchedulablePipeline",
     "ScheduleValidationError",
