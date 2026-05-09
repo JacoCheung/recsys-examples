@@ -82,6 +82,130 @@
   </table>
 </div>
 
+<div style="background: #eef5ff; border-left: 4px solid #3b6cb1; padding: 12px 16px; margin: 16px 0; font-size: 13px; line-height: 1.55;">
+  <strong>📡 NCCL 通信清单 — 实测每 task 内逐个 NCCL 内核（nsys 采样）</strong><br>
+  下表来自实测 nsys 采样（rank0, 50 iter, HSTU benchmark <code>balanced_ranking_benchmark.gin</code>: <code>local_batch=32</code>,
+  <code>item_emb_dim=128</code>, <code>num_layers=10</code>, <code>hidden=1024</code>, max_seqlen 4096 zipf α=1.2;
+  8×H100, DP=8, no TP/PP）。一个 task 内可能包含多个 NCCL 内核——本表把每个 NCCL kernel 单独列出（CUPTI_ACTIVITY_KIND_KERNEL
+  shortName 直接采集），并标注它们运行在哪条 GPU stream（streamId 经 cross-check 得到 <em>str-7=default / str-23=TorchRec output_dist comm / str-24=batch_shuffler memcpy</em>）。<br>
+  <em>Process group：HSTU benchmark 是纯 DP-8，<code>DistributedModelParallel(env=ShardingEnv.from_process_group(WORLD))</code>
+  + Megatron DP 也是 WORLD（commons/distributed/sharding.py:282-283）→ 所有 NCCL 共用同一个 comm，
+  <code>_NcclOrderedLock</code> ticket 链跨表中所有 NCCL kernel 全局生效。</em>
+  <table style="margin-top: 10px; border-collapse: collapse; font-size: 12px; width: 100%;">
+    <tr style="background: #cfe0fa;">
+      <th style="padding: 5px 6px; border: 1px solid #b3c8e8;">#</th>
+      <th style="padding: 5px 6px; border: 1px solid #b3c8e8;">task</th>
+      <th style="padding: 5px 6px; border: 1px solid #b3c8e8;">stream</th>
+      <th style="padding: 5px 6px; border: 1px solid #b3c8e8;">CUDA streamId</th>
+      <th style="padding: 5px 6px; border: 1px solid #b3c8e8;">NCCL kernel (shortName)</th>
+      <th style="padding: 5px 6px; border: 1px solid #b3c8e8;">payload — 实际是什么 / 量级</th>
+    </tr>
+
+    <!-- start_shuffle -->
+    <tr>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">1</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>start_shuffle</code></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">memcpy</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">24</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_AllGather_RING_LL</code></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">workloads = int64[LBS=32] → 全局 256, <b>~2 KB</b>，1 channel = latency-bound</td>
+    </tr>
+
+    <!-- finish_shuffle: 2 NCCL kernels -->
+    <tr style="background: #f7faff;">
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;" rowspan="2">2</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;" rowspan="2"><code>finish_shuffle</code><br><span style="font-size: 11px; color: #666;">→ <code>pad_and_allgather_batch</code> 内 KJT lengths AllGather + KJT values AllGatherV，2 个 kernel 串行</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;" rowspan="2">memcpy</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;" rowspan="2">24</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_AllGather_RING_LL</code></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">KJT lengths：fixed-size int64×(LBS×#feature) → 全局 [256×#feat]，<b>~10 KB</b>，1 channel</td>
+    </tr>
+    <tr style="background: #f7faff;">
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_AllGatherV_RING_LL</code></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">KJT values：variable-size int64 sum-of-seqlen，<b>~MB</b>，24 channel = bandwidth-bound</td>
+    </tr>
+
+    <!-- start_input_dist -->
+    <tr>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">3</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>start_input_dist</code><br><span style="font-size: 11px; color: #666;">→ TorchRec splits a2a，2 pipelined module 融合成 1 个 grouped call</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">data_dist</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">23</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_SendRecv</code></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">splits header (lengths-of-lengths) — int32×8×#feat，<b>~hundreds B</b>；8 channel = 8-rank a2a fanout</td>
+    </tr>
+
+    <!-- wait_input_dist: 2 NCCL kernels = KJT lengths a2a + KJT values a2a (single sharded module) -->
+    <tr style="background: #f7faff;">
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;" rowspan="2">4</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;" rowspan="2"><code>wait_input_dist</code><br><span style="font-size: 11px; color: #666;">→ <code>splits_awaitable.wait()</code> 在 sharded <code>EmbeddingCollection</code>（仅 1 个 model-parallel 模块）上触发底层 <code>KJTAllToAllTensorsAwaitable</code>，它把 KJT 的 <strong>lengths</strong> 和 <strong>values</strong> 拆成 <strong>2 个独立的</strong> a2a NCCL group，串行发射</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;" rowspan="2">data_dist</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;" rowspan="2">23</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_SendRecv</code> (KJT <b>lengths</b> a2a)</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">每条样本在每个 feature 上的 token 数 — int64×#feat×LBS 的拆分，<b>~tens of KB</b>，按 8-rank a2a fanout</td>
+    </tr>
+    <tr style="background: #f7faff;">
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_SendRecv</code> (KJT <b>values</b> a2a)</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">实际的 token id（int64 sum-of-seqlen × #feat），按 feature shard 重分布到 owner rank，<b>~MB</b></td>
+    </tr>
+
+    <!-- global_tokens -->
+    <tr>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">5</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>global_tokens_allreduce</code></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">default</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">7</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_AllReduce_Sum_f32_RING_LL</code></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">scalar int64 token count → 1 channel，<b>~8 B</b>（kernel cast 成 f32 SUM），latency-bound</td>
+    </tr>
+
+    <!-- compute_output_dist -->
+    <tr>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">6</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>compute_output_dist</code><br><span style="font-size: 11px; color: #666;">→ embedding output a2a (forward)</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">default<br><span style="font-size: 11px; color: #c62828;">⚠ 但 NCCL kernel 落到 str-23（TorchRec 用自己的 output_dist comm stream 跑 a2a）</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">23</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_SendRecv</code> (grouped, 2 modules)</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">embedding output: <code>(global_batch×Σseq) × 128 × 4B</code> (FP32 qcomm)，<b>~tens of MB</b>，32 channel = 跑满最大并行</td>
+    </tr>
+
+    <!-- backward -->
+    <tr>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">7</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>backward</code><br><span style="font-size: 11px; color: #666;">→ <code>.backward()</code> 内 autograd 触发<strong>仅</strong>有 embedding output dist 的 a2a 反向；<strong>不</strong>含任何 AllReduce — gradient AllReduce 全部在 <code>finalize_model_grads</code> 里发射</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">default<br><span style="font-size: 11px; color: #c62828;">⚠ NCCL kernel 落到 str-23（与 #6 同 comm stream），并且<strong>由 <code>pt_autograd_0</code> 线程</strong> launch（不是 engine 的 python 主线程），所以<strong>不</strong>被 <code>[engine] backward</code> NVTX 包裹</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;">23</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_SendRecv</code><br><span style="font-size: 11px; color: #666;">(emb output dist a2a backward, launched from pt_autograd_0)</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">embedding output 的反向 a2a → <b>~tens of MB</b>，p99 ~26 ms 是 critical-path gate 后被前序 NCCL 阻塞所致（疑似根因）</td>
+    </tr>
+
+    <!-- finalize_model_grads: 2 NCCL kernels -->
+    <tr style="background: #f7faff;">
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;" rowspan="2">8</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;" rowspan="2"><code>finalize_model_grads</code><br><span style="font-size: 11px; color: #666;">→ <strong>所有</strong> gradient AllReduce 都在这里发射（HSTU benchmark <code>overlap_grad_reduce=False</code>，backward 不嵌入 grad bucket AR）；本 benchmark 配置下实测 2 个 AllReduce/iter（Megatron 把 dense param grads 切成 2 个 bucket 串行发射）</span></td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;" rowspan="2">default</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5; text-align: center;" rowspan="2">7</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_AllReduce_Sum_f32_RING_LL</code> (gradient bucket 1)</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">HSTU dense param grads bucket 1，<b>~tens of MB</b>，9 channel</td>
+    </tr>
+    <tr style="background: #f7faff;">
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;"><code>ncclDevKernel_AllReduce_Sum_f32_RING_LL</code> (gradient bucket 2)</td>
+      <td style="padding: 3px 6px; border: 1px solid #d6e2f5;">HSTU dense param grads bucket 2，<b>~MB</b>，9 channel</td>
+    </tr>
+  </table>
+  <div style="margin-top: 10px; font-size: 11.5px; color: #555;">
+    <strong>采集方法</strong>：rank0 sqlite (<code>nsys export</code>) 上跑 SQL 把每个 <code>[engine] &lt;task&gt;</code> NVTX 范围
+    与<code>CUPTI_ACTIVITY_KIND_RUNTIME → CUPTI_ACTIVITY_KIND_KERNEL</code>（按 correlationId 配对）做时间包含连接，
+    再按 <code>shortName LIKE 'ncclDevKernel%'</code> 分组得到每 task 内的 NCCL kernel 列表 + GPU duration + gridX (= NCCL channels)。
+    backward 那一行的 SendRecv 因为是从 <code>pt_autograd_0</code> 线程 launch 的，<code>[engine] backward</code> 包不到 — 我们改用按 thread name 过滤来归因。<br>
+    <strong>关键观察</strong>：&nbsp;
+    (a) 每 iter 共 <b>11 个 NCCL kernel</b>（1 AG + 1 AG + 1 AGV + 1 + 2 SendRecv + 1 AR + 1 SendRecv + 1 SendRecv + 2 AR），跨 3 条不同的 GPU stream（7 / 23 / 24）；
+    (b) <code>compute_output_dist</code> 和 backward 的 emb a2a 反向都跑在 str-23（TorchRec 的 output_dist comm stream），不是 default；
+    (c) HSTU benchmark 没开 <code>overlap_grad_reduce</code>，所以 backward 内只剩 emb a2a 反向 1 个 SendRecv，dense param AllReduce 全部 defer 到 finalize_model_grads；
+    (d) <code>start_input_dist</code> kernel duration 长 = NCCL ticket 等待前序 collective（<code>_NcclOrderedLock</code> 串行链 + 跨 rank 同步等待），不是数据量本身大。
+  </div>
+</div>
+
 <!-- ========================================================== -->
 <script>
 // 14 tasks (HSTU prefetch variant, post-2026-05-08 task graph:
