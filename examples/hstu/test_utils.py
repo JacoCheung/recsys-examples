@@ -39,6 +39,18 @@ from torchrec.distributed.composable.table_batched_embedding_slice import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+
+def reset_dynamicemb_cache_states(module: torch.nn.Module) -> None:
+    from commons.checkpoint import get_unwrapped_module
+    from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+
+    unwrapped = get_unwrapped_module(module)
+    for _, _, collection in find_sharded_modules(unwrapped, ""):
+        for dynamicemb_module in get_dynamic_emb_module(collection):
+            if hasattr(dynamicemb_module, "reset_cache_states"):
+                dynamicemb_module.reset_cache_states()
+
+
 debug_module_path_to_tpN_module_path = {
     "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
     "_output_layernorm_bias": "_output_ln_dropout_mul.bias",
@@ -526,7 +538,7 @@ def create_model(
                 table_name="context",
                 vocab_size=contextual_emb_size,
                 dim=embdim,
-                sharding_type="model_parallel",
+                sharding_type="data_parallel",
             )
         )
 
@@ -570,19 +582,19 @@ def create_model(
     )
     from dynamicemb import DynamicEmbScoreStrategy
 
+    dynamicemb_options_dict = {}
+    if use_dynamic_emb:
+        dynamicemb_options_dict["item"] = DynamicEmbTableOptions(
+            global_hbm_for_values=1024 * 1024 * 32,  # 32M HBM (maybe cached)
+            score_strategy=DynamicEmbScoreStrategy.STEP,
+            caching=pipeline_type
+            == "prefetch",  # when prefetch is enabled, we must enable caching
+        )
+
     model_train, dense_optimizer = make_optimizer_and_shard(
         model_train,
         config=hstu_config,
-        dynamicemb_options_dict={
-            "item": DynamicEmbTableOptions(
-                global_hbm_for_values=1024 * 1024 * 8,  # 4M HBM (maybe cached)
-                score_strategy=DynamicEmbScoreStrategy.STEP,
-                caching=pipeline_type
-                == "prefetch",  # when prefetch is enabled, we must enable caching
-            ),
-        }
-        if use_dynamic_emb
-        else {},
+        dynamicemb_options_dict=dynamicemb_options_dict,
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
         pipeline_type=pipeline_type,

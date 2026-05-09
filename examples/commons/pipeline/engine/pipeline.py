@@ -126,7 +126,7 @@ class SchedulablePipeline(Generic[In, Out]):
         self._prefill_done: bool = False
 
         # Bootstrap counter: how many batches have been seeded via
-        # ``seed_first_batch`` (pre-populated into ring slots BEFORE
+        # ``_seed_first_batch`` (pre-populated into ring slots BEFORE
         # any progress() call). Engine will NOT pull from the
         # dataloader for the next ``_seeded`` iters — the slot already
         # has its batch_cpu set and tasks should skip any work that's
@@ -138,17 +138,20 @@ class SchedulablePipeline(Generic[In, Out]):
             task.init(self._ctx)
 
     # ------------------------------------------------------------------
-    # Bootstrap pre-population API (added for Problem #2 bootstrap fix)
+    # Internal bootstrap pre-population (Problem #2 bootstrap fix)
     # ------------------------------------------------------------------
+    #
+    # Underscore-prefixed: this is an internal hook used by adapter
+    # layers (e.g. HSTUPipeline) that need to run framework-setup
+    # work on a real batch before delegating to the engine. End users
+    # of SchedulablePipeline should NOT call this directly — same
+    # privacy convention as torchrec's _pipeline_model /
+    # _init_pipelined_modules.
 
-    def seed_first_batch(self, slot_contents: dict) -> None:
+    def _seed_first_batch(self, slot_contents: dict) -> None:
         """Pre-populate ring.at(max_offset) with the given slot values
         before the first ``progress()`` call, and mark one batch as
-        pulled. Used by adapters (e.g. HSTUPipeline) that need to run
-        framework-setup work on a real batch (FX tracing, monkey-patch
-        installation, input_dist bootstrap) BEFORE the engine takes
-        over, and want that batch to flow through the ring normally
-        instead of being dropped.
+        pulled.
 
         The engine will:
           1. Skip the ``next(batch_iter)`` call for the first iter
@@ -159,27 +162,25 @@ class SchedulablePipeline(Generic[In, Out]):
         Tasks that rely on slot contents being set by earlier pipeline
         stages (e.g. ``h2d`` sets ``batch_gpu`` from ``batch_cpu``)
         should be made **idempotent** by checking for prior slot values
-        in their body. Example: ``if ctx.slots.get("batch_gpu") is not
-        None: return``.
+        in their body.
 
         Parameters
         ----------
         slot_contents : dict
             Values to seed into ``ring.at(max_offset)``'s slot store.
-            Must include ``"batch_cpu"`` (or whatever your engine's
-            auto-pull slot is) to satisfy the §4.8 mask semantics;
+            Must include ``"batch_cpu"`` to satisfy the §4.8 mask;
             typically also includes ``batch_gpu``, per-batch context
             objects, and anything downstream tasks read.
         """
         if self._pulled > 0 or self._internal_iter > 0:
             raise RuntimeError(
-                "seed_first_batch() must be called before progress(); "
+                "_seed_first_batch() must be called before progress(); "
                 f"pipeline already ran (pulled={self._pulled}, "
                 f"internal_iter={self._internal_iter})."
             )
         if "batch_cpu" not in slot_contents:
             raise ValueError(
-                "seed_first_batch requires 'batch_cpu' in slot_contents "
+                "_seed_first_batch requires 'batch_cpu' in slot_contents "
                 "(matches the engine's auto-pull slot name)."
             )
         target_slot = self._ring.at(self._max_offset)
@@ -221,7 +222,7 @@ class SchedulablePipeline(Generic[In, Out]):
         # still has batches. Populates `batch_cpu` at
         # batch_offset=max_offset per SPEC §4.7 protocol.
         #
-        # Exception: if `seed_first_batch` was called, the first
+        # Exception: if `_seed_first_batch` was called, the first
         # `_seeded` iters skip the pull — the slot is already populated
         # and `_pulled` has already been bumped.
         if self._seeded > 0:

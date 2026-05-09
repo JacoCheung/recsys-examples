@@ -71,14 +71,25 @@ class PipelineState:
     def create_torchrec_ctx(self):
         """Factory for a fresh per-batch torchrec context.
 
-        Uses the context_type chosen by the pipeline variant (plain
-        ``TrainPipelineContext`` for non-prefetch,
-        ``PrefetchTrainPipelineContext`` for prefetch)."""
+        **v1 only** — the v0 (single-shared-context, deprecated) branch
+        in `commons/pipeline/utils.py::_start_data_dist` is forbidden
+        in HSTUPipeline. v0 was a legacy compat code path that mixes
+        cross-batch state in one context object; HSTUPipeline's engine
+        treats every batch as having its own context (per-batch slot
+        in the BatchRing). Mixing the two semantic models was the root
+        cause of the ``prefetch + dynamic_emb`` xfail (see
+        tasks/followups.md).
+        """
         if self.torchrec_context_type is None:
             from commons.pipeline.utils import TrainPipelineContext
 
             self.torchrec_context_type = TrainPipelineContext
         ctx = self.torchrec_context_type(index=self.next_ctx_index, version=1)
+        # Hard assert: prevent any subclass / future refactor from
+        # silently switching to v0.
+        assert (
+            getattr(ctx, "version", None) == 1
+        ), f"HSTUPipeline forbids v0 contexts; got version={ctx.version!r}"
         self.next_ctx_index += 1
         return ctx
 
@@ -107,12 +118,21 @@ def make_h2d_task(
         raw = ctx.slots.get("batch_cpu", None)
         if raw is None:
             return  # drain: no new batch
-        # Idempotent: if seed_first_batch already pre-populated
-        # batch_gpu + torchrec_ctx for this slot, skip. This lets
-        # HSTUPipeline bootstrap use a real per-batch ctx and have
-        # the peek batch flow through the engine naturally.
-        if ctx.slots.get("batch_gpu", None) is not None:
-            return
+        # Idempotent: if _seed_first_batch already pre-populated
+        # BOTH batch_gpu AND torchrec_ctx, skip. Partial seed
+        # (one of two set) is rejected — silent corruption otherwise
+        # because downstream tasks would read None for the missing
+        # field.
+        seeded_batch_gpu = ctx.slots.get("batch_gpu", None) is not None
+        seeded_ctx = ctx.slots.get("torchrec_ctx", None) is not None
+        if seeded_batch_gpu and seeded_ctx:
+            return  # full seed — skip
+        if seeded_batch_gpu or seeded_ctx:
+            raise RuntimeError(
+                "h2d task: partial seed detected — exactly one of "
+                "{batch_gpu, torchrec_ctx} is pre-populated. Seed "
+                "either both or neither via _seed_first_batch."
+            )
         with nvtx.annotate("## h2d ##"):
             batch_gpu = _to_device(raw, state.device, non_blocking=True)
         ctx.slots.set("batch_gpu", batch_gpu)
@@ -204,7 +224,7 @@ def make_start_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task:
         if batch_gpu is None:
             ctx.slots.set("shuffle_handle", None)
             return
-        # Idempotent: if seed_first_batch already provided a shuffled
+        # Idempotent: if _seed_first_batch already provided a shuffled
         # result (shuffled_batch slot set), the peek batch's shuffle
         # is already done. Skip re-issuing the KK AllGather.
         if ctx.slots.get("shuffled_batch", None) is not None:
@@ -239,7 +259,7 @@ def make_finish_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task
         batch_gpu = ctx.slots.get("batch_gpu", None)
         if batch_gpu is None:
             return
-        # Idempotent: if seed_first_batch pre-populated shuffled_batch,
+        # Idempotent: if _seed_first_batch pre-populated shuffled_batch,
         # this iter's shuffle work has already been done externally.
         if ctx.slots.get("shuffled_batch", None) is not None:
             return
@@ -284,7 +304,7 @@ def make_start_input_dist_task(state: PipelineState, *, batch_offset: int) -> Ta
         if shuffled is None or torchrec_ctx is None:
             return
         # Idempotent: if the ctx already has an in-flight splits
-        # request (populated by HSTU bootstrap via seed_first_batch),
+        # request (populated by HSTU bootstrap via _seed_first_batch),
         # skip — re-running _start_data_dist would issue a second
         # collective AND leak dynamicemb cache reservations.
         if (
@@ -483,7 +503,15 @@ def make_nccl_safety_barrier_task(state: PipelineState) -> Task:
 # ----------------------------------------------------------------------
 
 
-def make_backward_task(state: PipelineState) -> Task:
+def make_backward_task(state: PipelineState, *, depends_on: tuple = ()) -> Task:
+    """Build the backward task.
+
+    `depends_on` is forwarded to ``Task.from_fn`` so callers can add
+    cross-stream sync edges (e.g. for the prefetch variant, backward
+    should depend on ``prefetch_embeddings`` to emit a
+    ``wait_stream(prefetch)`` on the default stream — matches legacy
+    JaggedMegatronPrefetch progress at train_pipeline.py:996-997).
+    """
     from megatron.core import parallel_state
 
     def _fn(ctx):
@@ -512,6 +540,7 @@ def make_backward_task(state: PipelineState) -> Task:
         batch_offset=0,
         reads=(DataSlot("losses", 0), DataSlot("global_tokens", 0)),
         writes=(DataSlot("local_loss_sum", 0),),
+        depends_on=depends_on,
         # DDP backward AllReduce fires inside .backward() — mark NCCL.
         nccl=True,
     )

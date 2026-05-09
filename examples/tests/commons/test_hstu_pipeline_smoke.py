@@ -273,6 +273,61 @@ def test_legacy_depth_equals_one_has_three_batches() -> None:
     ), "Prefetch variant must also be 3 in-flight to fit dynamicemb cache"
 
 
+def test_no_v0_context_references_in_hstu_pipeline() -> None:
+    """HSTU pipeline is v1-only (per-batch contexts). No source code
+    in hstu_pipeline/ may reference the v0 legacy branch — catches
+    regressions where someone copy-pastes legacy patterns without
+    noticing they're v0-dependent.
+
+    Skip matches that are inside a COMMENT or DOCSTRING — those are
+    explanatory references, not code paths. Match only bare
+    ``version=0`` / ``version_0`` tokens in executable positions."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    pkg = root / "examples" / "commons" / "pipeline" / "hstu_pipeline"
+    offenders: list = []
+    # Executable uses of version=0 would appear as
+    # ``version=0`` or ``.version = 0`` without leading ``#``.
+    pattern = re.compile(r"(?<!#\s)\bversion\s*=\s*0\b")
+    for py in pkg.rglob("*.py"):
+        text = py.read_text()
+        for lineno, line in enumerate(text.splitlines(), 1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue  # comment line
+            if pattern.search(line):
+                offenders.append(f"{py.name}:{lineno}: {stripped}")
+    assert (
+        not offenders
+    ), "hstu_pipeline must be v1-only; found v0 references:\n  " + "\n  ".join(
+        offenders
+    )
+
+
+def test_create_torchrec_ctx_rejects_v0() -> None:
+    """Runtime regression guard: if a future subclass overrides
+    torchrec_context_type to return a version=0 ctx, the assertion
+    in create_torchrec_ctx fires."""
+    import torch
+    from commons.pipeline.hstu_pipeline.tasks import PipelineState
+
+    class _V0Ctx:
+        def __init__(self, index=0, version=1):
+            self.index = index
+            self.version = 0  # malicious: ignore kwarg, hardcode v0
+
+    state = PipelineState(
+        model=torch.nn.Linear(4, 4),
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+        torchrec_context_type=_V0Ctx,
+    )
+    with pytest.raises(AssertionError, match="forbids v0"):
+        state.create_torchrec_ctx()
+
+
 def test_default_thread_map_covers_every_task_name() -> None:
     """HSTU_DEFAULT_THREAD_MAP must map every task name the pipeline
     produces. Tasks without an entry fall through to the engine's
