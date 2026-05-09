@@ -243,3 +243,67 @@ class TaskContext(Generic[In]):
     @property
     def stream_pool(self):
         return self._stream_pool
+
+    # ------------------------------------------------------------------
+    # V7 — explicit Event escape hatch (followups.md Problem #1, V7)
+    # ------------------------------------------------------------------
+    #
+    # Most cross-stream sync is auto-inferred by the engine from the
+    # schedule's slot dependencies (see ``deps.infer_cross_stream_event_deps``
+    # + ``executor._apply_cross_stream_waits``). The escape hatch is for
+    # the rare case where a task body needs to publish a partial-progress
+    # event from inside its own work — e.g. the producer wants to signal
+    # downstream consumers as soon as a kernel chain reaches a checkpoint,
+    # before the task body finishes — or a consumer needs to wait on a
+    # specific named event whose producer isn't a separate task.
+    #
+    # Naming collision with the engine's auto-recorded
+    # producer-completion events (keyed by ``task.name``) is avoided by
+    # prefixing user-supplied names with ``"user:"``. A user task that
+    # picks a label colliding with another task's name still ends up in
+    # a private namespace.
+
+    _USER_EVENT_PREFIX = "user:"
+
+    def record_event(self, name: str, *, batch_offset: int = 0) -> Any:
+        """Record a torch.cuda.Event on the current task's CUDA stream
+        and stash it in the slot at ``batch_offset`` (default: 0, i.e.
+        the same slot the active task writes to).
+
+        The Event object is reused across iterations as the slot rotates
+        through the ring (matching engine-level event recycling).
+        Returns the event object so the caller can hold a reference if
+        needed.
+
+        Raises ``ImportError`` if torch is unavailable (CPU-only test
+        host) — the escape hatch is GPU-only by definition.
+        """
+        if not name:
+            raise ValueError("record_event(name) requires a non-empty name")
+        slot = self._ring.at(batch_offset)
+        full_name = self._USER_EVENT_PREFIX + name
+        event = slot.get_event(full_name)
+        if event is None:
+            import torch  # local import to keep this module framework-agnostic
+
+            event = torch.cuda.Event()
+            slot.set_event(full_name, event)
+        event.record()
+        return event
+
+    def wait_event(self, name: str, *, batch_offset: int = 0) -> bool:
+        """Make the current CUDA stream wait on the user-recorded event
+        ``name`` stored on the slot at ``batch_offset``. Returns True if
+        a wait was actually issued, False if no producer has recorded
+        the event yet (typical first-iter case — caller can fall back
+        to a coarser ``wait_stream`` or ignore).
+        """
+        if not name:
+            raise ValueError("wait_event(name) requires a non-empty name")
+        slot = self._ring.at(batch_offset)
+        full_name = self._USER_EVENT_PREFIX + name
+        event = slot.get_event(full_name)
+        if event is None:
+            return False
+        event.wait()
+        return True
