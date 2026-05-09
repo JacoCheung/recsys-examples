@@ -182,11 +182,26 @@ class HSTUPipeline:
             assert_nan_loss=assert_nan_loss,
         )
 
+        # Track whether the user supplied a custom forward so that
+        # attach(new_model) only re-points model_fwd when it shadows
+        # the bare model. Custom forwards intentionally diverge from
+        # state.model and must survive a model swap.
+        self._has_custom_model_fwd: bool = custom_model_fwd is not None
+
         # Lazily constructed on first progress() call.
         self._pipe: Optional[SchedulablePipeline] = None
         self._original_forwards: list = []
         self._original_kjt_dist_forwards: list = []
         self._model_attached: bool = True
+
+    @property
+    def _model(self) -> torch.nn.Module:
+        """Match legacy ``self._model`` so existing training loops
+        (e.g. ``train_with_pipeline``) can call ``pipeline._model.train()``
+        unchanged. The underlying model lives in ``self._state.model``;
+        ``attach()``/``detach()`` keep it in sync.
+        """
+        return self._state.model
 
     @staticmethod
     def _is_identity(shuffler: Any) -> bool:
@@ -525,6 +540,12 @@ class HSTUPipeline:
         """
         if model is not None:
             self._state.model = model
+            # Codex HIGH (2026-04-26): without this line, the forward
+            # task would still call the construction-time model. Only
+            # mirror when model_fwd was the default (== state.model);
+            # custom forwards are intentional and must survive attach.
+            if not self._has_custom_model_fwd:
+                self._state.model_fwd = model
         self._model_attached = True
 
     def detach(self) -> torch.nn.Module:

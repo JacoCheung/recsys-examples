@@ -171,21 +171,59 @@ def main():
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
-    # Map pipeline type string to factory registered name
-    pipeline_type_map = {
-        "prefetch": "jagged_prefetch_sparse_dist",
-        "native": "jagged_sparse_dist",
-        "none": "jagged_none",
-    }
-    pipeline_name = pipeline_type_map.get(trainer_args.pipeline_type, "jagged_none")
+    # Pipeline backend: "legacy" (default) uses TrainPipelineFactory's
+    # JaggedMegatron* classes; "new" uses HSTUPipeline (schedulable
+    # engine). Switched via env var RECSYS_PIPELINE_BACKEND so the gin
+    # config + CLI surface stay unchanged.
+    pipeline_backend = os.environ.get("RECSYS_PIPELINE_BACKEND", "legacy").lower()
+    if pipeline_backend not in ("legacy", "new"):
+        raise ValueError(
+            f"RECSYS_PIPELINE_BACKEND must be 'legacy' or 'new', "
+            f"got {pipeline_backend!r}"
+        )
 
-    # Create pipeline using factory
-    pipeline = TrainPipelineFactory.create(
-        pipeline_name,
-        model=model_train,
-        optimizer=dense_optimizer,
-        device=torch.device("cuda", torch.cuda.current_device()),
-        batch_shuffler=batch_shuffler,
+    if pipeline_backend == "new" and trainer_args.pipeline_type == "none":
+        # The new HSTU adapter only wraps the sparse-dist variants.
+        # Fall back to legacy for the non-pipelined "none" type instead
+        # of silently changing semantics.
+        print_rank_0(
+            "RECSYS_PIPELINE_BACKEND=new but pipeline_type=none; "
+            "falling back to legacy non-pipelined path."
+        )
+        pipeline_backend = "legacy"
+
+    if pipeline_backend == "legacy":
+        pipeline_type_map = {
+            "prefetch": "jagged_prefetch_sparse_dist",
+            "native": "jagged_sparse_dist",
+            "none": "jagged_none",
+        }
+        pipeline_name = pipeline_type_map.get(trainer_args.pipeline_type, "jagged_none")
+        pipeline = TrainPipelineFactory.create(
+            pipeline_name,
+            model=model_train,
+            optimizer=dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            batch_shuffler=batch_shuffler,
+        )
+    else:
+        from commons.pipeline.hstu_pipeline import HSTUPipelineFactory
+
+        pipeline_type_map = {
+            "prefetch": "hstu_prefetch_sparse_dist",
+            "native": "hstu_sparse_dist",
+        }
+        pipeline_name = pipeline_type_map[trainer_args.pipeline_type]
+        pipeline = HSTUPipelineFactory.create(
+            pipeline_name,
+            model=model_train,
+            optimizer=dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            batch_shuffler=batch_shuffler,
+        )
+    print_rank_0(
+        f"[pipeline] backend={pipeline_backend} "
+        f"name={pipeline_name} type={trainer_args.pipeline_type}"
     )
 
     train_with_pipeline(
