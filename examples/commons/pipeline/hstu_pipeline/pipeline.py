@@ -14,8 +14,19 @@
 # limitations under the License.
 
 """HSTUPipeline — adapter that drives the Problem #1 SchedulablePipeline
-engine using torchrec's ``_rewrite_model`` + ``PipelinedForward`` for
-the HSTU training scenario.
+engine using torchrec's ``_rewrite_model`` + ``HSTUPipelinedForward``
+(see ``embedding_split``) for the HSTU training scenario.
+
+Unlike TorchRec's stock ``PipelinedForward`` / ``PrefetchPipelinedForward``
+which inline ``compute_and_output_dist`` (local lookup + cross-rank
+output a2a NCCL) inside ``__call__``, this engine breaks that work
+out into a dedicated ``compute_output_dist`` task. The task runs on
+the **default stream** (same as forward / backward) so the resulting
+awaitable is FIFO-ordered with forward's consumer without any
+cross-stream wait_event; cross-rank NCCL submission ordering is
+maintained by the engine's ``_NcclOrderedLock`` ticket. The
+``HSTUPipelinedForward.__call__`` itself becomes a thin pull from
+``embedding_a2a_requests`` (no NCCL submitted from inside forward).
 
 Lazy initialization: ``_rewrite_model`` needs a peek at the first
 batch for FX tracing. We defer engine construction to the first
@@ -40,12 +51,12 @@ from commons.pipeline.engine import (
 from .tasks import (
     PipelineState,
     make_backward_task,
+    make_compute_output_dist_task,
     make_finalize_grads_task,
     make_finish_shuffle_task,
     make_forward_task,
     make_global_tokens_task,
     make_h2d_task,
-    make_nccl_safety_barrier_task,
     make_optimizer_step_task,
     make_prefetch_task,
     make_start_input_dist_task,
@@ -95,7 +106,7 @@ HSTU_DEFAULT_THREAD_MAP: dict = {
     "prefetch_embeddings": "compute",
     "zero_grad": "compute",
     "global_tokens_allreduce": "compute",
-    "nccl_safety_barrier": "compute",
+    "compute_output_dist": "compute",
     "forward": "compute",
     "backward": "compute",
     "finalize_model_grads": "compute",
@@ -157,7 +168,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "wait_input_dist": "compute",
         "zero_grad": "compute",
         "global_tokens_allreduce": "compute",
-        "nccl_safety_barrier": "compute",
+        "compute_output_dist": "compute",
         "forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
@@ -173,7 +184,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "prefetch_embeddings": "compute",
         "zero_grad": "compute",
         "global_tokens_allreduce": "compute",
-        "nccl_safety_barrier": "compute",
+        "compute_output_dist": "compute",
         "forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
@@ -189,7 +200,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "prefetch_embeddings": "prefetch",
         "zero_grad": "compute",
         "global_tokens_allreduce": "compute",
-        "nccl_safety_barrier": "compute",
+        "compute_output_dist": "compute",
         "forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
@@ -433,14 +444,57 @@ class HSTUPipeline:
                     "prefetch_embeddings", prefetch_lookahead
                 )
 
+        # ── Critical-path gate (full_split_d6 experiment) ──
+        # Push every la>0 task ("non-critical": h2d / start_shuffle /
+        # finish_shuffle / start_input_dist / wait_input_dist /
+        # prefetch_embeddings) behind the la=0 critical chain
+        # (zero_grad → global_tokens_allreduce → compute_output_dist
+        # → forward → backward → ...) by giving them
+        # ``same_progress_sync=("compute_output_dist",)``.
+        #
+        # NCCL ticket order after this gate (topo序):
+        #   t0 global_tokens_allreduce  (compute thread, root)
+        #   t1 compute_output_dist      (compute thread, root,
+        #                                tie-break by decl after t0)
+        #   t2 start_shuffle            (gated, fires after t1)
+        #   t3 finish_shuffle
+        #   t4 start_input_dist
+        #   t5 wait_input_dist
+        #   t6 backward (DDP)
+        #   t7 finalize_model_grads
+        #
+        # Deadlock-free: compute_output_dist (t1) only waits for t0
+        # (global_tokens_allreduce, same compute thread, no external
+        # dep) → fires unconditionally → release t1 + set completion
+        # → cascade unblocks. No circular wait between gates and
+        # _NcclOrderedLock.
+        critical_gate: tuple = ("compute_output_dist",)
         tasks = [
-            make_h2d_task(self._state, lookahead=h2d_lookahead),
-            make_start_shuffle_task(self._state, lookahead=start_shuffle_lookahead),
-            make_finish_shuffle_task(self._state, lookahead=finish_shuffle_lookahead),
-            make_start_input_dist_task(
-                self._state, lookahead=start_input_dist_lookahead
+            make_h2d_task(
+                self._state,
+                lookahead=h2d_lookahead,
+                same_progress_sync=critical_gate,
             ),
-            make_wait_input_dist_task(self._state, lookahead=wait_input_dist_lookahead),
+            make_start_shuffle_task(
+                self._state,
+                lookahead=start_shuffle_lookahead,
+                same_progress_sync=critical_gate,
+            ),
+            make_finish_shuffle_task(
+                self._state,
+                lookahead=finish_shuffle_lookahead,
+                same_progress_sync=critical_gate,
+            ),
+            make_start_input_dist_task(
+                self._state,
+                lookahead=start_input_dist_lookahead,
+                same_progress_sync=critical_gate,
+            ),
+            make_wait_input_dist_task(
+                self._state,
+                lookahead=wait_input_dist_lookahead,
+                same_progress_sync=critical_gate,
+            ),
         ]
         # Note: for the prefetch variant, prefetch_embeddings is
         # declared AFTER forward (not before). Same-iter ordering
@@ -454,12 +508,34 @@ class HSTUPipeline:
             [
                 make_zero_grad_task(self._state),
                 make_global_tokens_task(self._state),
-                make_nccl_safety_barrier_task(self._state),
+            ]
+        )
+        # Prefetch (optional) must run before compute_output_dist so
+        # the latter can read ``module_input_post_prefetch`` instead of
+        # falling back to ``input_dist_tensors_requests.wait()``.
+        if self._prefetch:
+            tasks.append(
+                make_prefetch_task(
+                    self._state,
+                    lookahead=prefetch_lookahead,
+                    same_progress_sync=critical_gate,
+                )
+            )
+        # compute_output_dist runs ``module.compute_and_output_dist``
+        # for each pipelined module (local lookup + cross-rank output
+        # ``all_to_all`` NCCL on data_dist stream). The awaitable is
+        # stashed into ``torchrec_ctx.embedding_a2a_requests`` for the
+        # forward task to pick up. forward.depends_on=("compute_output_dist",)
+        # gives the same-la=0 topo edge that orders the two tasks.
+        # nccl_safety_barrier is folded into forward's body —
+        # default.wait_stream(memcpy) now runs at the start of forward
+        # instead of as a standalone task.
+        tasks.extend(
+            [
+                make_compute_output_dist_task(self._state),
                 make_forward_task(self._state, prefetch=self._prefetch),
             ]
         )
-        if self._prefetch:
-            tasks.append(make_prefetch_task(self._state, lookahead=prefetch_lookahead))
         # backward dependency edges:
         #   - depends_on=("zero_grad",) — same-batch logical edge:
         #     backward processing batch K writes model.grad which
@@ -548,28 +624,42 @@ class HSTUPipeline:
         ``start_sparse_data_dist`` follows
         (``train_pipeline.py:440 with self._stream_context(self._data_dist_stream):``).
         """
-        from commons.pipeline.utils import (
-            PipelinedForward,
-            PrefetchPipelinedForward,
-            PrefetchTrainPipelineContext,
-            TrainPipelineContext,
-            _override_input_dist_forwards,
-        )
+        from commons.pipeline.utils import _override_input_dist_forwards
         from commons.pipeline.utils import _rewrite_model as torchrec_rewrite_model
         from commons.pipeline.utils import _start_data_dist
 
-        # Seed context type on state for per-batch ctx factory.
-        self._state.torchrec_context_type = (
-            PrefetchTrainPipelineContext if self._prefetch else TrainPipelineContext
+        from .embedding_split import (
+            HSTUPipelinedForward,
+            HSTUPrefetchPipelinedForward,
+            HSTUTrainPipelineContext,
         )
+
+        # Seed context type on state for per-batch ctx factory.
+        # HSTUTrainPipelineContext extends PrefetchTrainPipelineContext
+        # so it has every field both prefetch and non-prefetch paths
+        # touch (input_dist_*, module_contexts, module_input_post_prefetch),
+        # plus ``embedding_a2a_requests`` for the new
+        # ``compute_output_dist`` task to feed forward.
+        self._state.torchrec_context_type = HSTUTrainPipelineContext
+        # Tell the compute_output_dist factory which side of the dict
+        # population to read from.
+        self._state.uses_prefetch = self._prefetch
 
         # Real per-batch context for the peek batch (will be seeded
         # into the engine ring). Use state.create_torchrec_ctx so the
         # index counter stays consistent with subsequent batches.
         peek_ctx = self._state.create_torchrec_ctx()
 
+        # Replace TorchRec's PipelinedForward / PrefetchPipelinedForward
+        # (both call ``module.compute_and_output_dist`` inline → NCCL
+        # serialized on the default stream during forward) with a thin
+        # wrapper that only reads the awaitable populated by the new
+        # ``compute_output_dist`` engine task. Two variants because
+        # TorchRec's ``_prefetch_embeddings`` helper type-asserts
+        # ``isinstance(forward, PrefetchPipelinedForward)`` specifically
+        # — the prefetch flavor has to subclass that exact wrapper.
         pipelined_forward_type = (
-            PrefetchPipelinedForward if self._prefetch else PipelinedForward
+            HSTUPrefetchPipelinedForward if self._prefetch else HSTUPipelinedForward
         )
 
         (
