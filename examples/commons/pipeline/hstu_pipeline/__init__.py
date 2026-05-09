@@ -24,6 +24,17 @@ Public API:
 """
 
 from .factory import HSTUPipelineFactory
-from .pipeline import HSTUPipeline
+from .pipeline import (
+    HSTU_DEFAULT_THREAD_MAP,
+    HSTU_THREAD_MAP_PRESETS,
+    HSTUPipeline,
+    resolve_hstu_thread_map_variant,
+)
 
-__all__ = ["HSTUPipeline", "HSTUPipelineFactory"]
+__all__ = [
+    "HSTUPipeline",
+    "HSTUPipelineFactory",
+    "HSTU_DEFAULT_THREAD_MAP",
+    "HSTU_THREAD_MAP_PRESETS",
+    "resolve_hstu_thread_map_variant",
+]

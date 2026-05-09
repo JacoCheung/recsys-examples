@@ -197,3 +197,82 @@ def test_hstu_pipeline_matches_none_pipeline(
 
     hstu_pipeline.shutdown()
     init.destroy_global_state()
+
+
+def test_hstu_pipeline_prefetch_with_balanced_shuffler_varying_batches() -> None:
+    """Regression: prefetch=True + non-identity (balanced) shuffler +
+    varying batch sizes must not crash in forward.
+
+    Bug surface: the bootstrap path in ``HSTUPipeline._ensure_pipe``
+    used to call ``_start_data_dist`` on the UNSHUFFLED peek batch
+    while the engine's first iteration would later run the shuffler
+    and produce a *different* ``shuffled_batch``. ``start_input_dist``
+    then idempotent-skipped (ctx already had bootstrap state), leaving
+    ``torchrec_ctx.module_input_post_prefetch`` sized for the unshuffled
+    peek while ``shuffled_batch`` (the actual forward input) was sized
+    for the redistributed batch. Forward then crashed inside
+    ``hstu_preprocess_embeddings``' ``torch.cat`` with a row-count
+    mismatch — only when consecutive batches had different shapes
+    (``replicate_batches=False``), which the existing parity test
+    intentionally hides.
+
+    This test reproduces the production failure mode at small scale:
+    1 rank, balanced shuffler, varying batch sizes, prefetch on. It
+    asserts only that ``progress()`` doesn't raise — bit-exact parity
+    against NonePipeline isn't tractable here because the shuffler
+    redistributes rows across ranks differently than no-pipeline.
+    """
+    from hstu.utils.hstu_batch_balancer import HASTUBalancedBatchShuffler
+
+    init.initialize_distributed()
+    init.initialize_model_parallel(1)
+
+    # Use create_model with replicate_batches=False so each batch has
+    # a distinct shape; that's the trigger for the bootstrap mismatch.
+    pipelined_model, pipelined_dense_optimizer, history_batches = create_model(
+        task_type="ranking",
+        contextual_feature_names=["user0", "user1"],
+        max_num_candidates=10,
+        optimizer_type_str="sgd",
+        dtype=torch.bfloat16,
+        use_dynamic_emb=True,
+        pipeline_type="prefetch",
+        seed=1234,
+        num_batches=10,
+        replicate_batches=False,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    # Get attention head config from the model so the balanced shuffler
+    # can compute KK workloads correctly.
+    cfg = pipelined_model.module.module.config
+    shuffler = HASTUBalancedBatchShuffler(
+        num_heads=cfg.num_attention_heads,
+        head_dim=cfg.kv_channels,
+    )
+    pipe = HSTUPipeline(
+        pipelined_model,
+        pipelined_dense_optimizer,
+        device=device,
+        prefetch=True,
+        batch_shuffler=shuffler,
+    )
+
+    it = iter(history_batches)
+    # 5 progress() calls is enough — the bootstrap mismatch surfaces
+    # on the FIRST steady-state forward, not later. We exit the loop
+    # once we have a non-None result so this works for both prefill
+    # and steady iterations.
+    seen = 0
+    for _ in range(5):
+        result = pipe.progress(it)
+        if result is not None:
+            seen += 1
+    pipe.shutdown()
+    init.destroy_global_state()
+
+    assert seen >= 1, (
+        "HSTUPipeline with balanced shuffler + varying batches did not "
+        "return any results — bootstrap-mismatch fix appears to have "
+        "regressed."
+    )
