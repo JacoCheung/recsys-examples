@@ -40,6 +40,7 @@ from .task import DataSlot, Task
 __all__ = [
     "infer_cross_stream_waits",
     "infer_cross_stream_event_deps",
+    "producers_with_cross_stream_consumers",
     "topological_sort",
 ]
 
@@ -565,3 +566,24 @@ def infer_cross_stream_event_deps(
             deps[consumer.name] = tuple(sorted(triples))
 
     return deps
+
+
+def producers_with_cross_stream_consumers(schedule: Schedule) -> set:
+    """Set of producer task names that some cross-stream consumer
+    waits on via ``infer_cross_stream_event_deps``.
+
+    The executor only needs to call ``cudaEventRecord`` on producers
+    whose event will be looked up later. Tasks with no cross-stream
+    consumer (in particular, every same-stream-only task) can skip the
+    record entirely — same-stream FIFO already orders work, and no
+    other stream waits on the event.
+
+    This drives the optional ``producers_to_record`` filter on
+    ``_record_completion_event``.
+    """
+    deps = infer_cross_stream_event_deps(schedule)
+    out: set = set()
+    for triples in deps.values():
+        for producer_name, _producer_stream, _slot_offset in triples:
+            out.add(producer_name)
+    return out

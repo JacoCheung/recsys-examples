@@ -263,9 +263,12 @@ deferred, and a concrete next-step trigger.
   iterations of the design used a pseudo-slot leaking
   HSTU-internal field names; the bare-name form keeps the user
   surface clean. The runtime
-  ``_validate_set_context_colocation`` validator is preserved as
-  belt-and-suspenders. SPEC_p4 v2 §8 documents the bare-name
-  mutation-chain decision.
+  ``_validate_set_context_colocation`` validator was the
+  belt-and-suspenders guard, but the entire postproc set_context
+  machinery (``pipelined_postprocs``, ``_SET_CONTEXT_TASKS``, the
+  validator itself) was removed in the postproc cleanup commit —
+  there is no longer any shared context to colocate. SPEC_p4 v2
+  §8 documents the bare-name mutation-chain decision.
 - **Verification**: HSTU parity 24/8/0; first-iter forward →
   prefetch race is now structurally covered by the explicit DAG
   edge.

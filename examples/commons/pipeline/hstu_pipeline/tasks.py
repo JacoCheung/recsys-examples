@@ -58,7 +58,6 @@ class PipelineState:
     optimizer: torch.optim.Optimizer
     device: torch.device
     pipelined_modules: List[Any] = field(default_factory=list)
-    pipelined_postprocs: List[Any] = field(default_factory=list)
     batch_shuffler: Any = None
     is_identity_shuffler: bool = True
     model_fwd: Optional[Callable] = None
@@ -98,8 +97,6 @@ class PipelineState:
         Matches legacy ``TrainPipelineSparseDist._set_module_context``."""
         for module in self.pipelined_modules:
             module.forward.set_context(torchrec_ctx)
-        for postproc in self.pipelined_postprocs:
-            postproc.set_context(torchrec_ctx)
 
 
 # ----------------------------------------------------------------------
@@ -317,17 +314,7 @@ def make_start_input_dist_task(state: PipelineState, *, lookahead: int) -> Task:
         from commons.pipeline.utils import _start_data_dist
 
         with nvtx.annotate(f"## start_input_dist {torchrec_ctx.index} ##"):
-            # Temporarily set module context so postproc cache lands on
-            # the right batch's context (mirrors legacy
-            # start_sparse_data_dist).
-            original_contexts = [p.get_context() for p in state.pipelined_postprocs]
-            for pp in state.pipelined_postprocs:
-                pp.set_context(torchrec_ctx)
-            try:
-                _start_data_dist(state.pipelined_modules, shuffled, torchrec_ctx)
-            finally:
-                for pp, oc in zip(state.pipelined_postprocs, original_contexts):
-                    pp.set_context(oc)
+            _start_data_dist(state.pipelined_modules, shuffled, torchrec_ctx)
 
     return Task.from_fn(
         "start_input_dist",
@@ -462,9 +449,16 @@ def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
         ctx.slots.set("losses", losses)
         ctx.slots.set("output", output)
 
-    depends_on: tuple = ()
+    # Explicit depends_on so a custom thread_map can't put forward on a
+    # different worker thread and lose ordering. wait_input_dist
+    # populates torchrec_ctx.input_dist_tensors_requests (read here
+    # via module._context); nccl_safety_barrier issues
+    # current_stream.wait_stream(memcpy) whose effect must precede the
+    # forward stream submit. In prefetch mode prefetch_embeddings
+    # transitively depends on wait_input_dist.
+    depends_on: tuple = ("wait_input_dist", "nccl_safety_barrier")
     if prefetch:
-        depends_on = ("prefetch_embeddings",)
+        depends_on = ("prefetch_embeddings", "nccl_safety_barrier")
 
     return Task.from_fn(
         "forward",
@@ -513,14 +507,22 @@ def make_nccl_safety_barrier_task(state: PipelineState) -> Task:
 # ----------------------------------------------------------------------
 
 
-def make_backward_task(state: PipelineState, *, depends_on: tuple = ()) -> Task:
+def make_backward_task(
+    state: PipelineState,
+    *,
+    depends_on: tuple = (),
+    same_progress_sync: tuple = (),
+) -> Task:
     """Build the backward task.
 
-    `depends_on` is forwarded to ``Task.from_fn`` so callers can add
-    cross-stream sync edges (e.g. for the prefetch variant, backward
-    should depend on ``prefetch_embeddings`` to emit a
-    ``wait_stream(prefetch)`` on the default stream — matches legacy
-    JaggedMegatronPrefetch progress at train_pipeline.py:996-997).
+    ``depends_on`` carries same-batch logical dependency edges
+    (e.g. zero_grad → backward, both for batch K).
+
+    ``same_progress_sync`` carries same-progress GPU coherency edges
+    (e.g. prefetch_embeddings → backward in prefetch variant —
+    different batches but shared dynamicemb cache, mirroring legacy
+    ``default_stream.wait_stream(prefetch_stream)`` at
+    train_pipeline.py:993-997).
     """
     from megatron.core import parallel_state
 
@@ -551,6 +553,7 @@ def make_backward_task(state: PipelineState, *, depends_on: tuple = ()) -> Task:
         reads=("losses", "global_tokens"),
         writes=("local_loss_sum",),
         depends_on=depends_on,
+        same_progress_sync=same_progress_sync,
         # DDP backward AllReduce fires inside .backward() — mark NCCL.
         nccl=True,
     )

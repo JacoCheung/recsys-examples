@@ -376,68 +376,6 @@ def test_default_threaded_is_true() -> None:
     assert pipe._thread_map == HSTU_DEFAULT_THREAD_MAP
 
 
-def test_set_context_colocation_custom_map_rejects_split() -> None:
-    """Codex C-LOW: if a custom thread_map splits start_input_dist
-    and forward onto different threads, construction must refuse."""
-    import torch
-    from commons.pipeline.hstu_pipeline import HSTUPipeline
-
-    # Malicious custom map: split the set_context chain
-    bad_map = {
-        "start_input_dist": "compute",
-        "forward": "other",
-        # others can be anywhere
-    }
-
-    pipe = HSTUPipeline(
-        model=torch.nn.Linear(4, 4),
-        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
-        device=torch.device("cpu"),
-        prefetch=False,
-        threaded=True,
-        thread_map=bad_map,
-    )
-    # Validator fires in _ensure_pipe, which is lazy. Call it directly.
-    schedule, _ = pipe._build_schedule()
-    with pytest.raises(ValueError, match="set_context-mutating"):
-        pipe._validate_set_context_colocation(schedule)
-
-
-def test_set_context_colocation_default_map_accepted() -> None:
-    """HSTU_DEFAULT_THREAD_MAP co-locates start_input_dist + forward
-    on the compute thread — the validator must accept it."""
-    import torch
-    from commons.pipeline.hstu_pipeline import HSTUPipeline
-
-    pipe = HSTUPipeline(
-        model=torch.nn.Linear(4, 4),
-        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
-        device=torch.device("cpu"),
-        prefetch=True,  # widest task set
-        threaded=True,
-    )
-    schedule, _ = pipe._build_schedule()
-    pipe._validate_set_context_colocation(schedule)  # no raise
-
-
-def test_set_context_colocation_sequential_bypass() -> None:
-    """Sequential executor has no thread race, so the validator is a
-    no-op even with a malformed thread_map (which would also be
-    ignored since threaded=False)."""
-    import torch
-    from commons.pipeline.hstu_pipeline import HSTUPipeline
-
-    pipe = HSTUPipeline(
-        model=torch.nn.Linear(4, 4),
-        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
-        device=torch.device("cpu"),
-        prefetch=False,
-        threaded=False,
-    )
-    schedule, _ = pipe._build_schedule()
-    pipe._validate_set_context_colocation(schedule)  # no raise
-
-
 def test_prefetch_depth_validation() -> None:
     import torch
     from commons.pipeline.hstu_pipeline import HSTUPipeline
