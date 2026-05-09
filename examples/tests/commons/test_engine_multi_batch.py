@@ -355,6 +355,92 @@ def test_preset_prefetch_parity() -> None:
         )
 
 
+def test_progress_resets_state_on_new_iterator() -> None:
+    """Train slice exhausts (StopIteration) → eval slice runs on a
+    fresh iterator → engine must restart from a clean §4.8 state.
+
+    Without the iterator-identity reset (mirroring legacy
+    ``train_pipeline.py:418``), the second slice's first
+    ``progress()`` call would observe ``_exhausted=True`` left over
+    from the first slice and raise ``StopIteration`` immediately,
+    leaving the eval metrics module without any samples — which is
+    exactly what the 8-GPU pretrain ranking gr smoke test caught.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    torch.manual_seed(0)
+    model = torch.nn.Linear(4, 2).to(device)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-2)
+    pipe = SchedulablePipeline.basic(model, opt, loss_fn=lambda o: o.sum())
+
+    torch.manual_seed(1)
+    batches_a = [torch.randn(2, 4, device=device) for _ in range(8)]
+    torch.manual_seed(2)
+    batches_b = [torch.randn(2, 4, device=device) for _ in range(8)]
+
+    def _drain(it):
+        out = []
+        while True:
+            try:
+                out.append(pipe.progress(it))
+            except StopIteration:
+                break
+        return out
+
+    first = _drain(iter(batches_a))
+    assert len(first) == len(batches_a), (
+        f"first slice yielded {len(first)} results, expected "
+        f"{len(batches_a)} (M batches in → M results out)"
+    )
+
+    # Hand a NEW iterator. Engine must reset and yield M results
+    # again, not raise immediately.
+    second = _drain(iter(batches_b))
+    assert len(second) == len(batches_b), (
+        f"second slice yielded {len(second)} results after the first "
+        f"slice exhausted; got {len(second)}, expected "
+        f"{len(batches_b)}. The engine likely failed to reset its "
+        f"§4.8 state on the fresh iterator."
+    )
+
+
+def test_progress_rejects_iter_change_mid_flight() -> None:
+    """Switching to a fresh iterator before the previous one drained
+    would silently discard in-flight batches from the ring. For
+    schedules with ``max_offset > 0``, the engine must reject this
+    case rather than restart from a clean slate
+    (Codex MEDIUM 2026-04-26). Schedules with ``max_offset == 0``
+    have no in-flight batches between calls, so iterator changes are
+    always safe and not gated.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    torch.manual_seed(0)
+    model = torch.nn.Linear(4, 2).to(device)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-2)
+    # prefetch=True bumps max_offset above 0 (h2d at offset=1 / compute
+    # at offset=0) so the ring carries an in-flight batch between
+    # calls — the regime where mid-flight iter changes are unsafe.
+    pipe = SchedulablePipeline.basic(
+        model,
+        opt,
+        loss_fn=lambda o: o.sum(),
+        prefetch=True,
+        memcpy_stream=(device.type == "cuda"),
+    )
+
+    torch.manual_seed(1)
+    batches_a = [torch.randn(2, 4, device=device) for _ in range(8)]
+    batches_b = [torch.randn(2, 4, device=device) for _ in range(8)]
+
+    it_a = iter(batches_a)
+    pipe.progress(it_a)  # prefill consumed; first steady result returned
+
+    it_b = iter(batches_b)
+    with pytest.raises(RuntimeError, match="before the previous one drained"):
+        pipe.progress(it_b)
+
+
 def test_in_flight_batches_derived_from_max_offset() -> None:
     """`Schedule.in_flight_batches` is a `@property` — never authored.
     Confirms §4.2 rule 4 derivation survives V4 multi-batch."""

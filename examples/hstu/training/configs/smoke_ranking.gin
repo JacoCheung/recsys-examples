@@ -1,0 +1,31 @@
+TrainerArgs.train_batch_size = 64
+TrainerArgs.eval_batch_size = 64
+TrainerArgs.eval_interval = 1000
+TrainerArgs.log_interval = 5
+TrainerArgs.seed = 1234
+TrainerArgs.max_train_iters = 20
+TrainerArgs.profile = False
+TrainerArgs.pipeline_type = "prefetch"
+TrainerArgs.enable_balanced_shuffler = False
+
+DatasetArgs.dataset_name = 'ml-1m'
+DatasetArgs.max_history_seqlen = 200
+DatasetArgs.shuffle = False
+DatasetArgs.max_num_candidates = 20
+
+NetworkArgs.dtype_str = "bfloat16"
+NetworkArgs.num_layers = 1
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 128
+NetworkArgs.kv_channels = 128
+NetworkArgs.target_group_size = 1
+
+RankingArgs.prediction_head_arch = [512, 10]
+RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 1
+RankingArgs.eval_metrics = ("AUC",)
+
+OptimizerArgs.optimizer_str = 'sgd'
+OptimizerArgs.learning_rate = 1e-3
+
+TensorModelParallelArgs.tensor_model_parallel_size = 1

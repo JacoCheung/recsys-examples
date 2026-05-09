@@ -456,6 +456,119 @@ def test_prefetch_depth_validation() -> None:
 # ----------------------------------------------------------------------
 
 
+# ----------------------------------------------------------------------
+# Integration with pretrain_gr_ranking.py — _model attribute parity
+# ----------------------------------------------------------------------
+
+
+def test_hstu_pipeline_attach_updates_model_fwd_default_path() -> None:
+    """Codex HIGH 2026-04-26: ``attach(new_model)`` previously updated
+    only ``self._state.model``, leaving ``self._state.model_fwd``
+    pointing at the construction-time module — so the forward task
+    silently kept calling the stale model.
+
+    Default path (no custom_model_fwd): both must be re-routed.
+    """
+    import torch
+    from commons.pipeline.hstu_pipeline import HSTUPipeline
+
+    model = torch.nn.Linear(4, 4)
+    pipe = HSTUPipeline(
+        model=model,
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+    )
+    assert pipe._state.model is model
+    assert pipe._state.model_fwd is model
+
+    new_model = torch.nn.Linear(4, 4)
+    pipe.attach(new_model)
+    assert pipe._state.model is new_model
+    assert pipe._state.model_fwd is new_model, (
+        "attach() must re-route model_fwd to the new model when no "
+        "custom_model_fwd was supplied"
+    )
+
+
+def test_hstu_pipeline_attach_preserves_custom_model_fwd() -> None:
+    """Custom forwards intentionally diverge from ``state.model``;
+    attach() must not silently overwrite them.
+    """
+    import torch
+    from commons.pipeline.hstu_pipeline import HSTUPipeline
+
+    model = torch.nn.Linear(4, 4)
+    captured = {}
+
+    def custom_fwd(batch):
+        captured["called"] = True
+        return torch.zeros(1), None
+
+    pipe = HSTUPipeline(
+        model=model,
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+        custom_model_fwd=custom_fwd,
+    )
+    assert pipe._state.model_fwd is custom_fwd
+
+    new_model = torch.nn.Linear(4, 4)
+    pipe.attach(new_model)
+    assert pipe._state.model is new_model
+    assert (
+        pipe._state.model_fwd is custom_fwd
+    ), "attach() must NOT overwrite a user-supplied custom forward"
+
+
+def test_hstu_pipeline_exposes_underscore_model_attribute() -> None:
+    """``train_with_pipeline`` (in
+    ``examples/hstu/training/trainer/training.py``) calls
+    ``pipeline._model.train()`` / ``pipeline._model.eval()`` and reads
+    ``pipeline._model._hstu_config`` via ``get_unwrapped_module``. The
+    legacy ``JaggedMegatron*`` classes assign ``self._model = model``
+    directly; HSTUPipeline must expose the same attribute for drop-in
+    use."""
+    import torch
+    from commons.pipeline.hstu_pipeline import HSTUPipeline
+
+    model = torch.nn.Linear(4, 4)
+    pipe = HSTUPipeline(
+        model=model,
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+    )
+    assert (
+        pipe._model is model
+    ), "HSTUPipeline._model must be the same object passed at construction"
+
+    # detach() returns the bare model; attach(new_model) should
+    # re-route _model to the new module.
+    new_model = torch.nn.Linear(4, 4)
+    pipe.attach(new_model)
+    assert pipe._model is new_model
+
+
+def test_pretrain_gr_ranking_backend_env_var_routing() -> None:
+    """Smoke-checks that the env-var-driven backend switch in
+    ``examples/hstu/training/pretrain_gr_ranking.py`` accepts the two
+    canonical values and rejects unknown values. Inspects the script
+    source (not import — the script has heavy module-level deps) so
+    this test runs on CPU-only hosts."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    script = root / "examples" / "hstu" / "training" / "pretrain_gr_ranking.py"
+    text = script.read_text()
+    assert (
+        "RECSYS_PIPELINE_BACKEND" in text
+    ), "pretrain_gr_ranking.py must read env var RECSYS_PIPELINE_BACKEND"
+    assert (
+        "HSTUPipelineFactory" in text
+    ), "pretrain_gr_ranking.py must offer the new HSTU backend"
+    # Must reject typos rather than silently fall through.
+    assert "must be 'legacy' or 'new'" in text
+
+
 def test_legacy_pipeline_files_untouched_by_p2() -> None:
     """Problem #2 must NOT modify train_pipeline.py, train_pipeline_factory.py,
     or utils.py. The engine has a similar test; this one uses import

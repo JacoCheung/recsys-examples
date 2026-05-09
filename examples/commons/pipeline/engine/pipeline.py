@@ -127,6 +127,13 @@ class SchedulablePipeline(Generic[In, Out]):
         self._pulled: int = 0
         self._exhausted: bool = False
         self._prefill_done: bool = False
+        # Identity of the iterator currently being driven. When the
+        # caller hands in a new iterator (e.g. switching from the train
+        # loader to the eval loader), ``progress()`` resets the §4.8
+        # state so a fresh prefill kicks in. Mirrors legacy
+        # ``TrainPipeline._next_batch`` iterator-identity check
+        # (train_pipeline.py:418).
+        self._driving_iter: Optional[object] = None
 
         # Bootstrap counter: how many batches have been seeded via
         # ``_seed_first_batch`` (pre-populated into ring slots BEFORE
@@ -286,7 +293,53 @@ class SchedulablePipeline(Generic[In, Out]):
 
         First call absorbs `max_offset` prefill iterations so the
         user never sees a `None` from an incomplete ring.
+
+        When the caller hands in a different iterator than last time
+        (e.g. train → eval), the §4.8 state is reset so a fresh
+        prefill kicks in on the new iterator. The previous slice must
+        already have drained (i.e. the ``StopIteration`` that ends a
+        slice has been observed) — switching iterators mid-flight
+        would silently discard in-flight batches and is rejected here
+        with a ``RuntimeError``. Mirrors legacy
+        ``TrainPipeline._next_batch`` iterator-change reset
+        (train_pipeline.py:418), with an added drain-required guard
+        (Codex MEDIUM 2026-04-26).
+
+        Concurrency note: ``progress()`` is single-driver only — a
+        single host thread should drive any one ``SchedulablePipeline``.
+        The threaded executor parallelizes tasks **inside** a single
+        ``progress()`` call; concurrent ``progress()`` invocations on
+        the same instance race on ``_driving_iter``, ``_internal_iter``,
+        ``_pulled``, and the ``BatchRing``.
         """
+        if self._driving_iter is not batch_iter:
+            # Mid-flight = batches still propagating through deeper
+            # offsets in the ring. Only possible when max_offset > 0;
+            # max_offset == 0 schedules complete every batch within
+            # one progress() call so the ring is always empty between
+            # calls and switching iterators is safe.
+            mid_flight = (
+                self._driving_iter is not None
+                and self._max_offset > 0
+                and not self._exhausted
+                and self._internal_iter > 0
+            )
+            if mid_flight:
+                raise RuntimeError(
+                    "SchedulablePipeline.progress() received a new "
+                    "iterator before the previous one drained "
+                    f"(_internal_iter={self._internal_iter}, "
+                    f"_pulled={self._pulled}, _exhausted=False). The "
+                    "previous slice still has in-flight batches in "
+                    "the ring; restarting now would silently discard "
+                    "them. Drive the previous iterator until it "
+                    "raises StopIteration before switching."
+                )
+            self._driving_iter = batch_iter
+            self._internal_iter = 0
+            self._pulled = self._seeded
+            self._exhausted = False
+            self._prefill_done = False
         # Prefill absorption: first user call runs `max_offset`
         # internal iterations before returning the first steady
         # result. Each iter advances the ring so subsequent iters
