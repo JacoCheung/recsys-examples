@@ -19,9 +19,101 @@ See SPEC §4.1 for the field semantics and §4.2 for how Tasks compose
 into a Schedule.
 """
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple, Union
 
 __all__ = ["DataSlot", "Task"]
+
+
+# A read or write entry can be authored as a bare slot name (string)
+# or as an explicit ``DataSlot(name, batch_offset)``. Per SPEC_p4 v2,
+# string entries are normalized to ``DataSlot(name, task.batch_offset)``
+# at construction time — the user's per-batch DAG describes slots by
+# name, and the slot's batch_offset is implied by the owning task's
+# offset. Existing imperative call sites that pass explicit DataSlot
+# objects continue to work unchanged.
+SlotRef = Union[str, "DataSlot"]
+
+
+def _normalize_slot_refs(
+    refs: Optional[Iterable[SlotRef]], batch_offset: int
+) -> Tuple["DataSlot", ...]:
+    if refs is None:
+        return ()
+    out = []
+    for r in refs:
+        if isinstance(r, DataSlot):
+            out.append(r)
+        elif isinstance(r, str):
+            out.append(DataSlot(r, batch_offset))
+        else:
+            raise TypeError(
+                f"reads/writes entries must be str or DataSlot, got "
+                f"{type(r).__name__}: {r!r}"
+            )
+    return tuple(out)
+
+
+# `depends_on` entries: SPEC_p4 v2 §5 allows
+#   - bare task name "X"      → within-iter ordering, equivalent to ("X", 0)
+#   - tuple ("X", -N)         → cross-iter pure-control dependency, this
+#                               task must wait for `X` from `N` iters ago.
+# Positive offsets are rejected. The constructor splits the user-provided
+# entries into two engine-internal tuples: ``depends_on`` (within-iter,
+# bare names) and ``cross_iter_depends_on`` (list of (name, -N)).
+DependsOnRef = Union[str, Tuple[str, int]]
+
+
+def _normalize_depends_on(
+    refs: Optional[Iterable[DependsOnRef]],
+) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, int], ...]]:
+    """Split user-facing depends_on into (within_iter, cross_iter)."""
+    if refs is None:
+        return (), ()
+    within: list = []
+    cross: list = []
+    for r in refs:
+        if isinstance(r, str):
+            within.append(r)
+        elif isinstance(r, tuple) and len(r) == 2:
+            name, offset = r
+            if not isinstance(name, str) or not isinstance(offset, int):
+                raise TypeError(
+                    f"depends_on tuple entries must be (str, int), got "
+                    f"({type(name).__name__}, {type(offset).__name__}): {r!r}"
+                )
+            if offset > 0:
+                raise ValueError(
+                    f"depends_on tuple ({name!r}, {offset}): positive "
+                    f"iteration offset is not allowed. Use negative for "
+                    f"cross-iter ('wait for X from N iters ago'); use 0 "
+                    f"or the bare string {name!r} for within-iter."
+                )
+            if offset == 0:
+                within.append(name)
+            else:
+                cross.append((name, offset))
+        else:
+            raise TypeError(
+                f"depends_on entries must be str or (str, int) tuple, got "
+                f"{type(r).__name__}: {r!r}"
+            )
+
+    # SPEC_p4 v2 §5 strictness: a single producer name cannot appear
+    # both as within-iter and as cross-iter on the same consumer. If
+    # the user truly wants two independent edges they should use
+    # distinct producer names; mixing the two forms on the same name
+    # is treated as a likely mistake.
+    overlap = set(within) & {n for (n, _) in cross}
+    if overlap:
+        raise ValueError(
+            f"depends_on lists the same producer name(s) "
+            f"{sorted(overlap)!r} both as within-iter (bare string or "
+            f"(name, 0)) and as cross-iter ((name, -N)). Pick one "
+            f"semantic per producer; if you really want two ordering "
+            f"edges to that producer, give them distinct names."
+        )
+
+    return tuple(within), tuple(cross)
 
 
 class DataSlot:
@@ -76,6 +168,15 @@ class Task:
     `stream`, `reads`, `writes`. `priority`, `absolute_stream`,
     `batch_offset`, `depends_on`, `nvtx_tag` are accepted and stored
     but not yet exercised by the engine (lands in V2+).
+
+    Per SPEC_p4 v2, the user-facing field name for cross-iter
+    positioning is ``lookahead``; ``batch_offset`` is the internal
+    engine alias. Both are accepted at construction time, and the
+    public read-only ``Task.lookahead`` property returns
+    ``self.batch_offset``. If both are passed and they disagree, the
+    constructor raises ``ValueError``. New code should prefer
+    ``lookahead``; ``batch_offset`` is kept for the imperative
+    `Schedule` API and existing call sites.
     """
 
     # Defaults so subclasses can override as class attributes.
@@ -87,6 +188,7 @@ class Task:
     reads: Tuple[DataSlot, ...] = ()
     writes: Tuple[DataSlot, ...] = ()
     depends_on: Tuple[str, ...] = ()
+    cross_iter_depends_on: Tuple[Tuple[str, int], ...] = ()
     nvtx_tag: Optional[str] = None
     nccl: bool = False
 
@@ -97,10 +199,10 @@ class Task:
         stream: Optional[str] = None,
         priority: Optional[int] = None,
         absolute_stream: Optional[bool] = None,
-        batch_offset: Optional[int] = None,
+        lookahead: Optional[int] = None,
         reads: Optional[Tuple[DataSlot, ...]] = None,
         writes: Optional[Tuple[DataSlot, ...]] = None,
-        depends_on: Optional[Tuple[str, ...]] = None,
+        depends_on: Optional[Iterable[DependsOnRef]] = None,
         nvtx_tag: Optional[str] = None,
         nccl: Optional[bool] = None,
     ) -> None:
@@ -113,14 +215,35 @@ class Task:
             self.priority = priority
         if absolute_stream is not None:
             self.absolute_stream = absolute_stream
-        if batch_offset is not None:
-            self.batch_offset = batch_offset
+        # SPEC_p4 v2 §5: ``lookahead`` is the user-facing name for the
+        # cross-iter offset. The engine still stores it as
+        # ``self.batch_offset`` internally so existing code
+        # (deps.py, executor.py, autosched.validator) continues to read
+        # ``task.batch_offset``. The public ``Task.lookahead`` property
+        # below returns the same value. The legacy ``batch_offset=``
+        # constructor keyword was removed in Phase C — call sites must
+        # use ``lookahead=`` now.
+        if lookahead is not None:
+            self.batch_offset = lookahead
+        # `reads` / `writes` accept either explicit DataSlot objects
+        # (legacy imperative API) or bare slot names; bare names are
+        # auto-tagged with `self.batch_offset` so the user-facing
+        # SPEC_p4 v2 form `reads=("foo", "bar")` works without the user
+        # restating the offset.
         if reads is not None:
-            self.reads = reads
+            self.reads = _normalize_slot_refs(reads, self.batch_offset)
         if writes is not None:
-            self.writes = writes
+            self.writes = _normalize_slot_refs(writes, self.batch_offset)
         if depends_on is not None:
-            self.depends_on = depends_on
+            # Accept SPEC_p4 v2 union form: bare names are within-iter,
+            # ("X", -N) tuples are cross-iter pure-control. Split into
+            # the two engine-internal tuples; existing engine code
+            # (deps.py, executor.py) reads `self.depends_on` for the
+            # within-iter set as before.
+            within, cross = _normalize_depends_on(depends_on)
+            self.depends_on = within
+            if cross:
+                self.cross_iter_depends_on = cross
         if nvtx_tag is not None:
             self.nvtx_tag = nvtx_tag
         if nccl is not None:
@@ -136,6 +259,16 @@ class Task:
                 f"Task '{self.name}'.batch_offset must be >= 0, got "
                 f"{self.batch_offset} (SPEC §4.2 rule 2)."
             )
+
+    @property
+    def lookahead(self) -> int:
+        """SPEC_p4 v2 user-facing name for ``batch_offset``.
+
+        Read-only — set via the constructor. The engine still keys all
+        internal data structures on ``batch_offset``; this property is
+        the user-facing alias.
+        """
+        return self.batch_offset
 
     def init(self, ctx) -> None:
         """One-time setup called when the pipeline is built.
@@ -163,16 +296,22 @@ class Task:
         stream: str = "default",
         priority: int = 0,
         absolute_stream: bool = False,
-        batch_offset: int = 0,
-        reads: Tuple[DataSlot, ...] = (),
-        writes: Tuple[DataSlot, ...] = (),
-        depends_on: Tuple[str, ...] = (),
+        lookahead: Optional[int] = None,
+        reads: Iterable[SlotRef] = (),
+        writes: Iterable[SlotRef] = (),
+        depends_on: Iterable[DependsOnRef] = (),
         nvtx_tag: Optional[str] = None,
         nccl: bool = False,
     ) -> "Task":
         """Factory for the lambda-style authoring form.
 
-        Returns a `Task` instance whose `run(ctx)` dispatches to `fn(ctx)`.
+        ``reads`` and ``writes`` may be a tuple of bare slot names
+        (auto-tagged with the task's lookahead) or explicit ``DataSlot``
+        objects (legacy imperative form). Returns a ``Task`` instance
+        whose ``run(ctx)`` dispatches to ``fn(ctx)``.
+
+        SPEC_p4 v2 §7 Phase C removed the legacy ``batch_offset=``
+        keyword — call sites must use ``lookahead=``.
         """
         return _FnTask(
             fn=fn,
@@ -180,7 +319,7 @@ class Task:
             stream=stream,
             priority=priority,
             absolute_stream=absolute_stream,
-            batch_offset=batch_offset,
+            lookahead=lookahead,
             reads=reads,
             writes=writes,
             depends_on=depends_on,

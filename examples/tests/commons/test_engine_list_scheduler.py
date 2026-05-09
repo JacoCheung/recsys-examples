@@ -133,7 +133,7 @@ def test_output_passes_validator() -> None:
         reads=(DataSlot("batch_cpu", batch_offset=1),),
         writes=(DataSlot("batch_gpu", batch_offset=1),),
         stream="memcpy",
-        batch_offset=1,
+        lookahead=1,
     )
     zero_grad = Task.from_fn(name="zero_grad", fn=_noop, stream="default")
     forward = Task.from_fn(

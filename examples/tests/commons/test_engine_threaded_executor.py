@@ -442,8 +442,8 @@ def test_threaded_context_isolation() -> None:
     # A prefetch-like schedule where h2d is at offset=1 and compute
     # is at offset=0.
     tasks = (
-        Task.from_fn("h2d", _task_offset1, stream="memcpy", batch_offset=1),
-        Task.from_fn("compute", _task_offset0, stream="default", batch_offset=0),
+        Task.from_fn("h2d", _task_offset1, stream="memcpy", lookahead=1),
+        Task.from_fn("compute", _task_offset0, stream="default", lookahead=0),
     )
     schedule = Schedule(
         stages=(Stage(tasks=tasks),), stream_slots=("default", "memcpy")
