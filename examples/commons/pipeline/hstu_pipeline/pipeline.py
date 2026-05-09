@@ -56,23 +56,6 @@ from .tasks import (
 __all__ = ["HSTUPipeline", "HSTU_DEFAULT_THREAD_MAP"]
 
 
-# Tasks that mutate shared pipelined-module/postproc state via
-# ``module.forward.set_context(...)`` or ``postproc.set_context(...)``.
-# These MUST be co-located on a single worker thread — otherwise two
-# threads can non-atomically override each other's context pointer and
-# produce silent corruption (Codex D-CRITICAL-1 root cause).
-#
-# Currently the HSTU tasks with this property are:
-#   - ``start_input_dist``  — temporarily sets postproc context during
-#                              ``_start_data_dist`` (see
-#                              ``tasks.make_start_input_dist_task``).
-#   - ``forward``           — sets both module.forward + postproc
-#                              context via ``state.set_module_context``.
-#
-# Keep this tuple in sync with task implementations.
-_SET_CONTEXT_TASKS: tuple = ("start_input_dist", "forward")
-
-
 # ----------------------------------------------------------------------
 # Safe thread assignment for HSTU
 # ----------------------------------------------------------------------
@@ -81,20 +64,19 @@ _SET_CONTEXT_TASKS: tuple = ("start_input_dist", "forward")
 #
 #   "io"      — pure data movement: h2d, start_shuffle, finish_shuffle.
 #               These touch only their own slot's tensor + the batch
-#               shuffler (no shared mutable module state).
+#               shuffler.
 #   "compute" — everything else: start_input_dist, wait_input_dist,
 #               prefetch, zero_grad, global_tokens, forward,
 #               backward, finalize, optimizer.
-#               These may mutate shared module state
-#               (``module.forward._context`` / ``postproc._context``)
-#               so they MUST all live on one thread to avoid the
-#               set_context race (Codex D-CRITICAL-1).
+#
+# Two threads (not many) lets H2D / shuffle on "io" overlap with the
+# NCCL + GPU compute work on "compute", without paying the per-task
+# pool dispatch overhead of full thread-per-task.
 #
 # Cross-thread data dependencies use threading.Event (engine handles
 # this). Cross-rank NCCL ordering uses the engine's ``_NcclOrderedLock``.
 #
-# Users can override via ``thread_map=...`` kwarg if they know their
-# model's set_context path is thread-safe (e.g. no pipelined_postprocs).
+# Users can override via ``thread_map=...`` kwarg.
 HSTU_DEFAULT_THREAD_MAP: dict = {
     # io thread
     "h2d": "io",
@@ -135,12 +117,10 @@ class HSTUPipeline:
         batch_shuffler: Any = None,
         assert_nan_loss: bool = False,
         apply_jit: bool = False,
-        pipeline_postproc: bool = False,
         custom_model_fwd: Optional[Callable[[Any], Tuple[torch.Tensor, Any]]] = None,
         # Default: multi-threaded with HSTU_DEFAULT_THREAD_MAP (io +
-        # compute, two threads). The default map pins all set_context
-        # call-sites onto the same thread, avoiding the race Codex
-        # D-CRITICAL-1 flagged. Pass ``threaded=False`` to fall back
+        # compute, two threads) so H2D / shuffle on "io" overlap NCCL +
+        # GPU compute on "compute". Pass ``threaded=False`` to fall back
         # to Sequential, or override ``thread_map=`` to customize.
         threaded: bool = True,
         thread_map: Any = None,
@@ -161,7 +141,6 @@ class HSTUPipeline:
         self._prefetch = prefetch
         self._prefetch_depth = prefetch_depth
         self._apply_jit = apply_jit
-        self._pipeline_postproc = pipeline_postproc
         self._threaded = threaded
         self._thread_map = thread_map
 
@@ -267,14 +246,35 @@ class HSTUPipeline:
         )
         if self._prefetch:
             tasks.append(make_prefetch_task(self._state, lookahead=prefetch_lookahead))
-        # backward depends_on prefetch_embeddings only in prefetch
-        # variant — the engine emits wait_stream(prefetch) on default
-        # stream because they're on different streams. Mirrors legacy
-        # train_pipeline.py:996-997.
-        backward_deps = ("prefetch_embeddings",) if self._prefetch else ()
+        # backward dependency edges:
+        #   - depends_on=("zero_grad",) — same-batch logical edge:
+        #     backward processing batch K writes model.grad which
+        #     zero_grad must have cleared first (also for batch K).
+        #     Engine has no reads/writes edge between them (zero_grad
+        #     mutates out-of-slot model state), so we declare
+        #     explicitly. Without this, a custom thread_map could
+        #     reorder them across threads.
+        #   - same_progress_sync=("prefetch_embeddings",) (prefetch variant
+        #     only) — NOT a logical data-flow edge. backward (la=0,
+        #     batch K) and prefetch_embeddings (la=1, batch K+1) run
+        #     in the same progress() processing different batches,
+        #     but share the dynamicemb cache as global mutable state.
+        #     prefetch writes the cache on prefetch_stream; backward
+        #     reads it via autograd on default_stream — needs cross-
+        #     stream GPU coherency wait. Mirrors legacy
+        #     ``default_stream.wait_stream(prefetch_stream)``
+        #     (train_pipeline.py:993-997).
+        backward_deps = ("zero_grad",)
+        backward_same_progress_sync: tuple = ()
+        if self._prefetch:
+            backward_same_progress_sync = ("prefetch_embeddings",)
         tasks.extend(
             [
-                make_backward_task(self._state, depends_on=backward_deps),
+                make_backward_task(
+                    self._state,
+                    depends_on=backward_deps,
+                    same_progress_sync=backward_same_progress_sync,
+                ),
                 make_finalize_grads_task(self._state),
                 make_optimizer_step_task(self._state),
                 make_watchdog_task(),
@@ -362,7 +362,7 @@ class HSTUPipeline:
             pipelined_modules,
             self._state.model,
             self._original_forwards,
-            pipelined_postprocs,
+            _pipelined_postprocs,
             _names,
         ) = torchrec_rewrite_model(
             model=self._state.model,
@@ -372,10 +372,9 @@ class HSTUPipeline:
             batch=peek_batch,
             apply_jit=self._apply_jit,
             pipelined_forward=pipelined_forward_type,
-            pipeline_postproc=self._pipeline_postproc,
+            pipeline_postproc=False,
         )
         self._state.pipelined_modules = pipelined_modules
-        self._state.pipelined_postprocs = pipelined_postprocs
 
         # Bootstrap the input_dist on the engine's data_dist stream
         # AFTER ensuring the peek H2D on memcpy_stream is visible
@@ -396,36 +395,6 @@ class HSTUPipeline:
         )
         return peek_ctx
 
-    def _validate_set_context_colocation(self, schedule) -> None:
-        """Refuse a thread_map that splits set_context-calling tasks
-        across different threads.
-
-        ``start_input_dist`` and ``forward`` both write the shared
-        ``module.forward._context`` / ``postproc._context`` pointer
-        without a lock. Running them on different threads reintroduces
-        the Codex D-CRITICAL-1 race. This runtime check fails loudly
-        at pipeline-construction time rather than letting silent
-        corruption reach the parity oracle.
-        """
-        if not self._threaded:
-            return  # sequential executor — no thread race possible
-        from commons.pipeline.engine.executor import _resolve_thread_id
-
-        seen: set = set()
-        for stage in schedule.stages:
-            for task in stage.tasks:
-                if task.name in _SET_CONTEXT_TASKS:
-                    seen.add(_resolve_thread_id(task, self._thread_map))
-        if len(seen) > 1:
-            raise ValueError(
-                f"thread_map splits the set_context-mutating tasks "
-                f"{_SET_CONTEXT_TASKS} across threads {sorted(seen)}. "
-                f"These tasks mutate shared pipelined-module state "
-                f"non-atomically — they MUST be co-located on one "
-                f"worker thread. Use HSTU_DEFAULT_THREAD_MAP or put "
-                f"them on the same thread in your custom map."
-            )
-
     def _ensure_pipe(self, peek_batch_cpu: Any) -> None:
         if self._pipe is not None:
             return
@@ -435,10 +404,6 @@ class HSTUPipeline:
         # bootstrap had no stream context, risking NCCL submission
         # on the wrong stream.
         schedule, pool = self._build_schedule()
-
-        # Codex C-LOW: refuse any thread_map that lets set_context
-        # calls race across threads. Check at construction time.
-        self._validate_set_context_colocation(schedule)
 
         memcpy_stream = pool.get("memcpy")
         data_dist_stream = pool.get("data_dist")
@@ -568,7 +533,7 @@ class HSTUPipeline:
                 pipelined_modules=self._state.pipelined_modules,
                 original_forwards=self._original_forwards,
                 original_kjt_dist_forwards=self._original_kjt_dist_forwards,
-                pipelined_postprocs=self._state.pipelined_postprocs,
+                pipelined_postprocs=[],
             )
         # Reset bookkeeping so next progress() rebuilds the engine.
         # See class docstring + B-MEDIUM-1 follow-up.
@@ -576,7 +541,6 @@ class HSTUPipeline:
             self._pipe.shutdown()
         self._pipe = None
         self._state.pipelined_modules = []
-        self._state.pipelined_postprocs = []
         self._original_forwards = []
         self._original_kjt_dist_forwards = []
         self._model_attached = False

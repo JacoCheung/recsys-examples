@@ -867,3 +867,64 @@ def test_nccl_lock_does_not_deadlock_on_early_failure() -> None:
         f"NCCL lock deadlock — stage took {elapsed:.1f}s; "
         f"fix should unblock within 1s of the failing task raising"
     )
+
+
+def test_cross_lookahead_depends_on_no_cpu_cycle() -> None:
+    """Cross-lookahead ``depends_on`` (producer.la > consumer.la) must
+    NOT contribute a CPU dep edge in ``_compute_cpu_deps``.
+
+    Topo edges (``_build_same_progress_dag_edges``) already filter
+    cross-la depends_on out — producer's batch-K work happened in an
+    EARLIER progress, the event is already on the ring slot via
+    rotation, the current-progress producer enqueue is for an
+    unrelated batch. The CPU dep set was missing the same filter.
+
+    Repro topology:
+        T1.la=0, depends_on=("T2",)            # cross-la (T2 at higher la,
+                                               # ring-rotated, no topo edge)
+        T2.la=2, same_progress_sync=("T1",)    # topo edge T1→T2 (acyclic)
+
+    With the bug, _compute_cpu_deps emits both:
+        T1 waits on T2 (depends_on)
+        T2 waits on T1 (same_progress_sync)
+    When T1 and T2 land on different threads (default by_stream split
+    on differing streams), this is a cycle ⇒ ThreadedExecutor
+    deadlocks on the first progress() call.
+    """
+    from commons.pipeline.engine.executor import _compute_cpu_deps
+
+    t1 = Task.from_fn(
+        "T1",
+        fn=lambda ctx: None,
+        lookahead=0,
+        stream="stream_a",
+        depends_on=("T2",),
+    )
+    t2 = Task.from_fn(
+        "T2",
+        fn=lambda ctx: None,
+        lookahead=2,
+        stream="stream_b",
+        same_progress_sync=("T1",),
+    )
+    active = [t1, t2]
+    # Different threads (the cross-thread branch is the only one that
+    # populates cpu_deps).
+    thread_id_of = {"T1": "stream_a", "T2": "stream_b"}
+    completion = {"T1": threading.Event(), "T2": threading.Event()}
+
+    cpu_deps = _compute_cpu_deps(active, thread_id_of, completion)
+
+    # Required edge: T2 waits on T1 (same_progress_sync).
+    assert completion["T1"] in cpu_deps.get(
+        "T2", []
+    ), "T2.same_progress_sync=(T1,) must add the T2→T1 CPU edge"
+    # Forbidden edge: T1 waits on T2 (cross-la depends_on must be skipped).
+    assert completion["T2"] not in cpu_deps.get("T1", []), (
+        "Cross-la depends_on (consumer.la=0 < producer.la=2) MUST NOT "
+        "add a CPU edge: producer's batch-K host work happened in an "
+        "earlier progress (event already on the ring slot via rotation), "
+        "so the current-progress producer enqueue is unrelated. Pairing "
+        "this edge with a reverse same_progress_sync forms a cycle that "
+        "deadlocks the threaded executor."
+    )

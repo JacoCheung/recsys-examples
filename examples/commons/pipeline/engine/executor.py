@@ -143,7 +143,11 @@ def _nvtx_range(task: Task) -> Iterator[None]:
         yield
 
 
-def _record_completion_event(task: Task, ctx: TaskContext) -> None:
+def _record_completion_event(
+    task: Task,
+    ctx: TaskContext,
+    producers_to_record: Optional[set] = None,
+) -> None:
     """Record a CUDA event on the task's current stream and store it on
     the ring slot at ``task.batch_offset``, keyed by ``task.name``.
 
@@ -158,9 +162,19 @@ def _record_completion_event(task: Task, ctx: TaskContext) -> None:
     the previous record is the intended semantics — see SPEC §4.2 rule 8
     (event-based cross-stream sync).
 
+    ``producers_to_record`` is the set of producer task names whose
+    events some cross-stream consumer actually waits on (computed once
+    at construction by
+    ``deps.producers_with_cross_stream_consumers``). When provided,
+    tasks not in the set skip ``Event.record()`` entirely — same-stream
+    FIFO already orders their work and no other stream waits on the
+    event, so the record is wasted.
+
     No-op on CPU-only runs (no CUDA available).
     """
     if not torch.cuda.is_available():
+        return
+    if producers_to_record is not None and task.name not in producers_to_record:
         return
     slot = ctx.slots_at(task.batch_offset)
     event = slot.get_event(task.name)
@@ -235,14 +249,26 @@ def _compute_cpu_deps(
 
         # ``depends_on`` (same-batch logical) edges — engine emits
         # ring-rotated GPU wait_event; CPU-side, the consumer thread
-        # still needs the producer's host enqueue to be complete in
-        # this same progress() call before continuing. (For same-
-        # lookahead producer/consumer, this is straightforward;
-        # for cross-lookahead, the producer's host enqueue happens
-        # earlier in this progress for the consumer's batch K.)
+        # needs the producer's host enqueue to be complete in this
+        # same progress() call before continuing.
+        #
+        # Cross-lookahead (producer.la > consumer.la) is filtered out
+        # here, mirroring ``_build_same_progress_dag_edges``: the
+        # producer's batch-K host work happened in an EARLIER
+        # progress (event already on the ring slot via rotation), so
+        # the current-progress producer enqueue is unrelated. Adding
+        # this edge would also form a cycle with a reverse
+        # ``same_progress_sync`` (which the topological-sort filter
+        # makes legal), deadlocking the threaded executor.
         for dep_name in task.depends_on or ():
-            if dep_name in active_names:
-                dep_names.add(dep_name)
+            if dep_name not in active_names:
+                continue
+            producer = next((t for t in active if t.name == dep_name), None)
+            if producer is None:
+                continue
+            if producer.batch_offset > task.batch_offset:
+                continue  # cross-la — handled by ring rotation, no CPU edge
+            dep_names.add(dep_name)
 
         # ``same_progress_sync`` (same-progress GPU coherency) edges —
         # consumer waits for the producer's current-iter completion
@@ -310,6 +336,7 @@ class SequentialExecutor:
         stream_pool: StreamPool,
         *,
         event_deps: Optional[Dict[str, Tuple[Tuple[str, str, int], ...]]] = None,
+        producers_to_record: Optional[set] = None,
     ) -> None:
         for task in stage.tasks:
             if not should_run(task):
@@ -326,7 +353,7 @@ class SequentialExecutor:
                 )
                 with _nvtx_range(task):
                     task.run(ctx)
-                _record_completion_event(task, ctx)
+                _record_completion_event(task, ctx, producers_to_record)
 
     def shutdown(self) -> None:
         """No-op for sequential executor."""
@@ -448,6 +475,7 @@ class ThreadedExecutor:
         stream_pool: StreamPool,
         *,
         event_deps: Optional[Dict[str, Tuple[Tuple[str, str, int], ...]]] = None,
+        producers_to_record: Optional[set] = None,
     ) -> None:
         active: List[Task] = [t for t in stage.tasks if should_run(t)]
         if not active:
@@ -468,7 +496,7 @@ class ThreadedExecutor:
                 )
                 with _nvtx_range(task):
                     task.run(ctx)
-                _record_completion_event(task, ctx)
+                _record_completion_event(task, ctx, producers_to_record)
             return
 
         # Resolve thread assignment for each task
@@ -496,7 +524,7 @@ class ThreadedExecutor:
                     )
                     with _nvtx_range(task):
                         task.run(ctx)
-                    _record_completion_event(task, ctx)
+                    _record_completion_event(task, ctx, producers_to_record)
             return
 
         pool = self._ensure_pool(len(thread_to_tasks))
@@ -561,7 +589,7 @@ class ThreadedExecutor:
                                     self._nccl_lock.release(failed=nccl_failed)
                             else:
                                 task.run(ctx)
-                        _record_completion_event(task, ctx)
+                        _record_completion_event(task, ctx, producers_to_record)
 
                     completion[task.name].set()
             except BaseException as e:
