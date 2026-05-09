@@ -253,19 +253,134 @@ def test_schedule_construction_deep_queue() -> None:
 
 
 def test_legacy_depth_equals_one_has_three_batches() -> None:
-    """Default prefetch_depth=1 should match legacy's 3-batch
-    non-prefetch pipeline and 4-batch prefetch pipeline."""
+    """Default prefetch_depth=1 should match legacy's 3-batch in-flight
+    layout for BOTH variants.
+
+    An earlier iteration placed prefetch at max_offset=3 (4 batches)
+    but that overflows the dynamicemb prefetch cache (caught by the
+    P2 parity test with use_dynamic_emb=True). Legacy prefetch
+    pipeline actually carries 3 in-flight (batch_i / batch_ip1 /
+    batch_ip2) — prefetch is an extra stage co-located with
+    input_dist at offset=1, not an additional batch slot."""
     p_np = _make_noop_pipeline(prefetch=False, prefetch_depth=1)
     s_np, _ = p_np._build_schedule()
-    assert (
-        s_np.in_flight_batches == 3
-    ), "Legacy JaggedMegatronTrainPipelineSparseDist carries 3 batches"
+    assert s_np.in_flight_batches == 3
 
     p_pf = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
     s_pf, _ = p_pf._build_schedule()
     assert (
-        s_pf.in_flight_batches == 4
-    ), "Legacy JaggedMegatronPrefetchTrainPipelineSparseDist carries 4 batches"
+        s_pf.in_flight_batches == 3
+    ), "Prefetch variant must also be 3 in-flight to fit dynamicemb cache"
+
+
+def test_default_thread_map_covers_every_task_name() -> None:
+    """HSTU_DEFAULT_THREAD_MAP must map every task name the pipeline
+    produces. Tasks without an entry fall through to the engine's
+    'default' thread, potentially reintroducing the postproc
+    set_context race (Codex D-CRITICAL-1)."""
+    from commons.pipeline.hstu_pipeline.pipeline import HSTU_DEFAULT_THREAD_MAP
+
+    # Prefetch variant has the widest task set (includes prefetch_embeddings)
+    p = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    schedule, _ = p._build_schedule()
+    task_names = {t.name for stage in schedule.stages for t in stage.tasks}
+
+    missing = task_names - set(HSTU_DEFAULT_THREAD_MAP)
+    assert not missing, (
+        f"HSTU_DEFAULT_THREAD_MAP is missing entries for: {sorted(missing)}. "
+        f"Add them to the map in hstu_pipeline/pipeline.py."
+    )
+
+
+def test_default_thread_map_has_two_threads() -> None:
+    """The default map must use at least 2 distinct thread ids
+    (io + compute). If collapsed to one thread, threaded mode silently
+    degrades to sequential."""
+    from commons.pipeline.hstu_pipeline.pipeline import HSTU_DEFAULT_THREAD_MAP
+
+    threads = set(HSTU_DEFAULT_THREAD_MAP.values())
+    assert len(threads) >= 2, (
+        f"Default thread map uses only {threads} thread(s); need ≥ 2 "
+        f"for real parallelism."
+    )
+
+
+def test_default_threaded_is_true() -> None:
+    """Default HSTUPipeline construction should be threaded=True with
+    HSTU_DEFAULT_THREAD_MAP applied automatically."""
+    import torch
+    from commons.pipeline.hstu_pipeline import HSTUPipeline
+    from commons.pipeline.hstu_pipeline.pipeline import HSTU_DEFAULT_THREAD_MAP
+
+    pipe = HSTUPipeline(
+        model=torch.nn.Linear(4, 4),
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+    )
+    assert pipe._threaded is True
+    assert pipe._thread_map == HSTU_DEFAULT_THREAD_MAP
+
+
+def test_set_context_colocation_custom_map_rejects_split() -> None:
+    """Codex C-LOW: if a custom thread_map splits start_input_dist
+    and forward onto different threads, construction must refuse."""
+    import torch
+    from commons.pipeline.hstu_pipeline import HSTUPipeline
+
+    # Malicious custom map: split the set_context chain
+    bad_map = {
+        "start_input_dist": "compute",
+        "forward": "other",
+        # others can be anywhere
+    }
+
+    pipe = HSTUPipeline(
+        model=torch.nn.Linear(4, 4),
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+        prefetch=False,
+        threaded=True,
+        thread_map=bad_map,
+    )
+    # Validator fires in _ensure_pipe, which is lazy. Call it directly.
+    schedule, _ = pipe._build_schedule()
+    with pytest.raises(ValueError, match="set_context-mutating"):
+        pipe._validate_set_context_colocation(schedule)
+
+
+def test_set_context_colocation_default_map_accepted() -> None:
+    """HSTU_DEFAULT_THREAD_MAP co-locates start_input_dist + forward
+    on the compute thread — the validator must accept it."""
+    import torch
+    from commons.pipeline.hstu_pipeline import HSTUPipeline
+
+    pipe = HSTUPipeline(
+        model=torch.nn.Linear(4, 4),
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+        prefetch=True,  # widest task set
+        threaded=True,
+    )
+    schedule, _ = pipe._build_schedule()
+    pipe._validate_set_context_colocation(schedule)  # no raise
+
+
+def test_set_context_colocation_sequential_bypass() -> None:
+    """Sequential executor has no thread race, so the validator is a
+    no-op even with a malformed thread_map (which would also be
+    ignored since threaded=False)."""
+    import torch
+    from commons.pipeline.hstu_pipeline import HSTUPipeline
+
+    pipe = HSTUPipeline(
+        model=torch.nn.Linear(4, 4),
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+        device=torch.device("cpu"),
+        prefetch=False,
+        threaded=False,
+    )
+    schedule, _ = pipe._build_schedule()
+    pipe._validate_set_context_colocation(schedule)  # no raise
 
 
 def test_prefetch_depth_validation() -> None:
