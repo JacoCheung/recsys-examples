@@ -44,7 +44,7 @@ from commons.distributed.finalize_model_grads import finalize_model_grads
 from commons.pipeline.hstu_pipeline import HSTUPipeline
 from commons.pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from commons.utils.distributed_utils import collective_assert
-from test_utils import create_model
+from test_utils import create_model, reset_dynamicemb_cache_states
 
 
 @pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"], []])
@@ -64,37 +64,12 @@ def test_hstu_pipeline_matches_none_pipeline(
     """HSTUPipeline should produce identical results to NonePipeline
     baseline when driven on identical (replicated) batches from
     identical initial weights."""
-    # Known structural limitation: the combo prefetch + use_dynamic_emb
-    # hits the bootstrap cache-leak issue (tasks/followups.md entry
-    # "P2 bootstrap — 1-batch loss + abandoned input_dist awaitable").
-    # The abandoned peek-batch _start_data_dist reserves dynamicemb
-    # cache entries that are never consumed; after a few iters the
-    # outstanding-key counter exceeds cache capacity. The fix is to
-    # not drop the peek batch — requires engine API extension to
-    # pre-populate ring slots. Tracked as followup; mark xfail until
-    # resolved.
-    if pipeline_type == "prefetch" and use_dynamic_emb:
-        # Deeper than the original bootstrap issue: dynamicemb's
-        # caching layer counts outstanding prefetched keys
-        # per-context. Legacy uses ONE shared v0 context across all
-        # batches (cache reuses the slot). Our v1 per-batch context
-        # design gives each in-flight batch its own ctx → 3 batches
-        # × N_keys outstanding simultaneously → 7168 cache overflow.
-        # Fix requires either reverting to v0-style shared context
-        # or upstream dynamicemb changes to track outstanding across
-        # sibling contexts. Tracked in tasks/followups.md.
+    # Keep the known non-dynamic TorchRec Adam checkpoint issue separate from
+    # the dynamicemb parity surface covered below.
+    if optimizer_type_str == "adam" and not use_dynamic_emb:
         pytest.xfail(
-            "prefetch + dynamic_emb hits v1-vs-v0 context accounting "
-            "mismatch with dynamicemb cache — deeper than bootstrap."
-        )
-    if optimizer_type_str == "adam":
-        # torchrec's checkpoint doesn't preserve the Adam optimizer
-        # `step` state. Same caveat as legacy test_pipeline.py:38.
-        # Skip this row until torchrec fix lands — not an HSTU bug.
-        pytest.xfail(
-            "torchrec checkpoint drops Adam `step` state (upstream "
-            "limitation, not HSTU). Legacy test_pipeline.py:38 has "
-            "the same caveat."
+            "torchrec FBGEMM TBE checkpoint/load drops Adam step state for "
+            "non-dynamic sparse tables; keep this separate from dynamicemb parity."
         )
 
     init.initialize_distributed()
@@ -110,7 +85,7 @@ def test_hstu_pipeline_matches_none_pipeline(
         pipeline_type="none",
         dtype=dtype,
         seed=1234,
-        num_batches=20,  # need extra batches for HSTU pipeline bootstrap + prefill
+        num_batches=60,  # need extra batches for HSTU pipeline bootstrap + prefill
         replicate_batches=True,  # all batches identical → bootstrap offset invisible
     )
     # Target: HSTUPipeline-driven model.
@@ -123,7 +98,7 @@ def test_hstu_pipeline_matches_none_pipeline(
         use_dynamic_emb=use_dynamic_emb,
         pipeline_type=pipeline_type,
         seed=1234,
-        num_batches=20,
+        num_batches=60,
         replicate_batches=True,
     )
 
@@ -154,6 +129,8 @@ def test_hstu_pipeline_matches_none_pipeline(
     checkpoint.load(
         save_path, pipelined_model, dense_optimizer=pipelined_dense_optimizer
     )
+    if use_dynamic_emb:
+        reset_dynamicemb_cache_states(pipelined_model)
     dist.barrier(device_ids=[torch.cuda.current_device()])
     if dist.get_rank() == 0:
         shutil.rmtree(save_path)
@@ -180,7 +157,11 @@ def test_hstu_pipeline_matches_none_pipeline(
     iter_base = iter(history_batches)
     iter_hstu = iter(history_batches)
 
-    num_compare_steps = 5  # keep short; bootstrap consumes extras
+    # 50 steps catches slow-building drift (cache leaks, stale-context
+    # reuse, accumulator divergence) that a short run wouldn't surface.
+    # If a single step matches by coincidence, 50 in a row matching to
+    # atol=1e-4 is a much harder coincidence to fake.
+    num_compare_steps = 50
 
     # Prime HSTU pipeline: first progress() call consumes peek batch +
     # prefill. After this, both pipelines are aligned step-for-step.
