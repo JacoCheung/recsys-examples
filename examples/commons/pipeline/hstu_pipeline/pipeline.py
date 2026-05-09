@@ -207,6 +207,30 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "optimizer_step": "compute",
         "watchdog_step": "compute",
     },
+    # All six critical-gated (la>0) tasks share a single "io" worker thread
+    # so they serialize on one host thread instead of spreading across
+    # io/data_dist/prefetch. With ``critical_gate=("compute_output_dist",)``
+    # on each of the six, they ALL block on compute_output_dist's
+    # threading.Event, then fire one-after-another on the io thread —
+    # producing a single, contiguous burst of NCCL submissions that share
+    # one ticket-acquire/release cadence and minimize cross-thread
+    # interleaving on the NCCL ordered lock.
+    "all_noncritical_on_io": {
+        "h2d": "io",
+        "start_shuffle": "io",
+        "finish_shuffle": "io",
+        "start_input_dist": "io",
+        "wait_input_dist": "io",
+        "prefetch_embeddings": "io",
+        "zero_grad": "compute",
+        "global_tokens_allreduce": "compute",
+        "compute_output_dist": "compute",
+        "forward": "compute",
+        "backward": "compute",
+        "finalize_model_grads": "compute",
+        "optimizer_step": "compute",
+        "watchdog_step": "compute",
+    },
 }
 
 
