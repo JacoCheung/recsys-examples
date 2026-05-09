@@ -731,5 +731,3 @@ demanded by Finding 4.
 
 Wait for Checkpoint A answers before starting V3. V0–V2 can proceed
 immediately.
-
-See [todo.md](todo.md) for the checkbox view.

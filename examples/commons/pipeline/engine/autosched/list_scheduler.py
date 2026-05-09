@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Critical-path list scheduler for Problem #1 (SPEC §4.3).
+"""Critical-path list scheduler (SPEC §4.3).
 
 Inputs:
   - A bag of `Task`s (user-authored or preset-generated).
@@ -23,7 +23,7 @@ Inputs:
 Output: a `Schedule` (stages + stream bindings) that respects all
 slot + `depends_on` edges AND is valid per SPEC §4.2.
 
-v1 algorithm: topological + priority-based list scheduling.
+Algorithm: topological + priority-based list scheduling.
 
   - Build the intra-iter dependency DAG (slot-writer → slot-reader,
     `depends_on` edges).
@@ -31,8 +31,8 @@ v1 algorithm: topological + priority-based list scheduling.
     to the deepest leaf, using `CostModel.total_us`).
   - Greedy ready-queue: at each step, pick the highest-priority
     ready task and append it to the schedule.
-  - All tasks go in a single `Stage` (V1 semantics — stages are
-    organizational, not required for scheduling correctness).
+  - All tasks go in a single `Stage` (stages are organizational,
+    not required for scheduling correctness).
 
 This is a straightforward offline heuristic. It minimizes critical
 path length under the given costs; not optimal for all workloads
@@ -63,9 +63,9 @@ def schedule_tasks(
       - Contains one `Stage` with all tasks in priority-sorted order
         (higher critical-path length runs earlier).
       - Has `stream_slots` exactly as passed.
-      - Preserves each task's declared `stream` — the v1 scheduler
+      - Preserves each task's declared `stream` — the scheduler
         does NOT rebind streams (that would require modeling
-        per-stream resource contention; punt to a later slice).
+        per-stream resource contention; out of scope here).
 
     Raises `ScheduleValidationError` if the resulting Schedule
     violates SPEC §4.2.
@@ -149,7 +149,7 @@ def schedule_tasks(
         stages=(Stage(tasks=tuple(ordered)),),
         stream_slots=stream_slots,
     )
-    # Consolidate: run the full V5 validator on the output. Catches
+    # Consolidate: run the full validator on the output. Catches
     # any rule violation introduced by scheduler bugs.
     validate(schedule)
     return schedule

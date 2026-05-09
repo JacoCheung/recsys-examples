@@ -56,7 +56,7 @@ class Schedule:
         stages: ordered tuple of Stages.
         stream_slots: tuple of stream names that the Schedule's Tasks
             may reference. Must contain every `task.stream` across all
-            tasks. V5 validator enforces.
+            tasks. Validator enforces.
 
     `in_flight_batches` is computed from `max(task.batch_offset) + 1`
     across all tasks (SPEC §4.2 rule 4). Never authored.
