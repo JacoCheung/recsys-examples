@@ -107,6 +107,12 @@ def make_h2d_task(
         raw = ctx.slots.get("batch_cpu", None)
         if raw is None:
             return  # drain: no new batch
+        # Idempotent: if seed_first_batch already pre-populated
+        # batch_gpu + torchrec_ctx for this slot, skip. This lets
+        # HSTUPipeline bootstrap use a real per-batch ctx and have
+        # the peek batch flow through the engine naturally.
+        if ctx.slots.get("batch_gpu", None) is not None:
+            return
         with nvtx.annotate("## h2d ##"):
             batch_gpu = _to_device(raw, state.device, non_blocking=True)
         ctx.slots.set("batch_gpu", batch_gpu)
@@ -198,6 +204,12 @@ def make_start_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task:
         if batch_gpu is None:
             ctx.slots.set("shuffle_handle", None)
             return
+        # Idempotent: if seed_first_batch already provided a shuffled
+        # result (shuffled_batch slot set), the peek batch's shuffle
+        # is already done. Skip re-issuing the KK AllGather.
+        if ctx.slots.get("shuffled_batch", None) is not None:
+            ctx.slots.set("shuffle_handle", None)
+            return
         with nvtx.annotate("## start_kk_async ##"):
             handle = state.batch_shuffler.start_shuffle_async(
                 batch_gpu, parallel_state.get_data_parallel_group()
@@ -226,6 +238,10 @@ def make_finish_shuffle_task(state: PipelineState, *, batch_offset: int) -> Task
     def _fn(ctx):
         batch_gpu = ctx.slots.get("batch_gpu", None)
         if batch_gpu is None:
+            return
+        # Idempotent: if seed_first_batch pre-populated shuffled_batch,
+        # this iter's shuffle work has already been done externally.
+        if ctx.slots.get("shuffled_batch", None) is not None:
             return
         if state.is_identity_shuffler:
             # Identity path: the shuffled_batch IS the batch_gpu
@@ -266,6 +282,16 @@ def make_start_input_dist_task(state: PipelineState, *, batch_offset: int) -> Ta
         shuffled = ctx.slots.get("shuffled_batch", None)
         torchrec_ctx = ctx.slots.get("torchrec_ctx", None)
         if shuffled is None or torchrec_ctx is None:
+            return
+        # Idempotent: if the ctx already has an in-flight splits
+        # request (populated by HSTU bootstrap via seed_first_batch),
+        # skip — re-running _start_data_dist would issue a second
+        # collective AND leak dynamicemb cache reservations.
+        if (
+            torchrec_ctx.input_dist_splits_requests
+            or torchrec_ctx.fused_splits_awaitables
+            or torchrec_ctx.input_dist_tensors_requests
+        ):
             return
         # Import here to keep framework-free invariant for engine/
         from commons.pipeline.utils import _start_data_dist
@@ -334,7 +360,12 @@ def make_wait_input_dist_task(state: PipelineState, *, batch_offset: int) -> Tas
 
 
 def make_prefetch_task(state: PipelineState, *, batch_offset: int) -> Task:
-    """Calls ShardedModule.prefetch on the prefetch stream."""
+    """Calls ShardedModule.prefetch on the prefetch stream and stores
+    the result into the context's ``module_input_post_prefetch`` /
+    ``module_contexts_post_prefetch`` — matching legacy ``_prefetch``
+    (train_pipeline.py:663-692). Without this post-step,
+    ``PrefetchPipelinedForward.__call__`` asserts because its
+    required slot is empty."""
 
     def _fn(ctx):
         shuffled = ctx.slots.get("shuffled_batch", None)
@@ -343,11 +374,16 @@ def make_prefetch_task(state: PipelineState, *, batch_offset: int) -> Task:
             return
         from commons.pipeline.utils import _prefetch_embeddings
 
-        # _prefetch_embeddings signature: first stream arg is a
-        # stream-context CALLABLE (like torch.cuda.stream), not a stream
-        # handle. Name is "stream_context" in the utils.py definition.
+        # Legacy clears these dicts before populating — mirror exactly.
+        torchrec_ctx.module_input_post_prefetch.clear()
+        torchrec_ctx.module_contexts_post_prefetch.clear()
+
         with nvtx.annotate("## prefetch ##"):
-            _prefetch_embeddings(
+            # record_stream so the prefetch stream can safely use the
+            # batch tensor (legacy does this too).
+            shuffled.record_stream(torch.cuda.current_stream())
+
+            data_per_module = _prefetch_embeddings(
                 batch=shuffled,
                 context=torchrec_ctx,
                 pipelined_modules=state.pipelined_modules,
@@ -356,6 +392,15 @@ def make_prefetch_task(state: PipelineState, *, batch_offset: int) -> Task:
                 data_dist_stream=ctx.stream_pool.get("data_dist"),
                 default_stream=ctx.stream_pool.get("default"),
             )
+            # Populate ctx.module_input_post_prefetch + _contexts_
+            # (legacy does this in _prefetch after _prefetch_embeddings).
+            for sharded_module in state.pipelined_modules:
+                fwd = sharded_module.forward
+                data = data_per_module[fwd._name]
+                torchrec_ctx.module_input_post_prefetch[fwd._name] = data
+                torchrec_ctx.module_contexts_post_prefetch[
+                    fwd._name
+                ] = torchrec_ctx.module_contexts.pop(fwd._name)
 
     return Task.from_fn(
         "prefetch_embeddings",
