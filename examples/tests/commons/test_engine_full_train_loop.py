@@ -271,7 +271,7 @@ def test_basic_prefetch_true_constructs_in_v4() -> None:
     model = torch.nn.Linear(_IN, _OUT).to(device)
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     pipe = SchedulablePipeline.basic(model, opt, prefetch=True, memcpy_stream=True)
-    # in_flight_batches is derived from h2d task's batch_offset=1
+    # in_flight_batches is derived from h2d task's lookahead=1
     assert pipe._schedule.in_flight_batches == 2
 
 

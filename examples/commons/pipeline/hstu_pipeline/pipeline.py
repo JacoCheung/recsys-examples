@@ -223,16 +223,16 @@ class HSTUPipeline:
               max_offset = K+1 for both variants.
         """
         depth = self._prefetch_depth
-        h2d_offset = depth + 1  # = 2 for depth=1
-        input_dist_offset = depth  # = 1 for depth=1
-        prefetch_offset = 1 if self._prefetch else None
+        h2d_lookahead = depth + 1  # = 2 for depth=1
+        input_dist_lookahead = depth  # = 1 for depth=1
+        prefetch_lookahead = 1 if self._prefetch else None
 
         tasks = [
-            make_h2d_task(self._state, batch_offset=h2d_offset),
-            make_start_shuffle_task(self._state, batch_offset=h2d_offset),
-            make_finish_shuffle_task(self._state, batch_offset=h2d_offset),
-            make_start_input_dist_task(self._state, batch_offset=input_dist_offset),
-            make_wait_input_dist_task(self._state, batch_offset=input_dist_offset),
+            make_h2d_task(self._state, lookahead=h2d_lookahead),
+            make_start_shuffle_task(self._state, lookahead=h2d_lookahead),
+            make_finish_shuffle_task(self._state, lookahead=h2d_lookahead),
+            make_start_input_dist_task(self._state, lookahead=input_dist_lookahead),
+            make_wait_input_dist_task(self._state, lookahead=input_dist_lookahead),
         ]
         # Note: for the prefetch variant, prefetch_embeddings is
         # declared AFTER forward (not before). Same-iter ordering
@@ -247,11 +247,11 @@ class HSTUPipeline:
                 make_zero_grad_task(self._state),
                 make_global_tokens_task(self._state),
                 make_nccl_safety_barrier_task(self._state),
-                make_forward_task(self._state),
+                make_forward_task(self._state, prefetch=self._prefetch),
             ]
         )
         if self._prefetch:
-            tasks.append(make_prefetch_task(self._state, batch_offset=prefetch_offset))
+            tasks.append(make_prefetch_task(self._state, lookahead=prefetch_lookahead))
         # backward depends_on prefetch_embeddings only in prefetch
         # variant — the engine emits wait_stream(prefetch) on default
         # stream because they're on different streams. Mirrors legacy
@@ -516,15 +516,29 @@ class HSTUPipeline:
         return self._pipe.progress(dataloader_iter)
 
     def attach(self, model: Optional[torch.nn.Module] = None) -> None:
-        """Matches legacy attach() — re-enable the pipeline after detach."""
+        """Matches legacy ``attach()`` — re-enable the pipeline after a
+        prior ``detach()``. After this call the next ``progress()`` will
+        rebuild the engine and re-install the pipelined forwards via
+        ``_rewrite_model``; ``detach()`` clears ``self._pipe`` and the
+        bookkeeping state so this happens automatically (Codex
+        B-MEDIUM-1).
+        """
         if model is not None:
             self._state.model = model
         self._model_attached = True
-        # If already attached once, nothing to do; _rewrite_model has
-        # already mutated the model in place.
 
     def detach(self) -> torch.nn.Module:
-        """Restore original forwards, return the bare model."""
+        """Restore the original (non-pipelined) module forwards and
+        return the bare model. Also clears HSTUPipeline-internal
+        bookkeeping (``self._pipe`` and the pipelined-modules /
+        original-forwards lists) so the next ``progress()`` after
+        ``attach()`` rebuilds the engine from scratch — i.e.
+        ``_rewrite_model`` runs again on the (possibly modified)
+        model and a fresh ``SchedulablePipeline`` is constructed.
+        Without this reset, an attach/progress sequence after detach
+        would still hold references to torn-down sharded module
+        forwards and skip ``_rewrite_model`` (Codex B-MEDIUM-1).
+        """
         if self._state.pipelined_modules:
             from commons.pipeline.utils import _pipeline_detach_model
 
@@ -535,6 +549,15 @@ class HSTUPipeline:
                 original_kjt_dist_forwards=self._original_kjt_dist_forwards,
                 pipelined_postprocs=self._state.pipelined_postprocs,
             )
+        # Reset bookkeeping so next progress() rebuilds the engine.
+        # See class docstring + B-MEDIUM-1 follow-up.
+        if self._pipe is not None:
+            self._pipe.shutdown()
+        self._pipe = None
+        self._state.pipelined_modules = []
+        self._state.pipelined_postprocs = []
+        self._original_forwards = []
+        self._original_kjt_dist_forwards = []
         self._model_attached = False
         return self._state.model
 

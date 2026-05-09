@@ -68,15 +68,15 @@ def test_rule2_negative_batch_offset_rejected() -> None:
 
 
 def test_rule2_slot_offset_mismatch_read_rejected() -> None:
-    """Task at batch_offset=0 declaring a read of DataSlot with
-    batch_offset=1 is a metadata lie — `ctx.slots` at runtime targets
-    `ring.at(task.batch_offset=0)`, not offset=1."""
+    """Task at lookahead=0 declaring a read of DataSlot with
+    lookahead=1 is a metadata lie — `ctx.slots` at runtime targets
+    `ring.at(task.lookahead=0)`, not offset=1."""
     t = Task.from_fn(
         name="bad_read",
         fn=_noop,
         reads=(DataSlot("x", batch_offset=1),),  # mismatch
         stream="default",
-        batch_offset=0,
+        lookahead=0,
     )
     # Add a phantom writer so the read resolves (rule 5 wouldn't
     # fire on "no writer") — we want rule 2's check to trigger.
@@ -85,7 +85,7 @@ def test_rule2_slot_offset_mismatch_read_rejected() -> None:
         fn=_noop,
         writes=(DataSlot("x", batch_offset=1),),
         stream="default",
-        batch_offset=1,
+        lookahead=1,
     )
     schedule = Schedule(stages=(Stage(tasks=(w, t)),), stream_slots=("default",))
     with pytest.raises(
@@ -123,7 +123,7 @@ def test_rule2_reserved_slot_name_caught_regardless_of_offset() -> None:
         fn=_noop,
         writes=(DataSlot("batch_cpu", batch_offset=1),),  # mismatched offset
         stream="default",
-        batch_offset=0,
+        lookahead=0,
     )
     schedule = Schedule(stages=(Stage(tasks=(t,)),), stream_slots=("default",))
     with pytest.raises(
@@ -139,7 +139,7 @@ def test_rule2_slot_offset_mismatch_write_rejected() -> None:
         fn=_noop,
         writes=(DataSlot("y", batch_offset=2),),  # mismatch
         stream="default",
-        batch_offset=0,
+        lookahead=0,
     )
     schedule = Schedule(stages=(Stage(tasks=(t,)),), stream_slots=("default",))
     with pytest.raises(
@@ -192,14 +192,14 @@ def test_rule4_same_name_writers_on_different_streams() -> None:
         fn=_noop,
         writes=(DataSlot("x", batch_offset=1),),
         stream="memcpy",
-        batch_offset=1,
+        lookahead=1,
     )
     b = Task.from_fn(
         name="b",
         fn=_noop,
         writes=(DataSlot("x", batch_offset=0),),
         stream="comm",
-        batch_offset=0,
+        lookahead=0,
     )
     schedule = Schedule(
         stages=(Stage(tasks=(a, b)),),
@@ -261,8 +261,8 @@ def test_rule5_cross_stage_same_offset_reader_before_writer_rejected() -> None:
 
 def test_rule5_cross_iter_reader_before_writer_allowed() -> None:
     """Cross-iter prefetch is legal regardless of declaration order:
-    writer at batch_offset=1 writes "future" batch. Reader at
-    batch_offset=0 reads the ring's current slot, which (after
+    writer at lookahead=1 writes "future" batch. Reader at
+    lookahead=0 reads the ring's current slot, which (after
     advance) is what the writer wrote on the previous iter. The
     reader can be declared before the writer — no violation."""
     consumer = Task.from_fn(
@@ -270,14 +270,14 @@ def test_rule5_cross_iter_reader_before_writer_allowed() -> None:
         fn=_noop,
         reads=(DataSlot("x", batch_offset=0),),
         stream="default",
-        batch_offset=0,
+        lookahead=0,
     )
     producer = Task.from_fn(
         name="next_batch_writer",
         fn=_noop,
         writes=(DataSlot("x", batch_offset=1),),
         stream="default",
-        batch_offset=1,
+        lookahead=1,
     )
     # Declare consumer first (at position 0), producer later.
     schedule = Schedule(
@@ -298,7 +298,7 @@ def test_rule5_future_read_rejected() -> None:
         fn=_noop,
         reads=(DataSlot("x", batch_offset=1),),
         stream="default",
-        batch_offset=1,
+        lookahead=1,
     )
     schedule = Schedule(
         stages=(Stage(tasks=(writer, reader)),),
@@ -445,7 +445,7 @@ def test_smoke_valid_prefetch_schedule_passes() -> None:
         reads=(DataSlot("batch_cpu", batch_offset=1),),
         writes=(DataSlot("batch_gpu", batch_offset=1),),
         stream="memcpy",
-        batch_offset=1,
+        lookahead=1,
     )
     fwd = Task.from_fn(
         name="fwd",
@@ -478,7 +478,7 @@ def test_engine_populated_slot_exempt_from_rule5() -> None:
         fn=_noop,
         reads=(DataSlot("batch_cpu", batch_offset=1),),
         stream="default",
-        batch_offset=1,
+        lookahead=1,
     )
     schedule = Schedule(stages=(Stage(tasks=(t,)),), stream_slots=("default",))
     # Must not raise — "batch_cpu" is engine-populated.

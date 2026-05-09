@@ -40,11 +40,19 @@ deferred, and a concrete next-step trigger.
 - **Trigger to resume**: when HSTU pipeline (Problem #2) lands and we
   can hook into a multi-rank test fixture.
 
-### NVTX integration
-- **Why deferred**: `Task.nvtx_tag` field exists but the engine doesn't
-  emit NVTX ranges. V10 audit left it as a followup.
-- **Trigger to resume**: when profiling the real HSTU pipeline shows
-  unlabeled CUDA activity we want to attribute.
+### NVTX integration — RESOLVED
+- **Status**: Fixed in f77111e5 (2026-04-26).
+- **Resolution**: ``engine/executor.py`` now wraps every
+  ``task.run(ctx)`` call in ``nvtx.annotate(task.nvtx_tag or
+  task.name)`` via the ``_nvtx_range`` context manager. Wrapping is
+  applied at every callsite (SequentialExecutor, single-task fast
+  path, all-same-thread fast path, per-thread chain with and without
+  NCCL ticketing). ``nvtx`` is imported optionally so CPU-only test
+  hosts and CUDA-less builds continue to work — the wrapper is a
+  no-op when ``nvtx`` is unimportable or CUDA is unavailable.
+- **Verification**: engine 183/2/0, HSTU parity 24/8/0, both
+  unchanged from prior baselines — wrapping does not perturb
+  behavior.
 
 ---
 
@@ -142,13 +150,22 @@ deferred, and a concrete next-step trigger.
 - **Verification**: prefetch + dynamic_emb parity 4/4 PASS in
   ce5144d9 (was xfail before d81593fc).
 
-### P2 `attach()` / `detach()` lifecycle incomplete
-- **Status**: KNOWN GAP. Codex B-MEDIUM-1.
-- **Details**: legacy `attach()` re-pipelines the current batch's
-  context or resets `_pipelined_modules` so the next `progress()`
-  rewrites. The adapter only toggles `_model_attached`.
-- **Trigger to resume**: when a user integrates the pipeline with a
-  pause/resume flow that calls `detach()` then `attach()`.
+### P2 `attach()` / `detach()` lifecycle incomplete — RESOLVED
+- **Status**: Fixed in 2026-04-26. Originally Codex B-MEDIUM-1.
+- **Resolution**: ``HSTUPipeline.detach()`` now resets the engine
+  bookkeeping after restoring the original sharded-module forwards:
+  ``self._pipe`` is shut down and set to ``None``, and the
+  ``pipelined_modules`` / ``pipelined_postprocs`` /
+  ``original_forwards`` / ``original_kjt_dist_forwards`` lists are
+  cleared. The next ``progress()`` after ``attach()`` will see
+  ``self._pipe is None`` and run ``_ensure_pipe`` from scratch —
+  ``_rewrite_model`` re-installs pipelined forwards on the
+  (possibly re-attached) model and a fresh ``SchedulablePipeline``
+  is built. ``attach()`` itself stays minimal: it only toggles
+  ``_model_attached`` and accepts an optional new model reference.
+- **Verification**: HSTU parity 24/8/0 unchanged (the parity test
+  doesn't exercise detach/attach but verifies the happy path is
+  unaffected by the bookkeeping reset).
 
 ### P2 full parity test — RESOLVED
 - **Status**: Shipped across 9a9a7f10 → ce5144d9 (2026-04-24..25).
@@ -179,83 +196,52 @@ deferred, and a concrete next-step trigger.
   set_context call-sites onto the "compute" thread. The original
   Codex D-CRITICAL-1 postproc race is resolved by construction.
 
-### Engine: event-based cross-stream sync (replace wait_stream)
-- **Status**: KNOWN PERFORMANCE LIMITATION. Codex review of commit
-  23414493 (B-MEDIUM / C-HIGH).
-- **What**: `engine/deps.py::infer_cross_stream_waits` and
-  `engine/executor.py::_compute_cpu_deps` both match producer ↔
-  consumer by **slot name** only (`writers_by_slot_name` at
-  deps.py:55; `writers[slot.name] = task.name` at executor.py:115).
-  They ignore `DataSlot.batch_offset`, and the resulting GPU sync
-  uses **stream-granularity** `wait_stream(producer_stream)` —
-  which blocks on ALL pending work on that stream, including the
-  current iter's producer run for a FUTURE batch.
-- **Concrete HSTU impact**: `forward@0 reads shuffled_batch@0`
-  (data written by `finish_shuffle@2` in the PREVIOUS iter).
-  Current analysis emits `wait_stream(memcpy)` on the default
-  stream before forward. At the moment this wait fires, memcpy
-  stream holds both:
-    (a) prior iter's `finish_shuffle@2` → needed, correct
-    (b) current iter's `finish_shuffle@2` for a NEW batch →
-        unneeded but also waited on
-  The io/compute overlap collapses because compute blocks on (b).
-- **Correctness**: preserved. Ring advance guarantees the slot
-  holds the right data; forward still reads correct values. Only
-  wall-clock pipeline overlap is degraded.
+### Engine: event-based cross-stream sync (replace wait_stream) — RESOLVED
+- **Status**: Fixed across 25ca73fe → 6c25a1de → 05d08a45 → 43af9499
+  (2026-04-26). Originally Codex review B-MEDIUM / C-HIGH on commit
+  23414493.
+- **Resolution**: SlotStore now carries a per-task event registry
+  (``set_event``/``get_event``/``has_event``); BatchRing.advance
+  rotates SlotStore objects in-place so the same
+  ``torch.cuda.Event`` is reused across iterations. The executor
+  records a completion event on each task's stream after
+  ``task.run`` returns, and ``_apply_cross_stream_waits`` prefers
+  ``wait_event(producer_event)`` from the ring slot over coarse
+  ``wait_stream(producer_stream)``. Stream-level wait remains as
+  a first-iter fallback when the slot has no event yet.
+  ``deps.infer_cross_stream_event_deps`` returns
+  ``(producer_task, producer_stream, slot_offset)`` triples
+  including for cross-iter ``depends_on=("name", -N)`` edges, with
+  redundancy checks against reads/writes data edges.
+- **Verification**: engine 183/2/0; HSTU parity 24/8/0 unchanged.
+  io/compute overlap improvement is workload-dependent — current
+  HSTU tests use identity shuffler, so wall-clock parity does not
+  exercise the perf delta. Re-profile under non-identity shuffler
+  if quantification needed (`tasks/SPEC_p4_micro_repro.py` is a
+  starter scaffold).
 
-- **Fix proposal (engine-level change)**:
-
-  1. Each task records a post-execution CUDA event on its stream
-     (`torch.cuda.Event` + `event.record(task_stream)`), stored
-     in the slot store at the task's `batch_offset` under a
-     reserved key like ``__done_event__{task_name}``.
-
-  2. Events travel down the ring via `ring.advance()` alongside
-     the data slots (so iter N+1's reader at offset K has access
-     to the event recorded in iter N at offset K+1).
-
-  3. `_apply_cross_stream_waits` changes from
-     `wait_stream(producer_stream)` → `wait_event(prior_event)`,
-     which waits on the SPECIFIC producer operation, not the
-     whole stream. Under the hood this is `cudaStreamWaitEvent`
-     — finer-grained than `cudaStreamSynchronize`/wait_stream.
-
-  4. For CPU-side (`_compute_cpu_deps`), same idea: per-task
-     completion events at the slot's ring-adjacent offset, not
-     the current-iter task instance.
-
-  5. DataSlot carries `batch_offset` already, so the producer
-     lookup keys on `(slot.name, slot.batch_offset)`. A reader
-     of `DataSlot(name, J)` pairs with the producer that wrote
-     `DataSlot(name, K)` where K ≥ J; the event is the one
-     recorded at offset K in iter (N-(K-J)) — ring advance has
-     carried it down to offset J by iter N.
-
-  6. Back-compat: if a task has no `.writes` declared but mutates
-     in place (like our `start_input_dist` mutating torchrec_ctx),
-     emit an event keyed by `(depends_on target name, offset)`
-     instead of slot name. Users can then declare `depends_on`
-     for non-slot-carried dependencies.
-
-- **Scope**: engine-level; affects Problem #1 spec. Not HSTU-specific.
-- **Trigger to resume**: either (a) perf profile shows significant
-  io ↔ compute stream blocking under non-identity shuffler workloads,
-  or (b) a new user needs tight fine-grained stream sync
-  semantics. Current HSTU tests (identity shuffler) don't expose
-  the perf loss.
-
-### HSTU: torchrec_ctx mutation chain not modeled as DAG edges — PARTIALLY RESOLVED
-- **Status**: Codex C-LOW. Runtime validator added 2026-04-24.
-- **Resolution**: `HSTUPipeline._validate_set_context_colocation`
-  refuses any `thread_map` that puts `start_input_dist` and
-  `forward` on different worker threads. Fails at pipeline
-  construction time (not mid-training). Added:
-    - unit test: `test_set_context_colocation_custom_map_rejects_split`
-    - integration test: `test_threaded_custom_bad_thread_map_rejected`
-- **Residual**: the DAG itself still doesn't encode the
-  torchrec_ctx mutation chain, so the validator is the seatbelt.
-  Full DAG modeling is a larger refactor bundled with the
-  event-based cross-stream sync followup above.
+### HSTU: torchrec_ctx mutation chain not modeled as DAG edges — RESOLVED
+- **Status**: Fixed in dc8e3ea4 (2026-04-26) on top of the
+  earlier runtime-validator partial fix from 2026-04-24. Originally
+  Codex C-LOW.
+- **Resolution**: ``prefetch_embeddings`` now declares
+  ``writes=("module_input_post_prefetch",
+  "module_contexts_post_prefetch")`` as pseudo-slots — the task body
+  still mutates ``torchrec_ctx`` in place, but the slot names give
+  the engine a dependency identifier. ``forward`` (in the prefetch
+  variant) declares the matching reads. ``deps.
+  infer_cross_stream_event_deps`` now sees the
+  ``prefetch_embeddings → forward`` cross-iter data edge and emits
+  ``wait_event(prefetch_embeddings_event_at_offset_0)`` before
+  forward, with stream-level fallback on iteration 1 when the ring
+  slot has no event yet. SPEC_p4 v2 §8 documents the pseudo-slot
+  mutation-chain syntax decision. The runtime
+  ``_validate_set_context_colocation`` validator is preserved as
+  belt-and-suspenders.
+- **Verification**: HSTU parity 24/8/0; first-iter forward →
+  prefetch race is now structurally covered by the explicit DAG
+  edge instead of the cross-iter chain via
+  ``backward.depends_on=prefetch_embeddings``.
 
 ### HSTU threaded parity test: stress-mode missing — RESOLVED
 - **Status**: Codex E-LOW. Fixed 2026-04-24.

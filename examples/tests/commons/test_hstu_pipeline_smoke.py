@@ -87,7 +87,7 @@ def test_h2d_task_fields() -> None:
     from commons.pipeline.hstu_pipeline.tasks import make_h2d_task
 
     state = _make_dummy_state()
-    t = make_h2d_task(state, batch_offset=2)
+    t = make_h2d_task(state, lookahead=2)
     assert t.name == "h2d"
     assert t.stream == "memcpy"
     assert t.batch_offset == 2
@@ -191,8 +191,8 @@ def test_identity_shuffler_skips_shuffle_nccl() -> None:
 
     state = _make_dummy_state()  # identity by default
     state.is_identity_shuffler = True
-    assert make_start_shuffle_task(state, batch_offset=1).nccl is False
-    assert make_finish_shuffle_task(state, batch_offset=1).nccl is False
+    assert make_start_shuffle_task(state, lookahead=1).nccl is False
+    assert make_finish_shuffle_task(state, lookahead=1).nccl is False
 
 
 # ----------------------------------------------------------------------
