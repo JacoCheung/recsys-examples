@@ -77,11 +77,11 @@ deferred, and a concrete next-step trigger.
   schedulable pipeline for vanilla PyTorch DDP.
 
 ### P2 bootstrap — 1-batch loss + abandoned input_dist awaitable — RESOLVED
-- **Status**: Fixed 2026-04-24 via engine `seed_first_batch` API +
+- **Status**: Fixed 2026-04-24 via engine `_seed_first_batch` API +
   idempotent HSTU tasks. The peek batch is now seeded into the
   engine ring as the first real batch and flows through forward
   normally. No dataset-coverage loss for non-caching cases.
-- **Engine change**: `SchedulablePipeline.seed_first_batch(slot_contents)`
+- **Engine change**: `SchedulablePipeline._seed_first_batch(slot_contents)`
   pre-populates `ring.at(max_offset)` and skips the next
   auto-pull. Safe to call only before first `progress()`.
 - **HSTU changes**: `h2d` / `start_shuffle` / `finish_shuffle` /
@@ -89,45 +89,58 @@ deferred, and a concrete next-step trigger.
   slot they'd write is already populated, so the peek batch's
   pre-processed state (from `_rewrite_model` bootstrap) is
   preserved intact.
-- **Residual**: dynamicemb + prefetch combo still fails, but the
-  root cause is now known to be different (see entry below).
+- **Residual**: none — the dynamicemb + prefetch combo (separate
+  root cause) was subsequently resolved in d81593fc + ce5144d9
+  (see entry below).
 
-### dynamicemb + prefetch: v1 per-batch context mismatch
-- **Status**: KNOWN LIMITATION. NEW diagnosis (was previously
-  conflated with the bootstrap issue, which is now fixed).
-- **What**: Legacy `PrefetchTrainPipelineSparseDist` uses a SINGLE
-  shared `self._context` (v0 legacy), so dynamicemb's cache
-  accounting — which tracks outstanding prefetched keys
-  per-context — sees one context recycled across all in-flight
-  batches. Cache capacity is sized for that single-ctx model
-  (cache_capacity ≈ 2 × per_batch_keys).
-- **Our design**: engine's BatchRing gives each in-flight batch
-  its own `torchrec_ctx` (v1 per-batch). With 3 batches in
-  flight (prefetch depth=1), we hold 3 contexts → 3 × N_keys
-  outstanding → overflow (12K > 7168).
-- **Fix options**:
-  1. Use a shared v0 context for all batches in HSTUPipeline's
-     prefetch variant. Requires forking the context handling
-     path so only prefetch variant does this — parallel to
-     legacy's split between `TrainPipelineSparseDist` (v1) and
-     `PrefetchTrainPipelineSparseDist` (v0).
-  2. Patch dynamicemb upstream so outstanding is tracked per
-     cache-table rather than per-context.
-  3. Increase cache capacity in HSTU test config to 3+ batches
-     worth — masks the limitation but doesn't solve it at scale.
-- **Trigger to resume**: when production HSTU training enables
-  `prefetch_type=prefetch` with `dynamic_emb` caching. The
-  parity test marks this combo `xfail` for now.
+### dynamicemb + prefetch: pipeline-depth mismatch — RESOLVED
+- **Status**: Fixed across d81593fc + ce5144d9 (2026-04-24..25).
+- **Root cause** (re-verified): dynamicemb's outstanding-key
+  counter is per-table (`BatchedDynamicEmbeddingTables.
+  _prefetch_outstanding_keys`, `batched_dynamicemb_tables.py:358`),
+  bumped at `prefetch()` and dropped at end of forward. Cache
+  capacity is sized for **steady-state ~2 batches outstanding**,
+  matching legacy's prefetch progress ordering (forward FIRST
+  → prefetch SECOND). The original HSTU schedule declared
+  `prefetch_embeddings@1` BEFORE `forward@0`, peaking at ~3
+  batches outstanding and overflowing cache.
+- **Fix 1** (d81593fc, schedule reorder): moved
+  `prefetch_embeddings` AFTER `forward` in `_build_schedule`
+  (pipeline.py:245-254). Steady-state outstanding drops from
+  peak-3 to peak-2. Mirrors legacy
+  `JaggedMegatronPrefetchTrainPipelineSparseDist.progress` at
+  `train_pipeline.py:993-997`.
+- **Fix 2** (ce5144d9, cache headroom + reset): bumped
+  `global_hbm_for_values` 8 MiB → 32 MiB for the `item` dynamic
+  table in `test_utils.py:587`, and added
+  `reset_dynamicemb_cache_states()` helper (`test_utils.py:42`)
+  called after ckpt save→load in the parity test so the loaded
+  pipelined model starts with a clean cache state.
+- **Verification**: parity test 24 passed / 8 xfailed / 0 failed
+  on luna-prod-78-80gb 4×A100 (commit ce5144d9). 50 compare
+  steps × 60 batches.
 
-### P2 prefetch variant — missing end-of-iter start_input_dist + pre-backward barrier
-- **Status**: KNOWN LIMITATION. Codex B-HIGH-2 / B-HIGH-3.
-- **Details**: legacy `JaggedMegatronPrefetchTrainPipelineSparseDist.
-  progress()` (train_pipeline.py:993-999) does
-  `current_stream().wait_stream(prefetch_stream)` before backward,
-  and at end-of-iter fires `_start_sparse_data_dist(batch_ip2)` on the
-  freshly shuffled batch. The task-graph port doesn't capture these.
-- **Trigger to resume**: enabling the prefetch variant for HSTU
-  training.
+### P2 prefetch variant — missing end-of-iter start_input_dist + pre-backward barrier — RESOLVED
+- **Status**: Fixed by d81593fc (2026-04-24). Codex B-HIGH-2 /
+  B-HIGH-3.
+- **Pre-backward barrier**: `make_backward_task` gained an
+  optional `depends_on` kwarg; for the prefetch variant
+  `_build_schedule` passes
+  `depends_on=("prefetch_embeddings",)` (pipeline.py:259-262).
+  Cross-stream depends_on triggers the engine's
+  `_apply_cross_stream_waits` to emit
+  `wait_stream(prefetch_stream)` on default stream before
+  backward — mirrors legacy `train_pipeline.py:996-997`.
+- **End-of-iter `start_input_dist(batch_ip2)`**: handled
+  declaratively via the task DAG + ring rather than imperatively.
+  `start_input_dist@1` runs once per iter on the slot at offset 1
+  (= legacy's `_batch_ip2`, two iters ahead of `forward@0`); ring
+  advance at end-of-iter shifts that slot down to offset 0 for the
+  next iter's forward. Same data-flow as legacy
+  `train_pipeline.py:1009-1013`, just expressed as topology
+  instead of statement order.
+- **Verification**: prefetch + dynamic_emb parity 4/4 PASS in
+  ce5144d9 (was xfail before d81593fc).
 
 ### P2 `attach()` / `detach()` lifecycle incomplete
 - **Status**: KNOWN GAP. Codex B-MEDIUM-1.
@@ -137,14 +150,28 @@ deferred, and a concrete next-step trigger.
 - **Trigger to resume**: when a user integrates the pipeline with a
   pause/resume flow that calls `detach()` then `attach()`.
 
-### P2 full parity test
-- **Status**: NOT YET WRITTEN. Codex F-MEDIUM-1.
-- **Required setup**: multi-rank NCCL + torchrec sharded EBC +
-  Megatron parallel state initialized. Current smoke tests only
-  validate task metadata + schedule construction.
-- **Trigger to resume**: when a 2-GPU test fixture is available in
-  CI or on a dev machine; also needs the bootstrap-1-batch issue
-  fixed first, otherwise parity is intrinsically impossible.
+### P2 full parity test — RESOLVED
+- **Status**: Shipped across 9a9a7f10 → ce5144d9 (2026-04-24..25).
+  Codex F-MEDIUM-1.
+- **Test file**: `examples/hstu/test/test_hstu_pipeline_parity.py`.
+  Compares `HSTUPipeline` (Problem #2 adapter) against synchronous
+  `JaggedMegatronTrainNonePipeline` baseline on bit-identical
+  initial weights (ckpt save→load). Asserts
+  `torch.allclose(reporting_loss, atol=1e-4)` and
+  `torch.allclose(logits, atol=1e-4)` for 50 consecutive steps.
+- **Coverage matrix**: 32 cases =
+  `pipeline_type ∈ {prefetch, native}` ×
+  `use_dynamic_emb ∈ {True, False}` ×
+  `optimizer_type_str ∈ {sgd, adam}` ×
+  `max_num_candidates ∈ {0, 10}` ×
+  `contextual_feature_names ∈ {[user0,user1], []}`,
+  dtype = bf16.
+- **Result** (luna-prod-78-80gb 4×A100, 50 steps × 60 batches):
+  24 passed / 8 xfailed / 0 failed in 152s. The 8 xfail are
+  `use_dynamic_emb=False + adam`, blocked by torchrec FBGEMM
+  TBE dropping Adam step state on ckpt save/load (upstream
+  limitation, not HSTU — see notes inline at
+  test_hstu_pipeline_parity.py:84-90).
 
 ### P2 threaded executor for HSTU — RESOLVED
 - **Status**: Shipped 2026-04-24 (commit 23414493). Default is now
