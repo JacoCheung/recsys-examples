@@ -8,13 +8,30 @@ deferred, and a concrete next-step trigger.
 
 ## From Problem #1 (schedulable pipeline engine)
 
-### V7 — Explicit event escape hatch
-- **Why deferred**: SPEC-level scope audit (2026-04-23). Not needed
-  for any realistic T1/T2 loop in scope; `wait_stream` auto-inference
-  covers the cases we care about.
-- **Trigger to resume**: A concrete schedule where automatic cross-stream
-  waits produce incorrect ordering and the user needs manual `Event`
-  record/wait.
+### V7 — Explicit event escape hatch — RESOLVED
+- **Status**: Landed 2026-04-26 as a minimal API addition on top of
+  the engine's existing per-slot event registry.
+- **Resolution**: ``TaskContext.record_event(name, *, batch_offset=0)``
+  records a ``torch.cuda.Event`` on the active task's CUDA stream and
+  stashes it on the slot at ``batch_offset`` under a ``user:``-prefixed
+  namespace (so it cannot collide with the engine's auto-recorded
+  task-completion events).
+  ``TaskContext.wait_event(name, *, batch_offset=0)`` retrieves the
+  user event and issues ``wait_event`` on the current stream;
+  returns ``False`` if the producer hasn't recorded yet (first-iter
+  fallback case — caller decides whether to ``wait_stream`` or skip).
+  Event objects ride the ring's in-place rotation so they're reused
+  across iterations like the engine's auto events.
+- **Verification**: 3 new tests:
+  * ``test_taskcontext_record_wait_event_no_torch_environment`` —
+    validates empty-name rejection + missing-producer returns False
+  * ``test_taskcontext_user_event_namespace_isolated`` — proves the
+    ``user:`` namespace doesn't alias engine task-completion events
+  * ``test_v7_explicit_event_escape_hatch_round_trip`` (CUDA) — full
+    GPU round-trip: writer records a checkpoint event mid-task, runs
+    a long unrelated tail, reader on a different stream uses the
+    escape-hatch wait + the engine's auto data-dep sync; per-element
+    sum matches expected within fp32 accumulation tolerance.
 
 ### V8 — BackwardHookTask
 - **Why deferred**: same audit. Autograd is atomic in scope; no

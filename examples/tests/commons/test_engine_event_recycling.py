@@ -143,6 +143,60 @@ def test_event_persists_through_full_ring_cycle() -> None:
     assert s.get_event("h2d") == "ev_h2d_persistent"
 
 
+# ---------------------------------------------------------------------
+# V7 — explicit Event escape hatch (followups.md V7)
+# ---------------------------------------------------------------------
+
+
+def test_taskcontext_record_wait_event_no_torch_environment() -> None:
+    """``TaskContext.record_event`` requires real torch.cuda; on a
+    CPU-only host it should still raise rather than silently no-op so
+    that test environments don't paper over a real failure.
+
+    We exercise the validation paths (empty name, missing producer)
+    here, which don't need GPU; the GPU round-trip is exercised in
+    ``test_engine_multi_stream.py``-style tests that run under CUDA.
+    """
+    import pytest
+    from commons.pipeline.engine.context import BatchRing, TaskContext
+
+    ring = BatchRing(n=2)
+    ctx = TaskContext(ring, stream_pool=None)
+
+    # wait_event with no recorded producer must return False so the
+    # caller can fall back to a coarser sync (e.g. wait_stream).
+    assert ctx.wait_event("not_recorded_yet") is False
+
+    with pytest.raises(ValueError, match="non-empty name"):
+        ctx.record_event("")
+    with pytest.raises(ValueError, match="non-empty name"):
+        ctx.wait_event("")
+
+
+def test_taskcontext_user_event_namespace_isolated() -> None:
+    """The escape-hatch event namespace (``user:``) must not collide
+    with engine-recorded producer-completion events keyed by
+    ``task.name``. A user task picking the name ``"forward"`` must NOT
+    see the engine's auto-recorded forward-completion event."""
+    from commons.pipeline.engine.context import BatchRing, TaskContext
+
+    ring = BatchRing(n=2)
+    ctx = TaskContext(ring, stream_pool=None)
+
+    # Engine-side: producer ``forward`` completion event lives at the
+    # bare task name (this is what _apply_cross_stream_waits queries).
+    slot0 = ring.at(0)
+    slot0.set_event("forward", "engine_forward_completion")
+
+    # User-side ``forward`` lives in the user: namespace and must NOT
+    # alias the engine event.
+    assert (
+        ctx.wait_event("forward") is False
+    ), "user:forward must be a separate slot from engine-recorded forward"
+    # And the engine-side event is still intact.
+    assert slot0.get_event("forward") == "engine_forward_completion"
+
+
 def test_advance_payload_is_not_visible_after_one_advance() -> None:
     """Data written at offset=0 is dropped (cleared) when that slot
     rotates to the highest offset — the slot's role changed, so its
