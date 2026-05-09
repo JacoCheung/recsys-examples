@@ -144,6 +144,11 @@ export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy}
 # when RECSYS_PIPELINE_BACKEND=new). Empty string = use the pipeline's
 # built-in default. Valid values come from HSTU_THREAD_MAP_PRESETS.
 export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-}
+# Auto-scheduler hook: when set, points at a JSON cost model the
+# engine consults to recommend per-task lookaheads (bit-exact only;
+# default-stream tasks frozen). Empty = disabled.
+export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-}
+export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5}
 
 # Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
 LAUNCH_BLOCKING_ENV=""
@@ -257,6 +262,8 @@ WRAPPER_EOF
             export CACHE_DEBUG=${CACHE_DEBUG:-0} && \
             export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && \
             export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && \
+            export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-} && \
+            export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5} && \
             ${LAUNCH_BLOCKING_ENV} \
             ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
             python -u ${TRAIN_CMD}
@@ -282,7 +289,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-} && export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
