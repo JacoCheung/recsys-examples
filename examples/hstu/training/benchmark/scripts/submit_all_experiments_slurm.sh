@@ -253,6 +253,18 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             show_help
             ;;
+        # Forward-compat: tolerate flags emitted by newer submit_remote.sh
+        # versions. This branch only implements e2e; --benchmark-type and
+        # --post-nsys-analyze are no-ops here.
+        --benchmark-type=*)
+            shift
+            ;;
+        --benchmark-type)
+            shift 2
+            ;;
+        --post-nsys-analyze)
+            shift
+            ;;
         *)
             echo "❌ Unknown option: $1"
             echo "Use --help for usage information"
@@ -520,7 +532,7 @@ for i in "${!EXP_NAMES[@]}"; do
     fi
     
     # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
-    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${CACHE_DEBUG}"
+    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${CACHE_DEBUG},RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy},HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-}"
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script

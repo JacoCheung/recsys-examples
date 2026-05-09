@@ -24,6 +24,8 @@ batch for FX tracing. We defer engine construction to the first
 
 from __future__ import annotations
 
+import contextlib
+import os
 from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
@@ -53,7 +55,12 @@ from .tasks import (
     make_zero_grad_task,
 )
 
-__all__ = ["HSTUPipeline", "HSTU_DEFAULT_THREAD_MAP"]
+__all__ = [
+    "HSTUPipeline",
+    "HSTU_DEFAULT_THREAD_MAP",
+    "HSTU_THREAD_MAP_PRESETS",
+    "resolve_hstu_thread_map_variant",
+]
 
 
 # ----------------------------------------------------------------------
@@ -97,6 +104,119 @@ HSTU_DEFAULT_THREAD_MAP: dict = {
 }
 
 
+# Named thread-map presets for sweeping schedule variants in benchmarks.
+# Selected at construction time via ``thread_map=<name>`` or via the
+# env var ``HSTU_THREAD_MAP_VARIANT`` (only consulted when the kwarg is
+# left at its ``None`` default and ``threaded=True``). Keeping these
+# inside the engine package means a sweep doesn't have to bake variant
+# logic into the launcher / training script.
+#
+# Variant rationale (per HSTU pipeline topology audit):
+#   default              — io / compute split (2 threads). Baseline. CPU
+#                          waits=0 because io tasks live at lookahead=2
+#                          and readers live at lookahead<=1, so no exact
+#                          slot match across threads. All compute work
+#                          (input_dist + prefetch + fwd + bwd + opt)
+#                          serializes on one thread → host enqueue is
+#                          the bottleneck.
+#   by_stream            — one thread per CUDA stream (4 threads in
+#                          prefetch mode: default, memcpy, data_dist,
+#                          prefetch). Lets data_dist + prefetch host
+#                          enqueue run in parallel with default-stream
+#                          fwd/bwd. Costs ~2 cross-thread CPU waits per
+#                          progress.
+#   per_task             — one thread per task (14 threads). Maximum
+#                          parallelism but ~15 cross-thread CPU waits
+#                          per progress; pool dispatch overhead likely
+#                          dominates.
+#   io_prefetch_compute  — 3 threads: io / prefetch / compute. Splits
+#                          prefetch_embeddings off the compute thread so
+#                          its dynamicemb cache writes can overlap with
+#                          backward on the default stream. Adds a
+#                          cross-thread CPU edge for forward←prefetch
+#                          (next-iter consumer pattern, Δ=1).
+#   io_data_dist_compute — 3 threads: io / data_dist / compute. Splits
+#                          input_dist off so its NCCL host enqueue can
+#                          overlap with compute. Useful when input_dist
+#                          is comm-heavy.
+#   io_data_dist_prefetch_compute — 4 threads: io / data_dist / prefetch
+#                          / compute. Combines the above two splits.
+HSTU_THREAD_MAP_PRESETS: dict = {
+    "default": HSTU_DEFAULT_THREAD_MAP,
+    "by_stream": "by_stream",
+    "per_task": "per_task",
+    "io_prefetch_compute": {
+        # io
+        "h2d": "io",
+        "start_shuffle": "io",
+        "finish_shuffle": "io",
+        # prefetch
+        "prefetch_embeddings": "prefetch",
+        # compute
+        "start_input_dist": "compute",
+        "wait_input_dist": "compute",
+        "zero_grad": "compute",
+        "global_tokens_allreduce": "compute",
+        "nccl_safety_barrier": "compute",
+        "forward": "compute",
+        "backward": "compute",
+        "finalize_model_grads": "compute",
+        "optimizer_step": "compute",
+        "watchdog_step": "compute",
+    },
+    "io_data_dist_compute": {
+        "h2d": "io",
+        "start_shuffle": "io",
+        "finish_shuffle": "io",
+        "start_input_dist": "data_dist",
+        "wait_input_dist": "data_dist",
+        "prefetch_embeddings": "compute",
+        "zero_grad": "compute",
+        "global_tokens_allreduce": "compute",
+        "nccl_safety_barrier": "compute",
+        "forward": "compute",
+        "backward": "compute",
+        "finalize_model_grads": "compute",
+        "optimizer_step": "compute",
+        "watchdog_step": "compute",
+    },
+    "io_data_dist_prefetch_compute": {
+        "h2d": "io",
+        "start_shuffle": "io",
+        "finish_shuffle": "io",
+        "start_input_dist": "data_dist",
+        "wait_input_dist": "data_dist",
+        "prefetch_embeddings": "prefetch",
+        "zero_grad": "compute",
+        "global_tokens_allreduce": "compute",
+        "nccl_safety_barrier": "compute",
+        "forward": "compute",
+        "backward": "compute",
+        "finalize_model_grads": "compute",
+        "optimizer_step": "compute",
+        "watchdog_step": "compute",
+    },
+}
+
+
+def resolve_hstu_thread_map_variant(name: Optional[str]) -> Any:
+    """Resolve a named variant from ``HSTU_THREAD_MAP_PRESETS``.
+
+    Returns ``None`` for ``name=None`` (caller falls back to
+    ``HSTU_DEFAULT_THREAD_MAP``). Raises ``ValueError`` for unknown
+    names so a typo in benchmark config doesn't silently fall back to
+    the default and corrupt A/B comparisons.
+    """
+    if name is None:
+        return None
+    if name not in HSTU_THREAD_MAP_PRESETS:
+        raise ValueError(
+            f"Unknown HSTU thread_map variant {name!r}. "
+            f"Known: {sorted(HSTU_THREAD_MAP_PRESETS.keys())}"
+        )
+    return HSTU_THREAD_MAP_PRESETS[name]
+
+
 class HSTUPipeline:
     """Drop-in replacement for ``JaggedMegatronTrainPipelineSparseDist``
     / ``JaggedMegatronPrefetchTrainPipelineSparseDist`` built on the
@@ -135,8 +255,24 @@ class HSTUPipeline:
         # Resolve default thread_map when threaded=True and user didn't
         # pass one. Users can pass a dict / callable / "by_stream" /
         # "per_task" to override.
+        #
+        # Env var ``HSTU_THREAD_MAP_VARIANT`` (only when kwarg is None)
+        # selects a named preset from ``HSTU_THREAD_MAP_PRESETS``.
+        # Used by the benchmark sweep to A/B schedule variants without
+        # rebuilding the pipeline construction call site.
         if threaded and thread_map is None:
-            thread_map = HSTU_DEFAULT_THREAD_MAP
+            env_variant = os.environ.get("HSTU_THREAD_MAP_VARIANT")
+            if env_variant:
+                thread_map = resolve_hstu_thread_map_variant(env_variant)
+            else:
+                thread_map = HSTU_DEFAULT_THREAD_MAP
+        elif (
+            threaded
+            and isinstance(thread_map, str)
+            and thread_map in HSTU_THREAD_MAP_PRESETS
+        ):
+            # Allow callers to pass a preset name directly.
+            thread_map = resolve_hstu_thread_map_variant(thread_map)
 
         self._prefetch = prefetch
         self._prefetch_depth = prefetch_depth
@@ -429,10 +565,56 @@ class HSTUPipeline:
         else:
             peek_batch_gpu = _to_device(peek_batch_cpu, device, non_blocking=True)
 
-        # _rewrite_model bootstraps on a REAL per-batch ctx on the
-        # engine's data_dist stream (after wait_stream on memcpy).
+        # Synchronously run the shuffler on the peek batch so the
+        # bootstrap ``_start_data_dist`` (and FX-trace) bind to the
+        # SAME post-shuffle batch the engine will see in steady state.
+        #
+        # Why: ``_rewrite_model`` calls ``_start_data_dist(modules,
+        # peek_batch, peek_ctx)`` which populates ``peek_ctx`` with
+        # input-dist requests sized for ``peek_batch``. We then seed
+        # that ctx + ``shuffled_batch`` into the ring's max_offset
+        # slot. If the seeded ``shuffled_batch`` doesn't match the
+        # batch the ctx was bound to, ``start_input_dist``'s
+        # idempotent guard short-circuits at first iter and the ctx's
+        # ``module_input_post_prefetch`` (later set by
+        # prefetch_embeddings) ends up sized for a DIFFERENT batch
+        # than ``shuffled_batch``. Forward then sees mismatched row
+        # counts (item embeddings come from ``module_input_post_prefetch``,
+        # contextual features from the actual ``shuffled_batch``) and
+        # crashes inside ``hstu_preprocess_embeddings``' ``torch.cat``.
+        # Mirror legacy ``_copy_batch_to_gpu_and_shuffle`` which also
+        # does the shuffle synchronously on ``_memcpy_stream`` before
+        # any input_dist work fires.
+        if self._state.is_identity_shuffler:
+            peek_batch_shuffled = peek_batch_gpu
+        else:
+            from megatron.core import parallel_state
+
+            shuffle_kwargs: dict = {}
+            if device.type == "cuda" and memcpy_stream is not None:
+                shuffle_ctx: Any = torch.cuda.stream(memcpy_stream)
+            else:
+                shuffle_ctx = contextlib.nullcontext()
+            with shuffle_ctx:
+                peek_batch_shuffled = self._state.batch_shuffler.shuffle(
+                    peek_batch_gpu,
+                    parallel_state.get_data_parallel_group(),
+                    **shuffle_kwargs,
+                )
+            # record_stream the shuffled tensor onto every consumer
+            # stream too — same lifetime guarantee as peek_batch_gpu.
+            if device.type == "cuda" and memcpy_stream is not None:
+                for consumer in consumers:
+                    if consumer is not None and hasattr(
+                        peek_batch_shuffled, "record_stream"
+                    ):
+                        peek_batch_shuffled.record_stream(consumer)
+
+        # _rewrite_model bootstraps on the SHUFFLED peek so the ctx's
+        # input-dist state matches the batch start_input_dist will see
+        # in steady state.
         peek_ctx = self._rewrite_model(
-            peek_batch_gpu,
+            peek_batch_shuffled,
             data_dist_stream,
             default_stream,
             memcpy_stream=memcpy_stream,
@@ -444,23 +626,17 @@ class HSTUPipeline:
         self._pipe = SchedulablePipeline(schedule, pool, executor=executor)
 
         # Seed the engine with the peek batch's pre-processed state:
-        # batch_cpu / batch_gpu both set (h2d already done), torchrec_ctx
-        # set (with in-flight input_dist from _start_data_dist bootstrap),
-        # and for identity shuffler shuffled_batch is just batch_gpu.
-        # Idempotent guards in h2d/start_shuffle/finish_shuffle/start_input_dist
-        # tasks skip the work that's already been done.
+        # batch_cpu / batch_gpu / shuffled_batch / torchrec_ctx are all
+        # set so the first-iter h2d / start_shuffle / finish_shuffle /
+        # start_input_dist tasks all idempotent-skip; the ctx is bound
+        # to ``shuffled_batch`` via the bootstrap _start_data_dist
+        # above so prefetch_embeddings + forward see consistent state.
         seeded: dict = {
             "batch_cpu": peek_batch_cpu,
             "batch_gpu": peek_batch_gpu,
+            "shuffled_batch": peek_batch_shuffled,
             "torchrec_ctx": peek_ctx,
         }
-        if self._state.is_identity_shuffler:
-            # Identity shuffler: shuffled_batch IS the batch_gpu.
-            seeded["shuffled_batch"] = peek_batch_gpu
-        # (For non-identity shuffler, the engine's start_shuffle +
-        # finish_shuffle tasks still need to run on the peek batch.
-        # The shuffler's start/finish collectives are idempotent at
-        # the NCCL level — they'll happen exactly once per batch.)
         self._pipe._seed_first_batch(seeded)
 
     # ------------------------------------------------------------------
