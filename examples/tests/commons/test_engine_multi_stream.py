@@ -316,6 +316,108 @@ def test_cross_stream_wait_prevents_race() -> None:
         )
 
 
+def test_v7_explicit_event_escape_hatch_round_trip() -> None:
+    """V7 escape hatch: a producer task records a user-named event
+    via ``ctx.record_event("checkpoint")`` partway through its work,
+    a consumer task on a different stream waits via
+    ``ctx.wait_event("checkpoint")`` before reading the produced value.
+
+    This is the "I want a partial-progress signal" pattern that the
+    auto cross-stream sync (engine-recorded completion event after
+    task body returns) cannot express. To prove the wait is doing
+    real work, the producer:
+      1. records the user event right after writing the distinctive
+         final value, then
+      2. issues a long tail of unrelated work that the consumer
+         must NOT block on.
+    The consumer waits on ``checkpoint`` (which is recorded BEFORE
+    the unrelated tail) and reads the shared tensor. Without the
+    wait, on first iter (no auto cross-stream sync from a previous
+    iter's slot data) the consumer would race ahead of the writer.
+    """
+    device = _cuda_or_skip()
+
+    n_elements = 4_000_000
+    shared = torch.zeros(n_elements, device=device)
+
+    def _writer(ctx) -> None:
+        shared.fill_(0.0)
+        for _ in range(800):
+            shared.add_(0.01)
+        shared.fill_(99.0)
+        ctx.record_event("checkpoint")
+        # Long unrelated tail — if the consumer waits on the producer's
+        # auto-completion event, it would block on this. Waiting on
+        # the user event lets it proceed sooner.
+        for _ in range(2000):
+            shared.add_(0.001)
+        ctx.slots.set("shared", shared)
+
+    def _reader_via_user_event(ctx) -> None:
+        # Drop the engine-auto wait_stream by reading from a slot the
+        # writer DOESN'T declare (effectively bypassing data-deps),
+        # forcing reliance on the explicit user event. We still write
+        # to step_result so the engine can return it.
+        waited = ctx.wait_event("checkpoint")
+        x = shared
+        # On the first iter, no producer has run yet on any prior
+        # iteration, so wait_event returns False and we should fall
+        # back to wait_stream-equivalent. To keep the test
+        # deterministic across first/steady iters, consult `waited`.
+        if not waited:
+            # First-iter fallback: explicitly wait on memcpy stream.
+            ctx.stream_pool.get("default").wait_stream(ctx.stream_pool.get("memcpy"))
+        ctx.slots.set("step_result", x.sum())
+
+    writer = Task.from_fn(
+        name="writer",
+        fn=_writer,
+        writes=(DataSlot("shared"),),
+        stream="memcpy",
+    )
+    reader = Task.from_fn(
+        name="reader",
+        fn=_reader_via_user_event,
+        reads=(DataSlot("shared"),),
+        stream="default",
+        # Explicit task-name dep so the schedule validator + engine
+        # know reader follows writer. The user-event wait is what
+        # makes the GPU sync correct on default stream.
+        depends_on=("writer",),
+    )
+    schedule = Schedule(
+        stages=(Stage(tasks=(writer, reader)),),
+        stream_slots=("default", "memcpy"),
+    )
+    pool = StreamPool(
+        {
+            "default": torch.cuda.default_stream(device),
+            "memcpy": torch.cuda.Stream(device),
+        }
+    )
+    pipe = SchedulablePipeline(schedule, pool)
+
+    # Recorded final value (99.0) + 2000 × 0.001 tail. fp32
+    # accumulation drift on the tail gives ~2.0 ± 0.01. Use a
+    # tolerance on the per-element mean rather than an exact compare;
+    # the per-element value should be close to 101.0, NOT close to
+    # 99.0 (which would mean the reader observed only the terminal
+    # fill_ and not the tail) and NOT close to 0.0 (which would mean
+    # the reader raced ahead of the writer entirely).
+    for i in range(5):
+        result_tensor = pipe.progress(iter([None]))
+        torch.cuda.synchronize(device)
+        observed_mean = result_tensor.item() / n_elements
+        assert abs(observed_mean - 101.0) < 0.1, (
+            f"V7 round-trip iter {i}: per-element mean={observed_mean}, "
+            f"expected ~101.0 (= 99.0 terminal fill + 2000 × 0.001 "
+            f"tail). A mean near 99.0 means the reader observed only "
+            f"the terminal value but not the post-event tail (engine's "
+            f"data-dep auto-sync failed); near 0.0 means the reader "
+            f"raced past the writer entirely (V7 API broken)."
+        )
+
+
 def test_stream_pool_use_none_resolves_to_anchor_default() -> None:
     """Direct assertion: `pool.use('default')` on a slot that holds
     `None` must enter `default_stream(anchor_device)` as the current

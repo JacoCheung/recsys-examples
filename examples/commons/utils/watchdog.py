@@ -77,35 +77,72 @@ class StackDumpWatchdog:
                 self._heartbeat()
 
     def _dump_stacks(self, elapsed: float):
-        print(f"\n{'='*60}", file=sys.stderr)
-        print(
-            f"⚠️  WATCHDOG: No activity for {elapsed:.0f}s, dumping stack...",
-            file=sys.stderr,
-        )
-        print(f"{'='*60}", file=sys.stderr)
+        # rank/pid tag — multi-process torchrun runs land all 8 ranks'
+        # stack dumps into the same stderr stream; the tag is the only
+        # way to read them apart. Resolve once per dump in case rank
+        # was set lazily (e.g. by torch.distributed.init_process_group
+        # after watchdog construction).
+        pid = os.getpid()
+        rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "?"
+
+        # Format the entire dump into ONE string and emit it via a
+        # single sys.stderr.write() + flush(). With 8 torchrun ranks
+        # all sharing the same stderr pipe, the previous per-line
+        # print() calls interleave at sub-frame granularity (we
+        # observed engine_0 frames from rank 2 mixed into rank 5's
+        # MainThread block). A single write() of the whole rank's
+        # dump is the simplest atomicity story — POSIX pipe writes up
+        # to PIPE_BUF (4 KiB) are atomic across processes, and even
+        # larger writes get a kernel-side fast path that vastly
+        # reduces interleaving compared to N separate prints.
 
         frames = sys._current_frames()
+        # Map tid -> Thread object for friendly names. Threads without
+        # a Python `Thread` wrapper (e.g. native NCCL watchdog threads
+        # spawned by libtorch_cuda) won't appear here — they show up
+        # in `frames` but `threading.enumerate()` does NOT enumerate
+        # them.
+        thread_by_id = {t.ident: t for t in threading.enumerate()}
 
-        # Only dump the watched thread's stack
+        # Dump the watched (main) thread first, then everything else
+        # in deterministic ident order.
+        ordered_ids = []
         if self._watched_thread_id and self._watched_thread_id in frames:
-            stack = frames[self._watched_thread_id]
-            thread_name = "Unknown"
-            for t in threading.enumerate():
-                if t.ident == self._watched_thread_id:
-                    thread_name = t.name
-                    break
-            print(
-                f"\n--- Watched Thread: {thread_name} (id={self._watched_thread_id}) ---",
-                file=sys.stderr,
-            )
-            traceback.print_stack(stack, file=sys.stderr)
-        else:
-            print(
-                f"\n⚠️  Watched thread (id={self._watched_thread_id}) not found!",
-                file=sys.stderr,
-            )
+            ordered_ids.append(self._watched_thread_id)
+        for tid in sorted(frames.keys()):
+            if tid != self._watched_thread_id:
+                ordered_ids.append(tid)
 
-        print(f"{'='*60}\n", file=sys.stderr)
+        from io import StringIO
+
+        buf = StringIO()
+        buf.write("\n" + "=" * 60 + "\n")
+        buf.write(
+            f"⚠️  WATCHDOG [rank{rank} pid={pid}]: No activity for "
+            f"{elapsed:.0f}s, dumping stacks for ALL threads...\n"
+        )
+        buf.write("=" * 60 + "\n")
+
+        for tid in ordered_ids:
+            stack = frames.get(tid)
+            if stack is None:
+                continue
+            t = thread_by_id.get(tid)
+            name = t.name if t is not None else "<native-only>"
+            daemon = "daemon" if (t is not None and t.daemon) else "non-daemon"
+            tag = "WATCHED" if tid == self._watched_thread_id else "thread"
+            buf.write(
+                f"\n--- [rank{rank} pid={pid}] {tag}: {name} "
+                f"(tid={tid}, {daemon}) ---\n"
+            )
+            traceback.print_stack(stack, file=buf)
+
+        buf.write("=" * 60 + "\n\n")
+        # Single atomic-ish write to stderr. PIPE_BUF on Linux is
+        # 4096; dumps larger than that may still split, but at thread-
+        # boundary granularity rather than line-by-line.
+        sys.stderr.write(buf.getvalue())
+        sys.stderr.flush()
 
     def _start(self):
         if not self.on:
