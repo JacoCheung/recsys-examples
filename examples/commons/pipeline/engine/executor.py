@@ -325,12 +325,12 @@ def _compute_cpu_deps(
 
 
 # ------------------------------------------------------------------
-# Sequential (Problem #1 default)
+# Sequential
 # ------------------------------------------------------------------
 
 
 class SequentialExecutor:
-    """Single-threaded task execution — identical to Problem #1 behavior."""
+    """Single-threaded task execution."""
 
     def execute_stage(
         self,
@@ -420,7 +420,7 @@ class _NcclOrderedLock:
 
 
 # ------------------------------------------------------------------
-# Threaded (Problem #3)
+# Threaded
 # ------------------------------------------------------------------
 
 

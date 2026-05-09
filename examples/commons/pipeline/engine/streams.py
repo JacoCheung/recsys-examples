@@ -52,9 +52,8 @@ class StreamPool:
     On pure-CPU hosts (no CUDA), both paths keep `None` as-is;
     `torch.cuda.stream(None)` is a safe no-op.
 
-    v1 only uses this for name→stream lookup in a single-stream
-    `default` pool. V3 generalizes to multi-stream with auto-inferred
-    `wait_stream` edges.
+    Used for name→stream lookup. Multi-stream pools support
+    auto-inferred `wait_stream` edges.
     """
 
     def __init__(self, streams: Mapping[str, Optional[torch.cuda.Stream]]) -> None:

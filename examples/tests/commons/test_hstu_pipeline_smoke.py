@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Problem #2 — HSTU pipeline smoke tests.
+"""HSTU pipeline smoke tests.
 
 Scope of what this file tests:
   - Imports resolve cleanly (factory + pipeline classes)
@@ -507,10 +507,11 @@ def test_pretrain_gr_ranking_backend_env_var_routing() -> None:
     assert "must be 'legacy' or 'new'" in text
 
 
-def test_legacy_pipeline_files_untouched_by_p2() -> None:
-    """Problem #2 must NOT modify train_pipeline.py, train_pipeline_factory.py,
-    or utils.py. The engine has a similar test; this one uses import
-    hash so it catches even if the legacy test is disabled."""
+def test_legacy_pipeline_files_untouched_by_hstu_adapter() -> None:
+    """The HSTU adapter must NOT modify train_pipeline.py,
+    train_pipeline_factory.py, or utils.py. The engine has a similar
+    test; this one uses import hash so it catches even if the legacy
+    test is disabled."""
     import hashlib
     from pathlib import Path
 

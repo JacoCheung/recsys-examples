@@ -144,7 +144,7 @@ def test_event_persists_through_full_ring_cycle() -> None:
 
 
 # ---------------------------------------------------------------------
-# V7 — explicit Event escape hatch (followups.md V7)
+# Explicit Event escape hatch (see tasks/followups.md)
 # ---------------------------------------------------------------------
 
 

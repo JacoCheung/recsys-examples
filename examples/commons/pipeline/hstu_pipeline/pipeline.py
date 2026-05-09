@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HSTUPipeline — adapter that drives the Problem #1 SchedulablePipeline
-engine using torchrec's ``_rewrite_model`` + ``HSTUPipelinedForward``
+"""HSTUPipeline — adapter that drives the SchedulablePipeline engine
+using torchrec's ``_rewrite_model`` + ``HSTUPipelinedForward``
 (see ``embedding_split``) for the HSTU training scenario.
 
 Unlike TorchRec's stock ``PipelinedForward`` / ``PrefetchPipelinedForward``
