@@ -21,7 +21,7 @@ loop. Tasks are stateless closures over a shared ``PipelineState`` that
 the HSTUPipeline owns — references to the optimizer, pipelined
 modules, shuffler, etc., are captured at schedule-build time.
 
-Slot conventions (see SPEC_p2.md §5.2):
+Slot conventions:
 
   ``batch_cpu``       engine-populated; raw batch from dataloader
   ``batch_gpu``       H2D'd pre-shuffle batch

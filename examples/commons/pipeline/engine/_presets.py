@@ -19,9 +19,6 @@ These 5 makers are **not** re-exported from `engine/__init__.py`.
 Users who need to compose Tasks directly (T3/T4 adoption) write their
 own forward/loss/backward Tasks — the preset API is one function
 (`SchedulablePipeline.basic`), not a library of building blocks.
-
-v1 scope (V2): single-stream, no prefetch. `prefetch=True` and
-`memcpy_stream=True` branches raise `NotImplementedError` until V4.
 """
 
 from typing import Any, Callable, Optional

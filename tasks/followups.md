@@ -63,8 +63,7 @@ deferred, and a concrete next-step trigger.
   divergent loss across ranks.
 - **Verification**: legacy 568.24 / new 565.76 TFLOPS (within 0.4%);
   loss curves monotonically decrease over 1000 iters; nsys shows
-  3240 NCCL kernels with 81.8% overlap on compute. See
-  ``tasks/nsys_runs/RESULTS.md``.
+  3240 NCCL kernels with 81.8% overlap on compute.
 - **Note**: A focused 2-rank pytest fixture was attempted but the
   multi-rank checkpoint sync + DDP warmup added enough scope that the
   e2e benchmark was a better signal-to-cost trade. If a tighter
