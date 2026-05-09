@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Auto-scheduler package — V5 validator, V9 cost model + list scheduler."""
+"""Auto-scheduler package — validator + cost model + list scheduler."""
 
 from .cost_model import CostModel, CostProfiler, TaskCost
 from .fire_order import (

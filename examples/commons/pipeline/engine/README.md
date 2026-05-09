@@ -62,10 +62,10 @@ Import surface (from `commons.pipeline.engine`):
 | `StreamPool` | Named stream registry. |
 | `TaskContext` | Per-iteration handle passed to every `Task.run(ctx)`. Exposes `ctx.slots`, `ctx.stream_pool`, `ctx.iter_count`. |
 | `ScheduleValidationError` | Raised when a `Schedule` violates [SPEC §4.2](../../../../../SPEC.md) rules. |
-| `ThreadedExecutor` | Multi-threaded executor (Problem #3). Threads and CUDA streams are decoupled; `thread_map` controls task→thread assignment. NCCL ordering safety built in. |
-| `SequentialExecutor` | Single-threaded executor (default). Identical to Problem #1 behavior. |
+| `ThreadedExecutor` | Multi-threaded executor. Threads and CUDA streams are decoupled; `thread_map` controls task→thread assignment. NCCL ordering safety built in. |
+| `SequentialExecutor` | Single-threaded executor (default). |
 
-For the auto-scheduler and cost profiler (V9):
+For the auto-scheduler and cost profiler:
 
 ```python
 from commons.pipeline.engine.autosched import (
@@ -88,14 +88,13 @@ from commons.pipeline.engine.autosched import (
   [`test_engine_legacy_untouched.py`](../../../../tests/commons/test_engine_legacy_untouched.py).
 - **Single-rank**: the engine is per-rank. Multi-GPU dispatch is
   the trainer's job, not the engine's.
-- **Eager execution only in v1**: no CUDA graph capture.
+- **Eager execution only**: no CUDA graph capture.
 - **Backward is a plain Task**: PyTorch autograd is atomic; no
   intra-backward decomposition. See [SPEC §4.6](../../../../../SPEC.md).
 
 ## Scope boundaries
 
-- Problem #1 (this engine): decouples tasks from schedule, adds an
-  auto-scheduler.
-- Problem #2 (future): generalize `_rewrite_model` / FX
-  decomposition beyond `ShardedModule`.
-- Problem #3 (future): multi-threaded NCCL-safe executor.
+The engine decouples tasks from schedule, adds an auto-scheduler,
+and ships a multi-threaded NCCL-safe executor. Generalizing
+`_rewrite_model` / FX decomposition beyond `ShardedModule` is left
+to per-framework adapters (e.g. `hstu_pipeline`).

@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HSTU pipeline adapter — Problem #2.
+"""HSTU pipeline adapter.
 
-Ports the HSTU-specific training pipeline onto the Problem #1
-schedulable engine without touching the legacy pipeline files.
+Ports the HSTU-specific training pipeline onto the schedulable engine
+without touching the legacy pipeline files.
 
 Public API:
     HSTUPipeline — the adapter class with `progress()` matching legacy.

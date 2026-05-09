@@ -29,8 +29,6 @@ Also exposes the vanilla-adoption classmethod `SchedulablePipeline.basic(
 model, optimizer)` which wraps a standard training step into a pipeline
 (SPEC §4.7 T1/T2 — ≤8 / ≤15 line diff adoption).
 
-V3 adds cross-stream `wait_stream` insertion; V4 adds N-batch ring +
-prefill/drain; V5 adds validator; V9 adds auto-scheduler.
 """
 
 import contextlib
@@ -87,9 +85,9 @@ Out = TypeVar("Out")
 class SchedulablePipeline(Generic[In, Out]):
     """Drives a `Schedule` through iterations of a dataloader.
 
-    v1 behavior — for every `progress(batch_iter)` call:
+    For every `progress(batch_iter)` call:
       1. Pull one batch from `batch_iter` (raises `StopIteration` if
-         exhausted; V1 propagates it directly).
+         exhausted).
       2. Populate `slots["batch_cpu"]` with the pulled batch
          (SPEC §4.7 protocol — tasks read from the slot, never call
          `next()` themselves).
@@ -97,12 +95,6 @@ class SchedulablePipeline(Generic[In, Out]):
          its bound stream context.
       4. Return the value in the `"step_result"` slot (or `None`).
       5. Advance the ring (evicts the slot store).
-
-    Key omissions vs later slices:
-      - No cross-stream wait_stream insertion (lands in V3).
-      - No prefill/drain (lands in V4; V1 requires N=1).
-      - No `depends_on` edge enforcement (V5 validator).
-      - No `loss.backward()` gating via autograd spike (V2).
     """
 
     RETURN_SLOT: str = "step_result"
@@ -137,8 +129,7 @@ class SchedulablePipeline(Generic[In, Out]):
         self._schedule = schedule
         self._stream_pool = stream_pool
         self._nvtx = nvtx
-        # Problem #3: pluggable executor. Default is sequential
-        # (backward-compatible with Problem #1).
+        # Pluggable executor; defaults to sequential.
         if executor is None:
             self._executor = SequentialExecutor()
         elif executor == "threaded":
@@ -151,12 +142,7 @@ class SchedulablePipeline(Generic[In, Out]):
                 f"or ThreadedExecutor, got {type(executor).__name__}"
             )
 
-        # V4: multi-batch in-flight supported via BatchRing + §4.8
-        # prefill/drain mask. V1 hardcoded n=1; V4 removes that cap.
-
-        # V5: all 8 §4.2 validity rules enforced here (replaces the
-        # ad-hoc pre-V5 checks that previously lived in this ctor +
-        # `deps.py`).
+        # Validate the schedule against §4.2 validity rules.
         from .autosched.validator import validate as _validate
 
         _validate(schedule, stream_pool)
@@ -205,7 +191,7 @@ class SchedulablePipeline(Generic[In, Out]):
             task.init(self._ctx)
 
     # ------------------------------------------------------------------
-    # Internal bootstrap pre-population (Problem #2 bootstrap fix)
+    # Internal bootstrap pre-population for adapter layers
     # ------------------------------------------------------------------
     #
     # Underscore-prefixed: this is an internal hook used by adapter
@@ -257,7 +243,7 @@ class SchedulablePipeline(Generic[In, Out]):
         self._seeded += 1
 
     # ------------------------------------------------------------------
-    # V4 §4.8 implementation
+    # SPEC §4.8 prefill/drain mask
     # ------------------------------------------------------------------
 
     def _should_run(self, task, iter_count: int, pulled: int) -> bool:
@@ -448,10 +434,10 @@ class SchedulablePipeline(Generic[In, Out]):
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         *,
-        # overlap knobs — enabled in V4
+        # overlap knobs
         prefetch: bool = False,
         memcpy_stream: bool = False,
-        # execution strategy (Problem #3)
+        # execution strategy
         threaded: bool = False,
         thread_map: Optional[object] = None,
         executor: Optional[object] = None,
@@ -482,9 +468,6 @@ class SchedulablePipeline(Generic[In, Out]):
         Adoption bands (SPEC §4.7):
           - T1 vanilla: `SchedulablePipeline.basic(model, optimizer)` + `pipe.step(batch)` → ≤8-line diff
           - T2 AMP/clip/scheduler via escape kwargs              → ≤15-line diff
-
-        V2 ships the single-stream path only. `prefetch=True` and
-        `memcpy_stream=True` land in V4.
         """
         # Avoid circular import: _presets imports Task/DataSlot
         # already; local import keeps `_presets` strictly internal.
@@ -508,8 +491,8 @@ class SchedulablePipeline(Generic[In, Out]):
             else:
                 device = torch.device("cpu")
 
-        # V4: prefetch moves H2D into the next-batch slot
-        # (batch_offset=1) so it overlaps the current batch's
+        # When prefetch is enabled, H2D moves into the next-batch
+        # slot (batch_offset=1) so it overlaps the current batch's
         # forward/backward/optimizer on another stream.
         h2d_stream = "memcpy" if memcpy_stream else "default"
         h2d_offset = 1 if prefetch else 0

@@ -26,7 +26,7 @@ The eight rules:
   2. `task.batch_offset >= 0`.
   3. `task.stream` ∈ `Schedule.stream_slots` AND ∈ `StreamPool.names()`.
   4. At most one task `writes` any given `DataSlot(name, batch_offset)`.
-     Additional V4 invariant: all writers of a given slot NAME share
+     Additional invariant: all writers of a given slot NAME share
      one stream (cross-iter wait inference requires unambiguous stream
      per name).
   5. Every `reads(slot)` resolves to a matching writer of the same

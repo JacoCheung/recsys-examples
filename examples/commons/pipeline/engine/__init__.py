@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Schedulable pipeline engine (Problem #1).
+"""Schedulable pipeline engine.
 
 Framework-agnostic: this package must never import torchrec, megatron,
 fbgemm_gpu, or commons.distributed.* — enforced by

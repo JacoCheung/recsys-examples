@@ -92,7 +92,7 @@ def test_spike_plain_linear() -> None:
         "semantics and routes that layer's grad kernel to its forward "
         "stream, not the user-declared backward stream. SPEC §4.6 "
         "records this constraint — multi-stream-forward models are out "
-        "of Problem #1 scope and drop to T3/T4."
+        "of scope; drop to T3/T4."
     ),
     strict=True,
 )

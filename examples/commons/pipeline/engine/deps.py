@@ -225,9 +225,9 @@ def infer_cross_stream_waits(
     Excludes:
       - Same-stream edges (ordering within one stream is already
         serial by CUDA's per-stream FIFO semantics).
-      - Unresolved reads (no writer anywhere). V5 validator rejects
-        these; the analyzer tolerates them so the engine runs on
-        partially-validated schedules during V2-V4.
+      - Unresolved reads (no writer anywhere). The validator rejects
+        these; the analyzer tolerates them so the engine can also run
+        on partially-validated schedules.
 
     Raises `ValueError` if two tasks write the exact same
     `(name, batch_offset)` slot. SPEC §4.2 rule 4.

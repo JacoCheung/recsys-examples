@@ -19,8 +19,8 @@ Modeled on ``test_pipeline.py`` which compares
 ``JaggedMegatronTrainPipelineSparseDist`` against the synchronous
 ``JaggedMegatronTrainNonePipeline`` baseline.
 
-This version substitutes the new ``HSTUPipeline`` adapter (Problem #2)
-for the target pipeline. Uses ``replicate_batches=True`` (all batches
+This version substitutes the new ``HSTUPipeline`` adapter for the
+target pipeline. Uses ``replicate_batches=True`` (all batches
 in history_batches are identical) so the known bootstrap 1-batch offset
 does not cause data divergence — we can still verify that both paths
 produce equivalent model updates iteration-for-iteration (once the

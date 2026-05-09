@@ -211,8 +211,7 @@ class DataSlot:
     """Opaque named handle for inter-task data flow.
 
     Identity is `(name, batch_offset)`. Two DataSlots compare equal iff
-    both fields match. In V1 (`in_flight_batches=1`) only
-    `batch_offset=0` is meaningful; V4 generalizes to N>1.
+    both fields match.
     """
 
     __slots__ = ("name", "batch_offset")
@@ -255,10 +254,7 @@ class Task:
         stateless / one-off tasks (HugeCTR `StreamContextScheduleable`
         analog).
 
-    Field semantics: see SPEC §4.1. V1 exercises `name`, `fn`,
-    `stream`, `reads`, `writes`. `priority`, `absolute_stream`,
-    `batch_offset`, `depends_on`, `nvtx_tag` are accepted and stored
-    but not yet exercised by the engine (lands in V2+).
+    Field semantics: see SPEC §4.1.
 
     Per SPEC_p4 v2, the user-facing field name for cross-iter
     positioning is ``lookahead``; ``batch_offset`` is the internal

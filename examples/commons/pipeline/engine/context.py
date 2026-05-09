@@ -21,8 +21,8 @@ A Task body sees the pipeline state through `TaskContext`:
         x = ctx.slots["batch_cpu"]
         ctx.slots.set("loss", model(x))
 
-The store is scoped to one in-flight batch. V1 carries a single batch
-(`BatchRing(n=1)`); V4 generalizes to N batches with prefill/drain.
+The store is scoped to N in-flight batches via `BatchRing`, with
+prefill/drain to handle ring wraparound at the iteration boundary.
 """
 
 import threading
@@ -37,9 +37,8 @@ In = TypeVar("In")
 class SlotStore:
     """Per-batch named value store.
 
-    Keyed by slot name (str). V1 does not key on `(name, batch_offset)`
-    because `in_flight_batches=1` → offset is always 0. V4 promotes
-    this to a `(name, batch_offset)` map.
+    Keyed by slot name (str); the `(name, batch_offset)` mapping lives
+    in the enclosing `BatchRing`.
 
     Each SlotStore also carries a registry of **producer-completion
     events**, keyed by task name. After a task runs on its stream, the
@@ -147,10 +146,9 @@ class BatchRing(Generic[In]):
         return self._slots[batch_offset]
 
     def current(self) -> SlotStore:
-        """Slot store for the current batch (batch_offset=0).
-
-        Backward-compat shim for V1/V2/V3 callers. New code should
-        prefer `at(batch_offset)` when offset > 0 is possible.
+        """Convenience accessor for `batch_offset=0`; equivalent to
+        `at(0)`. Prefer `at(batch_offset)` when `offset > 0` is
+        possible.
         """
         return self._slots[0]
 
@@ -191,17 +189,16 @@ class TaskContext(Generic[In]):
     For tasks with `batch_offset > 0` (e.g. prefetch H2D), the engine
     sets `ctx._active_offset` to the task's offset before calling
     `run(ctx)`, so `ctx.slots` transparently returns the right
-    slot-store in the ring. Tasks authored for V1-V3 that used
-    `ctx.slots` still work — their `batch_offset` is 0.
+    slot-store in the ring.
     """
 
     def __init__(self, ring: BatchRing, stream_pool) -> None:
         self._ring = ring
         self._stream_pool = stream_pool
         # Thread-local storage for _active_offset and iter_count so
-        # that ThreadedExecutor (Problem #3) can set them per-thread
-        # without races.  SequentialExecutor works identically — the
-        # main thread's local state is used.
+        # that ThreadedExecutor can set them per-thread without races.
+        # SequentialExecutor works identically — the main thread's
+        # local state is used.
         self._local = threading.local()
 
     @property
@@ -224,9 +221,9 @@ class TaskContext(Generic[In]):
     def slots(self) -> SlotStore:
         """Slot store at the active task's `batch_offset`.
 
-        V1-V3 tasks all have offset=0 so this returns the current
-        batch's store. V4 tasks with offset>0 (e.g. prefetch H2D)
-        read/write the future batch's store.
+        Tasks with `batch_offset=0` see the current batch's store;
+        tasks with `offset>0` (e.g. prefetch H2D) read/write the
+        future batch's store.
         """
         return self._ring.at(self._active_offset)
 
@@ -245,7 +242,7 @@ class TaskContext(Generic[In]):
         return self._stream_pool
 
     # ------------------------------------------------------------------
-    # V7 — explicit Event escape hatch (followups.md Problem #1, V7)
+    # Explicit Event escape hatch (see tasks/followups.md)
     # ------------------------------------------------------------------
     #
     # Most cross-stream sync is auto-inferred by the engine from the
