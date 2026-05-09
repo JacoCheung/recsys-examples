@@ -58,14 +58,23 @@ except ImportError:  # pragma: no cover - nvtx absence
     _nvtx = None
 
 
-def _progress_nvtx_range(iter_count: int):
+def _progress_nvtx_range(iter_count: int, max_offset: int = 0):
     """Wrap one internal pipeline iteration in an NVTX range tagged
     ``progress[iter=N]``. No-op when nvtx is unavailable or CUDA is
     not initialized — the range would have no profiler to record into.
+
+    The emitted ``N`` is *user-visible* — it equals ``iter_count -
+    max_offset`` so the first steady-state iter is ``iter=0`` instead
+    of ``iter=max_offset`` (the internal counter at that point). This
+    aligns with the outer ``step N`` NVTX emitted by the training loop
+    (e.g. ``training.py`` does ``range_push(f"step {train_iter}")``
+    with ``train_iter`` starting at 0). Prefill iters get negative
+    indices (``-max_offset .. -1``) so they remain distinguishable.
     """
     if _nvtx is None or not torch.cuda.is_available():
         return contextlib.nullcontext()
-    return _nvtx.annotate(f"progress[iter={iter_count}]")
+    visible = iter_count - max_offset
+    return _nvtx.annotate(f"progress[iter={visible}]")
 
 
 __all__ = ["Pipeline", "SchedulablePipeline"]
@@ -276,7 +285,7 @@ class SchedulablePipeline(Generic[In, Out]):
         correct: if M < prefill-count the pipeline ends during
         prefill, and the first `progress()` call raises).
         """
-        with _progress_nvtx_range(self._internal_iter):
+        with _progress_nvtx_range(self._internal_iter, self._max_offset):
             # Pull next batch into the furthest-ahead slot if iterator
             # still has batches. Populates `batch_cpu` at
             # batch_offset=max_offset per SPEC §4.7 protocol.
