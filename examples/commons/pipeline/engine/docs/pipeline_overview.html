@@ -1,0 +1,1735 @@
+<!DOCTYPE html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Schedulable Pipeline Engine — Design Documentation</title>
+<style>
+  :root {
+    --bg: #fff;
+    --bg-alt: #f6f8fa;
+    --border: #d0d7de;
+    --fg: #1f2328;
+    --fg-mute: #656d76;
+    --link: #0969da;
+    --kw: #cf222e;
+    --type: #8250df;
+    --string: #0a3069;
+    --comment: #6e7781;
+    --critical: #cf222e;
+    --high: #d4a72c;
+    --info: #0969da;
+    --good: #1a7f37;
+    --code-bg: #f6f8fa;
+    --side-w: 280px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  /* --- Bilingual toggle --- */
+  html[data-lang="en"] .zh,
+  html[data-lang="en"] [lang="zh"] { display: none; }
+  html[data-lang="zh"] .en,
+  html[data-lang="zh"] [lang="en"] { display: none; }
+  /* Block-level wrappers should still occupy a line on the visible side. */
+  .en, .zh { }
+  p > .en, p > .zh, li > .en, li > .zh, td > .en, td > .zh,
+  th > .en, th > .zh, h1 > .en, h1 > .zh, h2 > .en, h2 > .zh,
+  h3 > .en, h3 > .zh, h4 > .en, h4 > .zh, figcaption > .en,
+  figcaption > .zh, .meta > .en, .meta > .zh, strong > .en, strong > .zh { display: inline; }
+  html[data-lang="en"] p > .zh, html[data-lang="en"] li > .zh,
+  html[data-lang="en"] td > .zh, html[data-lang="en"] th > .zh,
+  html[data-lang="en"] h1 > .zh, html[data-lang="en"] h2 > .zh,
+  html[data-lang="en"] h3 > .zh, html[data-lang="en"] h4 > .zh,
+  html[data-lang="en"] figcaption > .zh, html[data-lang="en"] .meta > .zh,
+  html[data-lang="en"] strong > .zh { display: none; }
+  html[data-lang="zh"] p > .en, html[data-lang="zh"] li > .en,
+  html[data-lang="zh"] td > .en, html[data-lang="zh"] th > .en,
+  html[data-lang="zh"] h1 > .en, html[data-lang="zh"] h2 > .en,
+  html[data-lang="zh"] h3 > .en, html[data-lang="zh"] h4 > .en,
+  html[data-lang="zh"] figcaption > .en, html[data-lang="zh"] .meta > .en,
+  html[data-lang="zh"] strong > .en { display: none; }
+
+  /* --- Lang toggle button (fixed top-right) --- */
+  .lang-toggle {
+    position: fixed; top: 14px; right: 16px; z-index: 1000;
+    display: inline-flex; align-items: center; gap: 0;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+    overflow: hidden; font-size: 13px;
+  }
+  .lang-toggle button {
+    border: none; background: transparent; cursor: pointer;
+    padding: 6px 14px; color: var(--fg-mute); font: inherit;
+    transition: background-color 0.15s ease;
+  }
+  .lang-toggle button:hover { background: var(--bg-alt); }
+  html[data-lang="en"] .lang-toggle button[data-set="en"],
+  html[data-lang="zh"] .lang-toggle button[data-set="zh"] {
+    background: var(--link); color: #fff;
+  }
+
+  /* Layout */
+  .layout { display: flex; min-height: 100vh; }
+  nav.toc {
+    position: sticky; top: 0; align-self: flex-start;
+    width: var(--side-w); height: 100vh; overflow-y: auto;
+    border-right: 1px solid var(--border);
+    background: var(--bg-alt);
+    padding: 24px 16px;
+    font-size: 13px;
+  }
+  nav.toc h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--fg-mute); }
+  nav.toc ol { list-style: none; padding: 0; margin: 0; counter-reset: sec; }
+  nav.toc ol li { padding: 4px 0; counter-increment: sec; }
+  nav.toc ol li::before { content: counter(sec) ". "; color: var(--fg-mute); margin-right: 4px; }
+  nav.toc ol ol { padding-left: 16px; counter-reset: sub; }
+  nav.toc ol ol li { padding: 2px 0; counter-increment: sub; }
+  nav.toc ol ol li::before { content: counter(sec) "." counter(sub) " "; }
+  nav.toc a { color: var(--fg); text-decoration: none; }
+  nav.toc a:hover { color: var(--link); text-decoration: underline; }
+  main { flex: 1; min-width: 0; padding: 32px 48px 80px; max-width: 1100px; }
+
+  h1 { font-size: 30px; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin: 0 0 24px; }
+  h2 { font-size: 24px; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin: 40px 0 16px; }
+  h3 { font-size: 18px; margin: 24px 0 12px; }
+  h4 { font-size: 15px; margin: 16px 0 8px; color: var(--fg-mute); text-transform: uppercase; letter-spacing: 0.4px; }
+
+  p { margin: 8px 0 12px; }
+  ul, ol { margin: 8px 0 12px; padding-left: 24px; }
+  li { margin: 4px 0; }
+
+  /* Code */
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+  pre code { background: transparent; padding: 0; }
+  .kw { color: var(--kw); }
+  .ty { color: var(--type); }
+  .st { color: var(--string); }
+  .cm { color: var(--comment); font-style: italic; }
+
+  /* Tables */
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 6px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--bg-alt); font-weight: 600; }
+
+  /* Callouts */
+  .note { border-left: 3px solid var(--info); background: #ddf4ff; padding: 10px 14px; margin: 12px 0; border-radius: 0 4px 4px 0; }
+  .warn { border-left: 3px solid var(--high); background: #fff8c5; padding: 10px 14px; margin: 12px 0; border-radius: 0 4px 4px 0; }
+  .crit { border-left: 3px solid var(--critical); background: #ffebe9; padding: 10px 14px; margin: 12px 0; border-radius: 0 4px 4px 0; }
+  .good { border-left: 3px solid var(--good); background: #dafbe1; padding: 10px 14px; margin: 12px 0; border-radius: 0 4px 4px 0; }
+
+  /* SVG */
+  figure { margin: 20px 0; text-align: center; }
+  figure svg { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+  figcaption { font-size: 13px; color: var(--fg-mute); margin-top: 8px; }
+  .svg-wrap { overflow-x: auto; }
+  /* SVG semantic classes (for UML conventions) */
+  .uml-box-fill { fill: #fff; stroke: #1f2328; stroke-width: 1.2; }
+  .uml-box-fill-alt { fill: #f6f8fa; stroke: #1f2328; stroke-width: 1.2; }
+  .uml-lifeline { stroke: #999; stroke-width: 1; stroke-dasharray: 4 4; fill: none; }
+  .uml-actor-rect { fill: #fff8c5; stroke: #1f2328; stroke-width: 1.2; }
+  .uml-activation { fill: #d0d7de; stroke: #1f2328; stroke-width: 0.8; }
+  .uml-msg-sync { stroke: #1f2328; stroke-width: 1.4; fill: none; }
+  .uml-msg-async { stroke: #1f2328; stroke-width: 1.4; fill: none; stroke-dasharray: 0; }
+  .uml-msg-return { stroke: #656d76; stroke-width: 1; stroke-dasharray: 5 4; fill: none; }
+  .uml-frag { fill: rgba(13, 105, 218, 0.05); stroke: #0969da; stroke-width: 1; stroke-dasharray: 4 3; }
+  .uml-text { font-family: ui-monospace, monospace; font-size: 11px; fill: #1f2328; }
+  .uml-text-em { font-family: ui-monospace, monospace; font-size: 11px; fill: #1f2328; font-weight: 700; }
+  .uml-text-mute { font-family: ui-monospace, monospace; font-size: 10px; fill: #656d76; }
+
+  /* anchor offset for sticky nav */
+  section { scroll-margin-top: 16px; }
+
+  /* misc */
+  hr { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
+  .meta { color: var(--fg-mute); font-size: 12.5px; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 12px; font-size: 11px; font-weight: 600; line-height: 18px; }
+  .badge-pub { background: #dafbe1; color: var(--good); }
+  .badge-priv { background: #ffebe9; color: var(--critical); }
+  .badge-int { background: #fff8c5; color: #6e5a00; }
+</style>
+</head>
+<body>
+
+<!-- Language toggle -->
+<div class="lang-toggle" role="group" aria-label="language">
+  <button type="button" data-set="en" onclick="setLang('en')">EN</button>
+  <button type="button" data-set="zh" onclick="setLang('zh')">中文</button>
+</div>
+
+<div class="layout">
+
+<!-- ====================== TOC ====================== -->
+<nav class="toc">
+<h2><span class="en">Contents</span><span class="zh">目录</span></h2>
+<ol>
+  <li><a href="#background"><span class="en">Background &amp; motivation</span><span class="zh">背景与动机</span></a></li>
+  <li><a href="#architecture"><span class="en">Architecture overview</span><span class="zh">架构概览</span></a>
+    <ol>
+      <li><a href="#three-layers"><span class="en">Three layers</span><span class="zh">三层结构</span></a></li>
+      <li><a href="#dep-graph"><span class="en">Module dependency</span><span class="zh">模块依赖</span></a></li>
+      <li><a href="#invariants"><span class="en">Invariants</span><span class="zh">硬性不变量</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#engine"><span class="en">Engine layer (Problem #1)</span><span class="zh">引擎层（Problem #1）</span></a>
+    <ol>
+      <li><a href="#engine-task"><span class="en">Task &amp; DataSlot</span><span class="zh">Task 与 DataSlot</span></a></li>
+      <li><a href="#engine-schedule"><span class="en">Schedule &amp; Stage</span><span class="zh">Schedule 与 Stage</span></a></li>
+      <li><a href="#engine-ring"><span class="en">BatchRing</span><span class="zh">BatchRing 批次环</span></a></li>
+      <li><a href="#engine-mask"><span class="en">§4.8 mask formula</span><span class="zh">§4.8 触发掩码公式</span></a></li>
+      <li><a href="#engine-driver"><span class="en">SchedulablePipeline driver</span><span class="zh">SchedulablePipeline 驱动器</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#exec"><span class="en">Threaded executor (Problem #3)</span><span class="zh">多线程执行器（Problem #3）</span></a>
+    <ol>
+      <li><a href="#exec-thread-map"><span class="en">thread_map strategies</span><span class="zh">thread_map 策略</span></a></li>
+      <li><a href="#exec-cpu-deps"><span class="en">CPU dep computation</span><span class="zh">CPU 依赖计算</span></a></li>
+      <li><a href="#exec-nccl-lock"><span class="en">NCCL ordered lock</span><span class="zh">NCCL 顺序锁</span></a></li>
+      <li><a href="#exec-cancel"><span class="en">Cancellation &amp; abort</span><span class="zh">取消与中止</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#hstu"><span class="en">HSTU adapter (Problem #2)</span><span class="zh">HSTU 适配层（Problem #2）</span></a>
+    <ol>
+      <li><a href="#hstu-tasks"><span class="en">14 tasks</span><span class="zh">14 个任务</span></a></li>
+      <li><a href="#hstu-thread-map"><span class="en">HSTU_DEFAULT_THREAD_MAP</span><span class="zh">HSTU 默认线程映射</span></a></li>
+      <li><a href="#hstu-bootstrap"><span class="en">Bootstrap flow</span><span class="zh">引导流程</span></a></li>
+      <li><a href="#hstu-variants"><span class="en">native vs prefetch</span><span class="zh">native 与 prefetch 变体</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#sequences"><span class="en">Workflow sequence diagrams</span><span class="zh">工作流时序图</span></a>
+    <ol>
+      <li><a href="#seq-first-call"><span class="en">First progress() call</span><span class="zh">首次 progress() 调用</span></a></li>
+      <li><a href="#seq-steady"><span class="en">Steady-state iteration</span><span class="zh">稳态迭代</span></a></li>
+      <li><a href="#seq-nccl"><span class="en">NCCL ticket lock</span><span class="zh">NCCL 票据锁</span></a></li>
+      <li><a href="#seq-pipeline"><span class="en">Multi-batch overlap</span><span class="zh">多批次重叠</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#class-ref"><span class="en">Class &amp; method reference</span><span class="zh">类与方法参考</span></a>
+    <ol>
+      <li><a href="#cls-engine"><span class="en">Engine classes</span><span class="zh">引擎类</span></a></li>
+      <li><a href="#cls-exec"><span class="en">Executor classes</span><span class="zh">执行器类</span></a></li>
+      <li><a href="#cls-hstu"><span class="en">HSTU classes</span><span class="zh">HSTU 类</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#user-api"><span class="en">User-facing API examples</span><span class="zh">用户接口与示例</span></a>
+    <ol>
+      <li><a href="#user-t1"><span class="en">T1: vanilla preset</span><span class="zh">T1：基础预设</span></a></li>
+      <li><a href="#user-t2"><span class="en">T2: with prefetch</span><span class="zh">T2：带 prefetch</span></a></li>
+      <li><a href="#user-hstu"><span class="en">HSTU usage</span><span class="zh">HSTU 使用</span></a></li>
+      <li><a href="#user-thread"><span class="en">Custom thread_map</span><span class="zh">自定义 thread_map</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#internal-api"><span class="en">Internal API examples</span><span class="zh">内部接口与示例</span></a>
+    <ol>
+      <li><a href="#int-task"><span class="en">Custom Task subclass</span><span class="zh">自定义 Task 子类</span></a></li>
+      <li><a href="#int-schedule"><span class="en">Hand-built Schedule</span><span class="zh">手工搭建 Schedule</span></a></li>
+      <li><a href="#int-executor"><span class="en">Custom Executor</span><span class="zh">自定义 Executor</span></a></li>
+    </ol>
+  </li>
+  <li><a href="#limits"><span class="en">Limitations &amp; followups</span><span class="zh">限制与后续工作</span></a></li>
+</ol>
+</nav>
+
+<!-- ====================== MAIN ====================== -->
+<main>
+<h1><span class="en">Schedulable Pipeline Engine</span><span class="zh">可调度流水线引擎</span></h1>
+<p class="meta">
+<span class="en">Branch: <code>junzhang/rework-mtms</code> · Last updated: 2026-04-26 · Coupled SPECs: <code>SPEC.md</code> (Problem #1), <code>SPEC_p2.md</code> (HSTU adapter), <code>SPEC_p3.md</code> (event-based sync, RESOLVED), <code>SPEC_p4_declarative_pipeline.md</code> (v2 declarative API).</span>
+<span class="zh">分支：<code>junzhang/rework-mtms</code> · 最后更新：2026-04-26 · 相互关联的 SPEC：<code>SPEC.md</code>（Problem #1）、<code>SPEC_p2.md</code>（HSTU 适配层）、<code>SPEC_p3.md</code>（基于事件的同步，已 RESOLVED）、<code>SPEC_p4_declarative_pipeline.md</code>（v2 声明式 API）。</span>
+</p>
+
+<div class="note" id="changelog-spec-p4-v2">
+  <strong><span class="en">Changelog: SPEC_p4 v2 (2026-04-26)</span><span class="zh">更新日志：SPEC_p4 v2（2026-04-26）</span></strong>
+  <ul>
+    <li><span class="en"><strong>User-facing Task API</strong>: <code>batch_offset=N</code> kwarg removed. Use <code>lookahead=N</code> instead — same semantics, better name. <code>reads</code> / <code>writes</code> accept bare strings; offsets are inferred from the producer's <code>lookahead</code>.</span><span class="zh"><strong>用户可见的 Task API</strong>：移除了 <code>batch_offset=N</code> 形参。改用 <code>lookahead=N</code>，语义不变、名字更准。<code>reads</code> / <code>writes</code> 直接传字符串，offset 由生产者的 <code>lookahead</code> 自动推断。</span></li>
+    <li><span class="en"><strong>Bare-name <code>depends_on</code></strong>: write <code>depends_on=("prefetch_embeddings",)</code> and the engine auto-classifies as within-iter or cross-iter from the producer's vs consumer's <code>lookahead</code>. No more leaking pseudo-slot names like <code>module_input_post_prefetch</code> in user code.</span><span class="zh"><strong>bare-name <code>depends_on</code></strong>：直接写 <code>depends_on=("prefetch_embeddings",)</code>，引擎根据生产者/消费者的 <code>lookahead</code> 自动判断是同迭代还是跨迭代依赖。再也不用把 <code>module_input_post_prefetch</code> 这类 pseudo-slot 暴露在用户代码里。</span></li>
+    <li><span class="en"><strong>Declarative <code>Pipeline</code> wrapper</strong>: <code>commons.pipeline.engine.Pipeline(tasks=[...])</code> — a thin façade over <code>SchedulablePipeline</code> + <code>Schedule</code> + <code>StreamPool</code> for one-shot user code.</span><span class="zh"><strong>声明式 <code>Pipeline</code> 封装</strong>：<code>commons.pipeline.engine.Pipeline(tasks=[...])</code>，把 <code>SchedulablePipeline</code> + <code>Schedule</code> + <code>StreamPool</code> 一层薄封装，给一次性用户代码用。</span></li>
+    <li><span class="en"><strong>Event-based cross-stream sync</strong>: executor prefers <code>wait_event(producer_event)</code> from the ring slot over coarse <code>wait_stream(producer_stream)</code>. Stream-level wait remains as first-iter fallback.</span><span class="zh"><strong>基于 Event 的跨流同步</strong>：执行器优先从 ring slot 取 <code>wait_event(producer_event)</code>，回退到粗粒度的 <code>wait_stream(producer_stream)</code>。stream 级别的 wait 仍作为第一轮迭代的兜底。</span></li>
+    <li><span class="en"><strong>NVTX integration</strong>: every <code>task.run(ctx)</code> is wrapped in <code>nvtx.annotate(task.nvtx_tag or task.name)</code> at all execution callsites (sequential, threaded, single-task fast path, NCCL-locked path). No-op on CPU-only hosts.</span><span class="zh"><strong>NVTX 集成</strong>：所有执行点（sequential / threaded / 单任务快路径 / NCCL-锁路径）都用 <code>nvtx.annotate(task.nvtx_tag or task.name)</code> 包裹了 <code>task.run(ctx)</code>。CPU-only 环境下是 no-op。</span></li>
+    <li><span class="en"><strong><code>HSTUPipeline.detach()</code> resets bookkeeping</strong> so a follow-up <code>attach()</code> + <code>progress()</code> rebuilds the engine cleanly (Codex B-MEDIUM-1).</span><span class="zh"><strong><code>HSTUPipeline.detach()</code> 现在重置 bookkeeping</strong>，下一次 <code>attach()</code> + <code>progress()</code> 能干净地重建引擎（Codex B-MEDIUM-1）。</span></li>
+    <li><span class="en"><strong><code>SchedulablePipeline.progress()</code> resets §4.8 state on a fresh iterator</strong> (mirrors legacy <code>train_pipeline.py:418</code>). Switching from train loader to eval loader inside one session no longer raises <code>StopIteration</code> immediately.</span><span class="zh"><strong><code>SchedulablePipeline.progress()</code> 在新 iterator 上重置 §4.8 状态</strong>（对齐遗留的 <code>train_pipeline.py:418</code>）。在同一个 session 里从 train loader 切到 eval loader 不再立刻抛 <code>StopIteration</code>。</span></li>
+    <li><span class="en"><strong>HSTU pretrain ranking GR integration</strong>: <code>RECSYS_PIPELINE_BACKEND=new</code> (default <code>legacy</code>) routes <code>examples/hstu/training/pretrain_gr_ranking.py</code> through <code>HSTUPipelineFactory</code>. 8-GPU benchmark on synthetic 8-layer 1024-hidden + cutlass: <strong>568.24 / 565.76 TFLOPS</strong> (legacy / new, within 0.4%); 81.8% NCCL/compute overlap; 64 host threads × 5 streams. See <code>tasks/nsys_runs/RESULTS.md</code>.</span><span class="zh"><strong>集成到 HSTU pretrain ranking GR</strong>：<code>RECSYS_PIPELINE_BACKEND=new</code>（默认 <code>legacy</code>）把 <code>examples/hstu/training/pretrain_gr_ranking.py</code> 走 <code>HSTUPipelineFactory</code>。8 卡基准（合成 8 层 1024 隐藏 + cutlass）：<strong>568.24 / 565.76 TFLOPS</strong>（legacy / new，差 0.4%）；NCCL/compute overlap 81.8%；64 个 host 线程跨 5 个 stream。详见 <code>tasks/nsys_runs/RESULTS.md</code>。</span></li>
+  </ul>
+</div>
+
+<!-- =========================================================== -->
+<section id="background">
+<h2><span class="en">1. Background &amp; motivation</span><span class="zh">1. 背景与动机</span></h2>
+
+<p>
+<span class="en">The legacy training pipeline at <code>examples/commons/pipeline/train_pipeline.py</code> follows torchrec's design: a hand-rolled <code>progress()</code> method that hardcodes task sequencing — H2D → input_dist → wait → forward → backward → optimizer — with HSTU-specific extensions wedged in (KK shuffler, loss-token AllReduce, Megatron grad finalize, NCCL stream discipline).</span>
+<span class="zh">遗留的训练流水线 <code>examples/commons/pipeline/train_pipeline.py</code> 沿用 torchrec 的设计：一个手写的 <code>progress()</code> 方法把任务顺序写死 —— H2D → input_dist → wait → forward → backward → optimizer —— 然后在中间硬塞各种 HSTU 专属扩展（KK shuffler、loss-token AllReduce、Megatron 梯度收尾、NCCL 流纪律等）。</span>
+</p>
+
+<p>
+<span class="en">Three structural problems motivated the rework:</span>
+<span class="zh">驱动这次重写的三个结构性问题：</span>
+</p>
+<ol>
+  <li>
+    <strong><span class="en">Coupling</span><span class="zh">耦合</span></strong>:
+    <span class="en">every task ordering decision lived inside one Python method. Adding a stage required editing the loop.</span>
+    <span class="zh">所有任务顺序决策都挤在一个 Python 方法里。新增一个阶段就得改主循环。</span>
+  </li>
+  <li>
+    <strong><span class="en">Single-threaded</span><span class="zh">单线程</span></strong>:
+    <span class="en">CPU-side kernel submission was strictly serial; CPU-bound work (e.g. KK partitioner) blocked the whole pipeline.</span>
+    <span class="zh">CPU 端的 kernel 提交是严格串行的；任何 CPU-bound 的工作（比如 KK partitioner）都会阻塞整条流水线。</span>
+  </li>
+  <li>
+    <strong><span class="en">No customization point</span><span class="zh">没有定制点</span></strong>:
+    <span class="en">variants like <code>JaggedMegatronPrefetch</code> were full subclass forks.</span>
+    <span class="zh">像 <code>JaggedMegatronPrefetch</code> 这样的变体只能整个子类化复制粘贴。</span>
+  </li>
+</ol>
+
+<p>
+<span class="en">The rework is structured as <strong>three coupled but independent slices</strong>:</span>
+<span class="zh">重写被拆成 <strong>三个相互关联但独立交付的切片</strong>：</span>
+</p>
+<table>
+<thead><tr>
+  <th><span class="en">Slice</span><span class="zh">切片</span></th>
+  <th><span class="en">Layer</span><span class="zh">层级</span></th>
+  <th><span class="en">Goal</span><span class="zh">目标</span></th>
+  <th><span class="en">Constraint</span><span class="zh">约束</span></th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>Problem #1</td>
+  <td><span class="en">Engine</span><span class="zh">引擎</span></td>
+  <td><span class="en">Decouple tasks from schedule with HugeCTR-style primitives</span><span class="zh">用 HugeCTR 风格的原语把任务和调度解耦</span></td>
+  <td><span class="en">Framework-agnostic — no <code>torchrec</code>, <code>megatron</code>, <code>fbgemm_gpu</code> imports</span><span class="zh">框架无关 —— 不引入 <code>torchrec</code>、<code>megatron</code>、<code>fbgemm_gpu</code></span></td>
+</tr>
+<tr>
+  <td>Problem #3</td>
+  <td><span class="en">Threaded executor</span><span class="zh">多线程执行器</span></td>
+  <td><span class="en">Multi-threaded task dispatch with NCCL ordering safety</span><span class="zh">多线程任务派发，并保持 NCCL 顺序安全</span></td>
+  <td><span class="en">Same engine still works single-threaded</span><span class="zh">同一个引擎仍能在单线程下工作</span></td>
+</tr>
+<tr>
+  <td>Problem #2</td>
+  <td><span class="en">HSTU adapter</span><span class="zh">HSTU 适配层</span></td>
+  <td><span class="en">Drive torchrec's <code>_rewrite_model</code> machinery via the engine</span><span class="zh">通过引擎驱动 torchrec 的 <code>_rewrite_model</code> 机制</span></td>
+  <td><span class="en">Legacy <code>train_pipeline.py</code> stays byte-identical</span><span class="zh">遗留的 <code>train_pipeline.py</code> 保持字节级不变</span></td>
+</tr>
+</tbody>
+</table>
+
+<div class="note">
+  <strong><span class="en">Reference</span><span class="zh">参考</span></strong>:
+  <span class="en">design inspired by HugeCTR's <code>Pipeline</code> + <code>Scheduleable</code> abstraction. We borrow the "task as schedulable unit" model but replace HugeCTR's C++ runtime with a Python engine + PyTorch streams.</span>
+  <span class="zh">设计灵感来自 HugeCTR 的 <code>Pipeline</code> + <code>Scheduleable</code> 抽象。我们沿用"任务即可调度单元"的模型，但把 HugeCTR 的 C++ 运行时换成了 Python 引擎 + PyTorch 流。</span>
+</div>
+</section>
+
+<!-- =========================================================== -->
+<section id="architecture">
+<h2><span class="en">2. Architecture overview</span><span class="zh">2. 架构概览</span></h2>
+
+<section id="three-layers">
+<h3><span class="en">2.1 Three layers</span><span class="zh">2.1 三层结构</span></h3>
+
+<figure><div class="svg-wrap">
+<svg width="780" height="420" viewBox="0 0 780 420" xmlns="http://www.w3.org/2000/svg">
+  <text x="390" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">Three-layer architecture</text>
+
+  <!-- Layer 3: HSTU adapter -->
+  <rect x="40" y="40" width="700" height="100" class="uml-box-fill-alt" rx="6"/>
+  <text x="60" y="62" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#8250df">Layer 3 — HSTU adapter (Problem #2)</text>
+  <text x="60" y="80" class="uml-text-mute">examples/commons/pipeline/hstu_pipeline/</text>
+  <rect x="60" y="92" width="160" height="36" class="uml-box-fill" rx="3"/>
+  <text x="140" y="115" text-anchor="middle" class="uml-text-em">HSTUPipeline</text>
+  <rect x="240" y="92" width="160" height="36" class="uml-box-fill" rx="3"/>
+  <text x="320" y="115" text-anchor="middle" class="uml-text-em">HSTUPipelineFactory</text>
+  <rect x="420" y="92" width="160" height="36" class="uml-box-fill" rx="3"/>
+  <text x="500" y="115" text-anchor="middle" class="uml-text-em">14 task factories</text>
+  <rect x="600" y="92" width="120" height="36" class="uml-box-fill" rx="3"/>
+  <text x="660" y="115" text-anchor="middle" class="uml-text-em">PipelineState</text>
+
+  <!-- Layer 2: Threaded executor -->
+  <rect x="40" y="160" width="700" height="100" class="uml-box-fill-alt" rx="6"/>
+  <text x="60" y="182" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#cf222e">Layer 2 — Threaded executor (Problem #3)</text>
+  <text x="60" y="200" class="uml-text-mute">examples/commons/pipeline/engine/executor.py</text>
+  <rect x="60" y="212" width="160" height="36" class="uml-box-fill" rx="3"/>
+  <text x="140" y="235" text-anchor="middle" class="uml-text-em">ThreadedExecutor</text>
+  <rect x="240" y="212" width="160" height="36" class="uml-box-fill" rx="3"/>
+  <text x="320" y="235" text-anchor="middle" class="uml-text-em">SequentialExecutor</text>
+  <rect x="420" y="212" width="160" height="36" class="uml-box-fill" rx="3"/>
+  <text x="500" y="235" text-anchor="middle" class="uml-text-em">_NcclOrderedLock</text>
+  <rect x="600" y="212" width="120" height="36" class="uml-box-fill" rx="3"/>
+  <text x="660" y="235" text-anchor="middle" class="uml-text-em">_compute_cpu_deps</text>
+
+  <!-- Layer 1: Engine core -->
+  <rect x="40" y="280" width="700" height="120" class="uml-box-fill-alt" rx="6"/>
+  <text x="60" y="302" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#1a7f37">Layer 1 — Engine core (Problem #1)</text>
+  <text x="60" y="320" class="uml-text-mute">examples/commons/pipeline/engine/ — framework-free</text>
+  <rect x="60" y="332" width="120" height="32" class="uml-box-fill" rx="3"/>
+  <text x="120" y="353" text-anchor="middle" class="uml-text-em">SchedulablePipeline</text>
+  <rect x="190" y="332" width="80" height="32" class="uml-box-fill" rx="3"/>
+  <text x="230" y="353" text-anchor="middle" class="uml-text-em">Task</text>
+  <rect x="280" y="332" width="80" height="32" class="uml-box-fill" rx="3"/>
+  <text x="320" y="353" text-anchor="middle" class="uml-text-em">DataSlot</text>
+  <rect x="370" y="332" width="100" height="32" class="uml-box-fill" rx="3"/>
+  <text x="420" y="353" text-anchor="middle" class="uml-text-em">Schedule/Stage</text>
+  <rect x="480" y="332" width="80" height="32" class="uml-box-fill" rx="3"/>
+  <text x="520" y="353" text-anchor="middle" class="uml-text-em">StreamPool</text>
+  <rect x="570" y="332" width="80" height="32" class="uml-box-fill" rx="3"/>
+  <text x="610" y="353" text-anchor="middle" class="uml-text-em">BatchRing</text>
+  <rect x="660" y="332" width="80" height="32" class="uml-box-fill" rx="3"/>
+  <text x="700" y="353" text-anchor="middle" class="uml-text-em">TaskContext</text>
+  <text x="60" y="385" class="uml-text-mute">+ autosched/ submodule: validator, cost_model, list_scheduler</text>
+
+  <!-- Arrows: layer dependencies -->
+  <defs>
+    <marker id="arrTri" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+  </defs>
+  <line x1="390" y1="140" x2="390" y2="160" class="uml-msg-sync" marker-end="url(#arrTri)"/>
+  <line x1="390" y1="260" x2="390" y2="280" class="uml-msg-sync" marker-end="url(#arrTri)"/>
+  <text x="400" y="153" class="uml-text-mute">depends on</text>
+  <text x="400" y="273" class="uml-text-mute">depends on</text>
+</svg>
+</div><figcaption>
+<span class="en">Component diagram: dependency direction is strictly downward. Layer 1 has no torchrec/megatron imports. Layers 2 and 3 add capability without modifying lower layers.</span>
+<span class="zh">组件图：依赖方向严格向下。Layer 1 不引入任何 torchrec/megatron。Layer 2 和 Layer 3 只新增能力，不修改下层。</span>
+</figcaption></figure>
+
+</section>
+
+<section id="dep-graph">
+<h3><span class="en">2.2 Module dependency</span><span class="zh">2.2 模块依赖</span></h3>
+<pre><span class="cm"># Engine core — pure stdlib + torch only</span>
+commons.pipeline.engine
+├── task.py       <span class="cm"># Task, DataSlot</span>
+├── context.py    <span class="cm"># SlotStore, BatchRing, TaskContext (thread-local)</span>
+├── streams.py    <span class="cm"># StreamPool with anchor_device + use(stream) ctx</span>
+├── schedule.py   <span class="cm"># Schedule, Stage</span>
+├── deps.py       <span class="cm"># infer_cross_stream_waits</span>
+├── pipeline.py   <span class="cm"># SchedulablePipeline driver + _seed_first_batch</span>
+├── executor.py   <span class="cm"># Sequential + Threaded + _NcclOrderedLock</span>
+├── _presets.py   <span class="cm"># T1/T2 forward/backward/optimizer task factories</span>
+└── autosched/
+    ├── validator.py        <span class="cm"># 8-rule SPEC §4.2 schedule validity</span>
+    ├── cost_model.py       <span class="cm"># CostProfiler, CostModel (JSON roundtrip)</span>
+    └── list_scheduler.py   <span class="cm"># Critical-path list scheduler</span>
+
+<span class="cm"># HSTU adapter — depends on torchrec, megatron, dynamicemb</span>
+commons.pipeline.hstu_pipeline
+├── pipeline.py   <span class="cm"># HSTUPipeline + HSTU_DEFAULT_THREAD_MAP</span>
+├── tasks.py      <span class="cm"># 14 task factories + PipelineState</span>
+└── factory.py    <span class="cm"># HSTUPipelineFactory</span></pre>
+</section>
+
+<section id="invariants">
+<h3><span class="en">2.3 Hard invariants</span><span class="zh">2.3 硬性不变量</span></h3>
+<ul>
+  <li>
+    <strong><span class="en">Engine framework-free</span><span class="zh">引擎层框架无关</span></strong>:
+    <span class="en"><code>commons.pipeline.engine.*</code> never imports <code>torchrec</code>, <code>megatron</code>, <code>fbgemm_gpu</code>, or <code>commons.distributed.*</code>. Enforced by <code>test_engine_import_hygiene.py</code>.</span>
+    <span class="zh"><code>commons.pipeline.engine.*</code> 不引入 <code>torchrec</code>、<code>megatron</code>、<code>fbgemm_gpu</code> 或 <code>commons.distributed.*</code>。由 <code>test_engine_import_hygiene.py</code> 强制约束。</span>
+  </li>
+  <li>
+    <strong><span class="en">Legacy untouched</span><span class="zh">遗留代码字节级不动</span></strong>:
+    <span class="en"><code>train_pipeline.py</code>, <code>train_pipeline_factory.py</code>, <code>utils.py</code> stay byte-identical. Enforced by <code>test_engine_legacy_untouched.py</code>.</span>
+    <span class="zh"><code>train_pipeline.py</code>、<code>train_pipeline_factory.py</code>、<code>utils.py</code> 保持字节级一致。由 <code>test_engine_legacy_untouched.py</code> 强制约束。</span>
+  </li>
+  <li>
+    <strong><span class="en">v1-only contexts in HSTU</span><span class="zh">HSTU 仅允许 v1 context</span></strong>:
+    <span class="en"><code>create_torchrec_ctx</code> asserts <code>ctx.version == 1</code>. Enforced by <code>test_no_v0_context_references_in_hstu_pipeline</code> (regex scan).</span>
+    <span class="zh"><code>create_torchrec_ctx</code> 断言 <code>ctx.version == 1</code>。由 <code>test_no_v0_context_references_in_hstu_pipeline</code>（正则扫描）强制约束。</span>
+  </li>
+  <li>
+    <strong><span class="en">Set-context co-location</span><span class="zh">set_context 同线程</span></strong>:
+    <span class="en">HSTU's <code>start_input_dist</code> and <code>forward</code> must run on the same worker thread. Enforced at construction by <code>HSTUPipeline._validate_set_context_colocation</code>.</span>
+    <span class="zh">HSTU 的 <code>start_input_dist</code> 与 <code>forward</code> 必须落在同一个工作线程。在构造时由 <code>HSTUPipeline._validate_set_context_colocation</code> 校验。</span>
+  </li>
+</ul>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="engine">
+<h2><span class="en">3. Engine layer (Problem #1)</span><span class="zh">3. 引擎层（Problem #1）</span></h2>
+
+<section id="engine-task">
+<h3><span class="en">3.1 Task &amp; DataSlot</span><span class="zh">3.1 Task 与 DataSlot</span></h3>
+<p>
+<span class="en">A <code>Task</code> is a unit of work with declarative metadata for the engine to schedule:</span>
+<span class="zh"><code>Task</code> 是一个带声明式元数据的工作单元，由引擎进行调度：</span>
+</p>
+<pre><span class="kw">class</span> <span class="ty">Task</span>:
+    name: <span class="ty">str</span>
+    stream: <span class="ty">str</span>                       <span class="cm"># named CUDA stream context</span>
+    priority: <span class="ty">int</span>                    <span class="cm"># NVTX priority hint</span>
+    lookahead: <span class="ty">int</span>                   <span class="cm"># SPEC_p4 v2: 0 = current batch, k = k iters ahead</span>
+    reads: Tuple[<span class="ty">DataSlot</span>, ...]      <span class="cm"># slots consumed (str shorthand auto-wraps)</span>
+    writes: Tuple[<span class="ty">DataSlot</span>, ...]     <span class="cm"># slots produced</span>
+    depends_on: Tuple[<span class="ty">str</span>, ...]      <span class="cm"># bare-name task edges; engine</span>
+                                       <span class="cm">#   auto-classifies within/cross-iter</span>
+                                       <span class="cm">#   from producer.lookahead vs consumer.lookahead</span>
+    nccl: <span class="ty">bool</span>                       <span class="cm"># participate in NCCL ordered lock</span>
+    nvtx_tag: Optional[<span class="ty">str</span>]            <span class="cm"># auto-emitted via nvtx.annotate</span>
+
+    <span class="kw">def</span> run(<span class="kw">self</span>, ctx: <span class="ty">TaskContext</span>) -> <span class="ty">None</span>: ...</pre>
+
+<p>
+<span class="en"><strong>SPEC_p4 v2 user API note</strong> (commits <code>2060ee62</code>, <code>9a2c7a12</code>, <code>faa7a30f</code>): the legacy <code>batch_offset=N</code> kwarg is removed (Phase C hard break). Pass <code>lookahead=N</code>; <code>reads</code> / <code>writes</code> accept bare strings; <code>depends_on</code> is bare-name and the engine derives within/cross-iter from the lookahead diff. Pseudo-slot names (e.g. <code>module_input_post_prefetch</code>) are no longer required to model HSTU's prefetch→forward mutation chain.</span>
+<span class="zh"><strong>SPEC_p4 v2 用户 API 说明</strong>（提交 <code>2060ee62</code>、<code>9a2c7a12</code>、<code>faa7a30f</code>）：legacy 的 <code>batch_offset=N</code> 形参已移除（Phase C hard break）。改用 <code>lookahead=N</code>；<code>reads</code> / <code>writes</code> 直接传字符串；<code>depends_on</code> 用 bare name，引擎从 lookahead 差自动判断同迭代/跨迭代。HSTU 的 prefetch→forward mutation chain 不再需要 pseudo-slot 名（如 <code>module_input_post_prefetch</code>）。</span>
+</p>
+
+<p>
+<span class="en"><code>DataSlot</code> is an opaque named handle: <code>(name: str, batch_offset: int)</code>. Two slots are equal iff both fields match. Cross-iter data flow happens via <code>BatchRing.advance()</code> shifting the slot store rather than copying values.</span>
+<span class="zh"><code>DataSlot</code> 是一个不透明的命名句柄：<code>(name: str, batch_offset: int)</code>。两个 slot 相等当且仅当两个字段都相等。跨迭代的数据流是通过 <code>BatchRing.advance()</code> 平移 slot store 实现的，并不真的拷贝数据。</span>
+</p>
+</section>
+
+<section id="engine-schedule">
+<h3><span class="en">3.2 Schedule &amp; Stage</span><span class="zh">3.2 Schedule 与 Stage</span></h3>
+<p>
+<span class="en">A <code>Schedule</code> is a frozen DAG declaration:</span>
+<span class="zh"><code>Schedule</code> 是一个冻结的 DAG 声明：</span>
+</p>
+<pre>schedule = <span class="ty">Schedule</span>(
+    stages=(
+        <span class="ty">Stage</span>(tasks=(h2d_task, fwd_task, bwd_task, opt_task)),
+    ),
+    stream_slots=(<span class="st">"default"</span>, <span class="st">"memcpy"</span>),
+)</pre>
+<p>
+<span class="en">Stages run in declaration order; tasks within a stage run subject to the <a href="#engine-mask">§4.8 mask</a> + executor's parallelism choice. <code>in_flight_batches</code> is derived from <code>max(task.batch_offset) + 1</code>.</span>
+<span class="zh">Stage 按声明顺序运行；同一个 Stage 内的任务受 <a href="#engine-mask">§4.8 掩码</a> 与执行器的并行策略共同约束。<code>in_flight_batches</code> 由 <code>max(task.batch_offset) + 1</code> 推导得到。</span>
+</p>
+
+<p>
+<span class="en">The <strong>validator</strong> (<code>autosched/validator.py</code>) enforces 8 rules at <code>SchedulablePipeline.__init__</code>:</span>
+<span class="zh"><strong>validator</strong>（<code>autosched/validator.py</code>）在 <code>SchedulablePipeline.__init__</code> 时强制执行 8 条规则：</span>
+</p>
+<table>
+<thead><tr>
+  <th><span class="en">Rule</span><span class="zh">规则</span></th>
+  <th><span class="en">Constraint</span><span class="zh">约束</span></th>
+</tr></thead>
+<tbody>
+<tr><td>1</td><td><span class="en">Task names are unique within the schedule.</span><span class="zh">同一个 schedule 中任务名唯一。</span></td></tr>
+<tr><td>2</td><td><span class="en"><code>batch_offset &gt;= 0</code> for tasks and slots.</span><span class="zh">任务和 slot 的 <code>batch_offset &gt;= 0</code>。</span></td></tr>
+<tr><td>3</td><td><span class="en">Every <code>task.stream</code> is in <code>schedule.stream_slots</code> AND in <code>StreamPool</code>.</span><span class="zh">每个 <code>task.stream</code> 既要在 <code>schedule.stream_slots</code> 中，也要在 <code>StreamPool</code> 中。</span></td></tr>
+<tr><td>4</td><td><span class="en">Each <code>DataSlot(name, offset)</code> has at most one writer.</span><span class="zh">每个 <code>DataSlot(name, offset)</code> 最多只有一个 writer。</span></td></tr>
+<tr><td>5</td><td><span class="en">Every read resolves to a writer (cross-iter via ring carry allowed; reserved slot <code>batch_cpu</code> exempt).</span><span class="zh">每个读都能解析到一个 writer（允许跨迭代通过 ring 进位；保留 slot <code>batch_cpu</code> 例外）。</span></td></tr>
+<tr><td>6</td><td><span class="en">Every <code>depends_on</code> name resolves to a task that appears earlier in declaration order.</span><span class="zh">每个 <code>depends_on</code> 引用的任务都必须在声明顺序中位于当前任务之前。</span></td></tr>
+<tr><td>7</td><td><span class="en">The combined slot + depends_on graph is acyclic.</span><span class="zh">slot + depends_on 形成的图无环。</span></td></tr>
+<tr><td>8</td><td><span class="en">Cross-stream waits are emitted exactly once per (consumer, producer-stream) pair.</span><span class="zh">每个 (consumer, producer-stream) 对的 cross-stream wait 仅插入一次。</span></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="engine-ring">
+<h3><span class="en">3.3 BatchRing</span><span class="zh">3.3 BatchRing 批次环</span></h3>
+<p>
+<span class="en">The ring holds N in-flight batches' slot stores. <code>at(k)</code> is the slot store at offset k from current. <code>advance()</code> drops offset 0, shifts each store down by one, and appends a fresh empty store at the highest offset.</span>
+<span class="zh">环里持有 N 个在飞批次的 slot store。<code>at(k)</code> 返回距当前偏移 k 的 slot store。<code>advance()</code> 丢弃 offset 0，把所有 store 向下平移一格，并在最大偏移处追加一个空的新 store。</span>
+</p>
+
+<figure><div class="svg-wrap">
+<svg width="780" height="270" viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg">
+  <text x="390" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">BatchRing — advance() over 4 iterations (N=3)</text>
+
+  <!-- iter labels -->
+  <g font-family="ui-monospace, monospace" font-size="11" fill="#1f2328">
+    <text x="60" y="60">iter 0</text>
+    <text x="60" y="105">iter 1</text>
+    <text x="60" y="150">iter 2</text>
+    <text x="60" y="195">iter 3</text>
+  </g>
+
+  <!-- header: slot indices -->
+  <g font-family="ui-monospace, monospace" font-size="10" fill="#656d76">
+    <text x="170" y="38" text-anchor="middle">slot[0]</text>
+    <text x="270" y="38" text-anchor="middle">slot[1]</text>
+    <text x="370" y="38" text-anchor="middle">slot[2]</text>
+  </g>
+
+  <!-- iter 0 -->
+  <rect x="125" y="44" width="90" height="28" class="uml-box-fill"/>
+  <text x="170" y="62" text-anchor="middle" class="uml-text">empty</text>
+  <rect x="225" y="44" width="90" height="28" class="uml-box-fill"/>
+  <text x="270" y="62" text-anchor="middle" class="uml-text">empty</text>
+  <rect x="325" y="44" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="370" y="62" text-anchor="middle" class="uml-text-em">batch 0</text>
+
+  <!-- iter 1 (after one advance) -->
+  <rect x="125" y="89" width="90" height="28" class="uml-box-fill"/>
+  <text x="170" y="107" text-anchor="middle" class="uml-text">empty</text>
+  <rect x="225" y="89" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="270" y="107" text-anchor="middle" class="uml-text-em">batch 0</text>
+  <rect x="325" y="89" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="370" y="107" text-anchor="middle" class="uml-text-em">batch 1</text>
+
+  <!-- iter 2 -->
+  <rect x="125" y="134" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="170" y="152" text-anchor="middle" class="uml-text-em">batch 0</text>
+  <rect x="225" y="134" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="270" y="152" text-anchor="middle" class="uml-text-em">batch 1</text>
+  <rect x="325" y="134" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="370" y="152" text-anchor="middle" class="uml-text-em">batch 2</text>
+
+  <!-- iter 3 (batch 0 evicted) -->
+  <rect x="125" y="179" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="170" y="197" text-anchor="middle" class="uml-text-em">batch 1</text>
+  <rect x="225" y="179" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="270" y="197" text-anchor="middle" class="uml-text-em">batch 2</text>
+  <rect x="325" y="179" width="90" height="28" class="uml-box-fill-alt"/>
+  <text x="370" y="197" text-anchor="middle" class="uml-text-em">batch 3</text>
+
+  <!-- arrows -->
+  <defs>
+    <marker id="arrSmall" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#656d76"/>
+    </marker>
+  </defs>
+  <line x1="220" y1="103" x2="220" y2="89" class="uml-msg-return" marker-end="url(#arrSmall)"/>
+  <line x1="320" y1="103" x2="320" y2="89" class="uml-msg-return" marker-end="url(#arrSmall)"/>
+  <text x="440" y="60" class="uml-text-mute">push new batch at slot[max_offset]</text>
+  <text x="440" y="106" class="uml-text-mute">advance() shifts stores</text>
+  <text x="440" y="151" class="uml-text-mute">steady state: N batches in flight</text>
+  <text x="440" y="196" class="uml-text-mute">batch 0's slot evicted (refcounts drop)</text>
+</svg>
+</div><figcaption>
+<span class="en">Each row is the ring after a successful <code>_run_one_internal_iter</code>. Slot stores carry batch-specific tensors and torchrec contexts; <code>advance()</code> is what enables data flow across iterations without explicit copies.</span>
+<span class="zh">每行是 <code>_run_one_internal_iter</code> 成功后的环状态。Slot store 持有批次相关的张量与 torchrec context；<code>advance()</code> 让数据无需显式拷贝就能跨迭代流动。</span>
+</figcaption></figure>
+</section>
+
+<section id="engine-mask">
+<h3><span class="en">3.4 §4.8 mask formula</span><span class="zh">3.4 §4.8 触发掩码公式</span></h3>
+<p>
+<span class="en">Determines whether a task at <code>batch_offset = k</code> fires at iteration <code>i</code>:</span>
+<span class="zh">决定 <code>batch_offset = k</code> 的任务是否在迭代 <code>i</code> 触发：</span>
+</p>
+<pre>fire iff   <span class="kw">(max_offset - k) ≤ i &lt; M_known + (max_offset - k)</span></pre>
+<p>
+<span class="en">where <code>M_known = pulled</code> while pulling is live, otherwise the final <code>M</code>.</span>
+<span class="zh">其中 <code>M_known</code> 在还在拉数据时等于已拉数 <code>pulled</code>，拉完之后等于最终的 <code>M</code>。</span>
+</p>
+<ul>
+  <li>
+    <span class="en">The <strong>prefill phase</strong> (i &lt; max_offset) runs only deep-offset tasks; compute @ offset 0 doesn't fire yet.</span>
+    <span class="zh"><strong>预热阶段</strong>（i &lt; max_offset）只跑深 offset 的任务；offset 0 上的 compute 还不触发。</span>
+  </li>
+  <li>
+    <span class="en">The <strong>steady phase</strong> (max_offset ≤ i &lt; M) runs all qualifying tasks each iter.</span>
+    <span class="zh"><strong>稳态阶段</strong>（max_offset ≤ i &lt; M）每轮都跑所有满足条件的任务。</span>
+  </li>
+  <li>
+    <span class="en">The <strong>drain phase</strong> (i ≥ M) runs only shallow-offset tasks until the ring is empty.</span>
+    <span class="zh"><strong>排空阶段</strong>（i ≥ M）只跑浅 offset 的任务，直到环清空。</span>
+  </li>
+</ul>
+<p>
+<span class="en">Engine raises <code>StopIteration</code> when no future iteration can satisfy any task's mask.</span>
+<span class="zh">当未来任何迭代都不能让任意任务的掩码成立时，引擎抛出 <code>StopIteration</code>。</span>
+</p>
+</section>
+
+<section id="engine-driver">
+<h3><span class="en">3.5 SchedulablePipeline driver</span><span class="zh">3.5 SchedulablePipeline 驱动器</span></h3>
+<p>
+<span class="en">Public API surface (8 symbols total at <code>commons.pipeline.engine</code>):</span>
+<span class="zh">公开 API（<code>commons.pipeline.engine</code> 共 8 个符号）：</span>
+</p>
+<table>
+<thead><tr>
+  <th><span class="en">Symbol</span><span class="zh">符号</span></th>
+  <th><span class="en">Visibility</span><span class="zh">可见性</span></th>
+  <th><span class="en">Purpose</span><span class="zh">用途</span></th>
+</tr></thead>
+<tbody>
+<tr><td><code>SchedulablePipeline</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">The driver. Holds the engine's <code>(schedule, stream_pool, executor)</code> triple and runs <code>progress(batch_iter)</code>.</span><span class="zh">驱动器。持有 <code>(schedule, stream_pool, executor)</code> 三元组并执行 <code>progress(batch_iter)</code>。</span></td></tr>
+<tr><td><code>Task</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Subclass or <code>Task.from_fn(name, fn, ...)</code>.</span><span class="zh">通过子类或 <code>Task.from_fn(name, fn, ...)</code> 创建。</span></td></tr>
+<tr><td><code>DataSlot</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Slot identifier.</span><span class="zh">slot 标识。</span></td></tr>
+<tr><td><code>Schedule</code>, <code>Stage</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Declarative DAG.</span><span class="zh">声明式 DAG。</span></td></tr>
+<tr><td><code>StreamPool</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Named CUDA stream registry.</span><span class="zh">命名 CUDA 流注册表。</span></td></tr>
+<tr><td><code>TaskContext</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Per-iter handle (<code>ctx.slots</code>, <code>ctx.stream_pool</code>, <code>ctx.iter_count</code>).</span><span class="zh">每轮迭代的句柄（<code>ctx.slots</code>、<code>ctx.stream_pool</code>、<code>ctx.iter_count</code>）。</span></td></tr>
+<tr><td><code>SequentialExecutor</code>, <code>ThreadedExecutor</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Two execution strategies.</span><span class="zh">两种执行策略。</span></td></tr>
+<tr><td><code>ScheduleValidationError</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Raised by validator.</span><span class="zh">由 validator 抛出。</span></td></tr>
+<tr><td><code>_seed_first_batch</code></td><td><span class="badge badge-priv">private</span></td><td><span class="en">Pre-populate <code>ring.at(max_offset)</code> for adapter bootstrap.</span><span class="zh">为适配层引导预填 <code>ring.at(max_offset)</code>。</span></td></tr>
+</tbody>
+</table>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="exec">
+<h2><span class="en">4. Threaded executor (Problem #3)</span><span class="zh">4. 多线程执行器（Problem #3）</span></h2>
+
+<p>
+<span class="en"><code>ThreadedExecutor</code> dispatches tasks to a <code>concurrent.futures.ThreadPoolExecutor</code> with one worker per <code>thread_id</code> in the active <code>thread_map</code>. The pool resizes on demand if a later stage needs more thread groups than the current pool has.</span>
+<span class="zh"><code>ThreadedExecutor</code> 把任务派发到 <code>concurrent.futures.ThreadPoolExecutor</code>，每个活跃 <code>thread_map</code> 中的 <code>thread_id</code> 对应一个 worker。如果后续 stage 需要更多线程组，线程池会按需扩容。</span>
+</p>
+
+<section id="exec-thread-map">
+<h3><span class="en">4.1 thread_map strategies</span><span class="zh">4.1 thread_map 策略</span></h3>
+<table>
+<thead><tr>
+  <th><span class="en">Spec</span><span class="zh">规约</span></th>
+  <th><span class="en">Resolution</span><span class="zh">解析方式</span></th>
+  <th><span class="en">Use case</span><span class="zh">使用场景</span></th>
+</tr></thead>
+<tbody>
+<tr>
+  <td><code>None</code> <span class="en">or</span><span class="zh">或</span> <code>"by_stream"</code> (<span class="en">default</span><span class="zh">默认</span>)</td>
+  <td><code>thread_id = task.stream or "default"</code></td>
+  <td><span class="en">Common case: one CPU thread per CUDA stream</span><span class="zh">常见情况：每个 CUDA 流一个 CPU 线程</span></td>
+</tr>
+<tr>
+  <td><code>"per_task"</code></td>
+  <td><code>thread_id = task.name</code></td>
+  <td><span class="en">Maximum parallelism; useful for stress tests</span><span class="zh">最大并行度；适合压力测试</span></td>
+</tr>
+<tr>
+  <td><code>dict[str, str]</code></td>
+  <td><code>{task_name: thread_id}</code> <span class="en">with <code>"default"</code> fallback</span><span class="zh">未命中走 <code>"default"</code></span></td>
+  <td><span class="en">Custom pinning (e.g. HSTU's <code>{io, compute}</code>)</span><span class="zh">自定义绑定（例如 HSTU 的 <code>{io, compute}</code>）</span></td>
+</tr>
+<tr>
+  <td><code>Callable[[Task], str]</code></td>
+  <td><span class="en">User function</span><span class="zh">用户提供的函数</span></td>
+  <td><span class="en">Dynamic policies based on task fields</span><span class="zh">基于任务字段的动态策略</span></td>
+</tr>
+</tbody>
+</table>
+
+<p>
+<span class="en">Threads and CUDA streams are <strong>decoupled</strong>: a task's <code>stream</code> selects the CUDA stream context inside <code>StreamPool.use()</code>; <code>thread_map</code> selects the CPU worker that submits the task. The same stream may be submitted from different threads (different iterations or — with caution — same iteration).</span>
+<span class="zh">线程与 CUDA 流是 <strong>解耦的</strong>：任务的 <code>stream</code> 字段决定 <code>StreamPool.use()</code> 内的 CUDA 流上下文；<code>thread_map</code> 决定提交任务的 CPU 线程。同一个流可以来自不同线程（来自不同迭代，或谨慎地来自同一迭代）。</span>
+</p>
+</section>
+
+<section id="exec-cpu-deps">
+<h3><span class="en">4.2 CPU dependency computation</span><span class="zh">4.2 CPU 依赖计算</span></h3>
+<p>
+<span class="en"><code>_compute_cpu_deps</code> builds a dict <code>{task_name → [predecessor_completion_events]}</code> by walking the active task list and adding three edge types:</span>
+<span class="zh"><code>_compute_cpu_deps</code> 构造 <code>{task_name → [predecessor_completion_events]}</code> 字典，遍历活跃任务并添加三类边：</span>
+</p>
+<ol>
+  <li>
+    <strong><span class="en">Slot-based</span><span class="zh">基于 slot</span></strong>:
+    <span class="en">any writer of a slot the task reads (excluding self).</span>
+    <span class="zh">该任务所读 slot 的任意 writer（自己除外）。</span>
+  </li>
+  <li>
+    <strong><span class="en">Explicit</span><span class="zh">显式</span></strong>:
+    <span class="en">every <code>task.depends_on</code> name that is in active.</span>
+    <span class="zh"><code>task.depends_on</code> 中且在活跃集合中的所有任务名。</span>
+  </li>
+  <li>
+    <strong><span class="en">Same-stream FIFO</span><span class="zh">同流 FIFO</span></strong>:
+    <span class="en">the most recent task on the same stream in declaration order — preserves CUDA stream FIFO semantics when <code>thread_map</code> splits same-stream tasks across threads.</span>
+    <span class="zh">声明顺序中同一个流上的最近一个任务 —— 当 <code>thread_map</code> 把同流任务拆到不同线程时，这条边保住了 CUDA 流的 FIFO 语义。</span>
+  </li>
+</ol>
+<p>
+<span class="en">The cross-thread filter then keeps only edges where <code>thread_id_of(producer) ≠ thread_id_of(consumer)</code>; same-thread predecessors are already serialized by their thread loop.</span>
+<span class="zh">随后通过跨线程过滤，仅保留 <code>thread_id_of(producer) ≠ thread_id_of(consumer)</code> 的边；同线程的前驱已经被线程内的循环串行化。</span>
+</p>
+</section>
+
+<section id="exec-nccl-lock">
+<h3><span class="en">4.3 NCCL ordered lock</span><span class="zh">4.3 NCCL 顺序锁</span></h3>
+<p>
+<span class="en">Tasks tagged <code>nccl=True</code> acquire a ticket-based lock that guarantees declaration-order execution across all ranks. Without this, a multi-threaded executor on different ranks may submit collectives in different orders → mismatched NCCL calls → deadlock.</span>
+<span class="zh">标了 <code>nccl=True</code> 的任务要获取一把基于票据的锁，保证所有 rank 都按声明顺序执行集合通信。如果没有它，多线程执行器在不同 rank 上可能以不同顺序提交集合操作 → NCCL 调用错配 → 死锁。</span>
+</p>
+
+<figure><div class="svg-wrap">
+<svg width="720" height="380" viewBox="0 0 720 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="360" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">_NcclOrderedLock — state &amp; transitions</text>
+
+  <!-- States -->
+  <ellipse cx="160" cy="120" rx="80" ry="34" class="uml-box-fill"/>
+  <text x="160" y="116" text-anchor="middle" class="uml-text-em">next_ticket = N</text>
+  <text x="160" y="132" text-anchor="middle" class="uml-text-mute">_failed = false</text>
+
+  <ellipse cx="420" cy="120" rx="80" ry="34" class="uml-box-fill"/>
+  <text x="420" y="116" text-anchor="middle" class="uml-text-em">holding ticket N</text>
+  <text x="420" y="132" text-anchor="middle" class="uml-text-mute">(running task)</text>
+
+  <ellipse cx="560" cy="280" rx="80" ry="34" class="uml-box-fill" style="fill: #ffebe9; stroke: #cf222e;"/>
+  <text x="560" y="276" text-anchor="middle" class="uml-text-em" style="fill: #cf222e;">aborted</text>
+  <text x="560" y="292" text-anchor="middle" class="uml-text-mute">_failed = true</text>
+
+  <ellipse cx="160" cy="280" rx="80" ry="34" class="uml-box-fill"/>
+  <text x="160" y="276" text-anchor="middle" class="uml-text-em">waiting</text>
+  <text x="160" y="292" text-anchor="middle" class="uml-text-mute">in cond.wait()</text>
+
+  <!-- Transitions -->
+  <defs>
+    <marker id="arrState" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+  </defs>
+  <!-- next=N → holding ticket N (acquire matches) -->
+  <path d="M 240,108 L 340,108" class="uml-msg-sync" marker-end="url(#arrState)"/>
+  <text x="290" y="100" text-anchor="middle" class="uml-text">acquire(N)</text>
+
+  <!-- holding → next=N+1 (release) -->
+  <path d="M 340,140 L 240,140" class="uml-msg-sync" marker-end="url(#arrState)"/>
+  <text x="290" y="156" text-anchor="middle" class="uml-text">release()</text>
+
+  <!-- next=N → waiting (acquire(N+1) before release) -->
+  <path d="M 160,160 L 160,240" class="uml-msg-sync" marker-end="url(#arrState)"/>
+  <text x="170" y="200" class="uml-text">acquire(K&gt;N)</text>
+  <text x="170" y="216" class="uml-text-mute">cond.wait()</text>
+
+  <!-- waiting → holding (release notifies, K matches) -->
+  <path d="M 220,260 Q 280,200 360,140" class="uml-msg-sync" marker-end="url(#arrState)"/>
+  <text x="305" y="200" class="uml-text-mute">release notify_all + K==next</text>
+
+  <!-- holding → aborted (task raises) -->
+  <path d="M 480,150 Q 540,210 560,246" class="uml-msg-sync" marker-end="url(#arrState)"/>
+  <text x="540" y="200" class="uml-text" style="fill: #cf222e;">release(failed=true)</text>
+
+  <!-- waiting → aborted (abort() called by external thread) -->
+  <path d="M 240,290 L 480,288" class="uml-msg-sync" marker-end="url(#arrState)"/>
+  <text x="360" y="280" text-anchor="middle" class="uml-text" style="fill: #cf222e;">abort() — wakes all waiters</text>
+
+  <!-- aborted → re-raise -->
+  <path d="M 560,316 L 560,360" class="uml-msg-async" marker-end="url(#arrState)"/>
+  <text x="570" y="345" class="uml-text" style="fill: #cf222e;">RuntimeError</text>
+</svg>
+</div><figcaption>
+<span class="en">Ticket-based FIFO with two failure-aware exits: <code>release(failed=True)</code> when the running task raises; <code>abort()</code> when an unrelated worker dies before the expected ticket release would have happened.</span>
+<span class="zh">票据 FIFO 设计了两条失败退出：当前任务抛错时走 <code>release(failed=True)</code>；当某个无关 worker 在预期的票据释放之前先死掉时由 <code>abort()</code> 触发。</span>
+</figcaption></figure>
+
+</section>
+
+<section id="exec-cancel">
+<h3><span class="en">4.4 Cancellation &amp; abort</span><span class="zh">4.4 取消与中止</span></h3>
+<p>
+<span class="en">Each <code>execute_stage</code> call sets up:</span>
+<span class="zh">每次 <code>execute_stage</code> 调用会准备：</span>
+</p>
+<ul>
+  <li><span class="en">A <code>threading.Event</code> per active task — signaled when the task finishes (or its thread errors out).</span><span class="zh">每个活跃任务一个 <code>threading.Event</code> —— 任务完成（或所在线程出错）时置位。</span></li>
+  <li><span class="en">A shared <code>cancelled</code> Event — set by the first failing thread.</span><span class="zh">一个共享的 <code>cancelled</code> Event —— 由第一个失败的线程置位。</span></li>
+  <li><span class="en">An <code>errors_lock</code> + <code>errors</code> list to collect exceptions across threads.</span><span class="zh"><code>errors_lock</code> + <code>errors</code> 列表用于跨线程收集异常。</span></li>
+</ul>
+<p>
+<span class="en">The <code>except</code> handler in <code>_run_thread_chain</code> does three things in order:</span>
+<span class="zh"><code>_run_thread_chain</code> 的 <code>except</code> 分支按顺序做三件事：</span>
+</p>
+<ol>
+  <li><code>cancelled.set()</code> — <span class="en">stops further task starts on all chains.</span><span class="zh">阻止所有线程链上后续任务的启动。</span></li>
+  <li><code>self._nccl_lock.abort()</code> — <span class="en">wakes any worker blocked inside <code>acquire(ticket &gt; current)</code>.</span><span class="zh">唤醒任何阻塞在 <code>acquire(ticket &gt; current)</code> 的 worker。</span></li>
+  <li><span class="en">Append exception to <code>errors</code>; the <code>finally</code> block sets every remaining task's completion event so peer threads waiting on <code>cpu_deps</code> Events don't deadlock.</span><span class="zh">把异常追加进 <code>errors</code>；<code>finally</code> 块把剩余任务的完成事件全部置位，避免其他线程在 <code>cpu_deps</code> 上死锁。</span></li>
+</ol>
+<p>
+<span class="en">After the stage barrier (<code>future.result()</code> on every chain), <code>execute_stage</code> raises <code>errors[0]</code>.</span>
+<span class="zh">stage 屏障（对每条链 <code>future.result()</code>）之后，<code>execute_stage</code> 抛出 <code>errors[0]</code>。</span>
+</p>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="hstu">
+<h2><span class="en">5. HSTU adapter (Problem #2)</span><span class="zh">5. HSTU 适配层（Problem #2）</span></h2>
+
+<section id="hstu-tasks">
+<h3><span class="en">5.1 14 tasks</span><span class="zh">5.1 14 个任务</span></h3>
+<p>
+<span class="en"><code>HSTUPipeline._build_schedule</code> assembles a single-stage schedule from these task factories. Order matters: tasks within a stage are declared in the order they should fire when their masks both qualify.</span>
+<span class="zh"><code>HSTUPipeline._build_schedule</code> 用这些任务工厂拼出一个单 stage 的 schedule。顺序很重要：当掩码都成立时，stage 内的任务按声明顺序触发。</span>
+</p>
+
+<table>
+<thead><tr>
+  <th>#</th>
+  <th><span class="en">Task</span><span class="zh">任务</span></th>
+  <th>batch_offset</th>
+  <th>stream</th>
+  <th>nccl</th>
+  <th><span class="en">Purpose</span><span class="zh">用途</span></th>
+</tr></thead>
+<tbody>
+<tr><td>1</td><td><code>h2d</code></td><td>2 (np) / 2 (pf)</td><td>memcpy</td><td>—</td><td><span class="en">CPU→GPU + create torchrec_ctx</span><span class="zh">CPU→GPU + 创建 torchrec_ctx</span></td></tr>
+<tr><td>2</td><td><code>start_shuffle</code></td><td>2 / 2</td><td>memcpy</td><td>conditional</td><td><span class="en">KK shuffler phase 1 (background thread)</span><span class="zh">KK shuffler 第 1 阶段（后台线程）</span></td></tr>
+<tr><td>3</td><td><code>finish_shuffle</code></td><td>2 / 2</td><td>memcpy</td><td>conditional</td><td><span class="en">KK shuffler phase 2 (AllGather + index_select)</span><span class="zh">KK shuffler 第 2 阶段（AllGather + index_select）</span></td></tr>
+<tr><td>4</td><td><code>start_input_dist</code></td><td>1 / 1</td><td>data_dist</td><td>✓</td><td><span class="en">torchrec splits all-to-all</span><span class="zh">torchrec splits all-to-all</span></td></tr>
+<tr><td>5</td><td><code>wait_input_dist</code></td><td>1 / 1</td><td>data_dist</td><td>✓</td><td><span class="en">tensors-awaitable wait</span><span class="zh">等待 tensors-awaitable 完成</span></td></tr>
+<tr><td>6</td><td><code>zero_grad</code></td><td>0</td><td>default</td><td>—</td><td><span class="en">optimizer.zero_grad + Megatron buffer reset</span><span class="zh">optimizer.zero_grad + Megatron buffer 重置</span></td></tr>
+<tr><td>7</td><td><code>global_tokens_allreduce</code></td><td>0</td><td>default</td><td>✓</td><td><span class="en">Per-rank loss-token AllReduce</span><span class="zh">per-rank loss-token AllReduce</span></td></tr>
+<tr><td>8</td><td><code>nccl_safety_barrier</code></td><td>0</td><td>default</td><td>—</td><td><span class="en"><code>wait_stream(memcpy)</code> for shuffle ordering</span><span class="zh">为 shuffle 顺序插入 <code>wait_stream(memcpy)</code></span></td></tr>
+<tr><td>9</td><td><code>forward</code></td><td>0</td><td>default</td><td>—</td><td><span class="en">set_module_context + model(batch)</span><span class="zh">set_module_context + model(batch)</span></td></tr>
+<tr><td>10</td><td><code>prefetch_embeddings</code> (prefetch only)</td><td>1</td><td>prefetch</td><td>—</td><td><span class="en">cache prefetch + populate <code>module_input_post_prefetch</code></span><span class="zh">缓存 prefetch + 填充 <code>module_input_post_prefetch</code></span></td></tr>
+<tr><td>11</td><td><code>backward</code></td><td>0</td><td>default</td><td>✓</td><td>(loss × dp_size / global_tokens).backward()</td></tr>
+<tr><td>12</td><td><code>finalize_model_grads</code></td><td>0</td><td>default</td><td>✓</td><td><span class="en">Megatron TP grad finalize</span><span class="zh">Megatron TP 梯度收尾</span></td></tr>
+<tr><td>13</td><td><code>optimizer_step</code></td><td>0</td><td>default</td><td>—</td><td><span class="en">optimizer.step + write step_result</span><span class="zh">optimizer.step + 写 step_result</span></td></tr>
+<tr><td>14</td><td><code>watchdog_step</code></td><td>0</td><td>default</td><td>—</td><td><span class="en">Optional CUDA mem watchdog</span><span class="zh">可选的 CUDA 内存 watchdog</span></td></tr>
+</tbody>
+</table>
+
+<p class="meta">
+<span class="en">np = non-prefetch variant, pf = prefetch variant. Both keep <code>max_offset = 2</code> at <code>prefetch_depth=1</code> (matches legacy 3-batch in-flight). For prefetch_depth=K, <code>max_offset = K+1</code>.</span>
+<span class="zh">np = 无 prefetch 变体，pf = prefetch 变体。两者在 <code>prefetch_depth=1</code> 时都是 <code>max_offset = 2</code>（与遗留的 3 批在飞匹配）。<code>prefetch_depth=K</code> 时 <code>max_offset = K+1</code>。</span>
+</p>
+</section>
+
+<section id="hstu-thread-map">
+<h3><span class="en">5.2 HSTU_DEFAULT_THREAD_MAP</span><span class="zh">5.2 HSTU_DEFAULT_THREAD_MAP</span></h3>
+<p>
+<span class="en">Two thread groups:</span>
+<span class="zh">两个线程组：</span>
+</p>
+<pre>HSTU_DEFAULT_THREAD_MAP = {
+    <span class="cm"># io thread — pure data movement</span>
+    <span class="st">"h2d"</span>: <span class="st">"io"</span>,
+    <span class="st">"start_shuffle"</span>: <span class="st">"io"</span>,
+    <span class="st">"finish_shuffle"</span>: <span class="st">"io"</span>,
+    <span class="cm"># compute thread — everything that touches shared module state</span>
+    <span class="st">"start_input_dist"</span>: <span class="st">"compute"</span>,
+    <span class="st">"wait_input_dist"</span>: <span class="st">"compute"</span>,
+    <span class="st">"prefetch_embeddings"</span>: <span class="st">"compute"</span>,
+    <span class="st">"zero_grad"</span>: <span class="st">"compute"</span>,
+    <span class="st">"global_tokens_allreduce"</span>: <span class="st">"compute"</span>,
+    <span class="st">"nccl_safety_barrier"</span>: <span class="st">"compute"</span>,
+    <span class="st">"forward"</span>: <span class="st">"compute"</span>,
+    <span class="st">"backward"</span>: <span class="st">"compute"</span>,
+    <span class="st">"finalize_model_grads"</span>: <span class="st">"compute"</span>,
+    <span class="st">"optimizer_step"</span>: <span class="st">"compute"</span>,
+    <span class="st">"watchdog_step"</span>: <span class="st">"compute"</span>,
+}</pre>
+
+<div class="warn">
+  <strong><span class="en">Why two threads, not many</span><span class="zh">为什么是两个线程而不是更多</span></strong>:
+  <span class="en"><code>start_input_dist</code> temporarily mutates each <code>postproc.set_context(ctx)</code>; <code>forward</code> calls <code>module.forward.set_context(ctx)</code> + <code>postproc.set_context(ctx)</code>. Both write the same shared module attribute. Splitting them across threads would race. Pinning to one thread serializes them by construction. <code>HSTUPipeline._validate_set_context_colocation</code> rejects custom thread_maps that violate this.</span>
+  <span class="zh"><code>start_input_dist</code> 会暂时修改每个 <code>postproc.set_context(ctx)</code>；<code>forward</code> 又调 <code>module.forward.set_context(ctx)</code> + <code>postproc.set_context(ctx)</code>。两者写的是同一个共享 module 属性。把它们放到不同线程会发生竞争。绑定到同一线程在构造时就把它们串行化了。<code>HSTUPipeline._validate_set_context_colocation</code> 会拒绝违反这一约束的自定义 thread_map。</span>
+</div>
+</section>
+
+<section id="hstu-bootstrap">
+<h3><span class="en">5.3 Bootstrap flow</span><span class="zh">5.3 引导流程</span></h3>
+<p>
+<span class="en">The first call to <code>HSTUPipeline.progress()</code> runs a one-time bootstrap because torchrec's <code>_rewrite_model</code> needs a real batch for FX tracing. Sequence diagram in <a href="#seq-first-call">§6.1</a>.</span>
+<span class="zh">首次调用 <code>HSTUPipeline.progress()</code> 会执行一次性引导，因为 torchrec 的 <code>_rewrite_model</code> 需要一个真实 batch 做 FX 追踪。时序图见 <a href="#seq-first-call">§6.1</a>。</span>
+</p>
+
+<p>
+<span class="en">Key invariants:</span>
+<span class="zh">关键不变量：</span>
+</p>
+<ul>
+  <li><strong><span class="en">StreamPool built first</span><span class="zh">先建 StreamPool</span></strong> — <span class="en">H2D + bootstrap collectives run on the engine's actual streams, not throwaway streams.</span><span class="zh">H2D + 引导阶段的集合通信都跑在引擎真正用的流上，而非临时流。</span></li>
+  <li><strong><span class="en">Real per-batch context</span><span class="zh">真实的 per-batch context</span></strong> — <span class="en">bootstrap context is created by <code>state.create_torchrec_ctx()</code> with <code>version=1</code> (the v0 single-shared-context branch is forbidden).</span><span class="zh">引导 context 由 <code>state.create_torchrec_ctx()</code> 创建，<code>version=1</code>（v0 单共享 context 分支被禁用）。</span></li>
+  <li><strong><span class="en">Peek batch is seeded into the ring</span><span class="zh">peek batch 被植入 ring</span></strong> — <span class="en"><code>_pipe._seed_first_batch(...)</code> populates <code>ring.at(max_offset)</code> with <code>{batch_cpu, batch_gpu, torchrec_ctx, shuffled_batch (identity only)}</code>; idempotent guards in h2d/start_input_dist/finish_shuffle skip the work that's already been done.</span><span class="zh"><code>_pipe._seed_first_batch(...)</code> 把 <code>{batch_cpu, batch_gpu, torchrec_ctx, shuffled_batch（仅 identity）}</code> 写入 <code>ring.at(max_offset)</code>；h2d/start_input_dist/finish_shuffle 中的幂等保护会跳过已完成的工作。</span></li>
+  <li><strong><span class="en">No 1-batch loss</span><span class="zh">不丢一个 batch</span></strong> — <span class="en">the peek batch flows through forward/backward/optimizer like any other batch.</span><span class="zh">peek batch 与普通 batch 一样走完 forward/backward/optimizer。</span></li>
+</ul>
+</section>
+
+<section id="hstu-variants">
+<h3><span class="en">5.4 native vs prefetch variant</span><span class="zh">5.4 native 与 prefetch 变体</span></h3>
+<p>
+<span class="en">Same task list, plus or minus <code>prefetch_embeddings</code>. The non-prefetch variant uses <code>PipelinedForward</code> which reads <code>input_dist_tensors_requests</code> directly. The prefetch variant uses <code>PrefetchPipelinedForward</code> which reads from <code>module_input_post_prefetch</code>, populated in the previous iter by <code>prefetch_embeddings</code>.</span>
+<span class="zh">两者任务列表相同，区别是有没有 <code>prefetch_embeddings</code>。无 prefetch 变体用 <code>PipelinedForward</code>，直接读 <code>input_dist_tensors_requests</code>；prefetch 变体用 <code>PrefetchPipelinedForward</code>，读上一轮 <code>prefetch_embeddings</code> 写入的 <code>module_input_post_prefetch</code>。</span>
+</p>
+
+<p>
+<strong><span class="en">Critical ordering</span><span class="zh">关键顺序</span></strong>:
+<span class="en">in the schedule, <code>prefetch_embeddings</code> is declared <em>after</em> <code>forward</code>, not before. Reason: dynamicemb's <code>_prefetch_outstanding_keys</code> counter is incremented by <code>prefetch()</code> and decremented at end of <code>forward</code>. Same-iter order:</span>
+<span class="zh">schedule 中 <code>prefetch_embeddings</code> 声明在 <code>forward</code> <em>之后</em>，不能在前面。原因：dynamicemb 的 <code>_prefetch_outstanding_keys</code> 计数器在 <code>prefetch()</code> 时加，在 <code>forward</code> 结束时减。同迭代顺序：</span>
+</p>
+<ul>
+  <li><strong><span class="en">forward → prefetch (correct)</span><span class="zh">forward → prefetch（正确）</span></strong>: <span class="en">forward consumes prev-iter's prefetched data first (counter decremented), then this-iter's prefetch adds new keys. Steady-state outstanding ≈ 1 batch.</span><span class="zh">forward 先消费上一轮 prefetch 的数据（计数减），然后本轮 prefetch 新增 key。稳态在飞 ≈ 1 个 batch。</span></li>
+  <li><strong><span class="en">prefetch → forward (wrong)</span><span class="zh">prefetch → forward（错误）</span></strong>: <span class="en">prefetch adds new keys before forward consumes prev's. Steady-state outstanding ≈ 2 batches → cache overflow.</span><span class="zh">prefetch 在 forward 消费前一轮之前就加新 key。稳态在飞 ≈ 2 个 batch → cache 溢出。</span></li>
+</ul>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="sequences">
+<h2><span class="en">6. Workflow sequence diagrams</span><span class="zh">6. 工作流时序图</span></h2>
+
+<section id="seq-first-call">
+<h3><span class="en">6.1 First progress() call (bootstrap)</span><span class="zh">6.1 首次 progress() 调用（引导）</span></h3>
+
+<figure><div class="svg-wrap">
+<svg width="900" height="660" viewBox="0 0 900 660" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">Sequence: HSTUPipeline.progress() — first call</text>
+
+  <!-- Lifelines (header rectangles) -->
+  <g>
+    <rect x="20" y="40" width="100" height="32" class="uml-actor-rect"/>
+    <text x="70" y="60" text-anchor="middle" class="uml-text-em">User</text>
+    <rect x="160" y="40" width="120" height="32" class="uml-box-fill"/>
+    <text x="220" y="60" text-anchor="middle" class="uml-text-em">HSTUPipeline</text>
+    <rect x="320" y="40" width="120" height="32" class="uml-box-fill"/>
+    <text x="380" y="60" text-anchor="middle" class="uml-text-em">torchrec</text>
+    <text x="380" y="73" text-anchor="middle" class="uml-text-mute">_rewrite_model</text>
+    <rect x="480" y="40" width="120" height="32" class="uml-box-fill"/>
+    <text x="540" y="60" text-anchor="middle" class="uml-text-em">StreamPool</text>
+    <rect x="640" y="40" width="120" height="32" class="uml-box-fill"/>
+    <text x="700" y="60" text-anchor="middle" class="uml-text-em">SchedulablePipeline</text>
+    <rect x="780" y="40" width="100" height="32" class="uml-box-fill"/>
+    <text x="830" y="60" text-anchor="middle" class="uml-text-em">Engine ring</text>
+  </g>
+
+  <!-- Lifelines (dashed verticals) -->
+  <g>
+    <line x1="70" y1="72" x2="70" y2="640" class="uml-lifeline"/>
+    <line x1="220" y1="72" x2="220" y2="640" class="uml-lifeline"/>
+    <line x1="380" y1="72" x2="380" y2="640" class="uml-lifeline"/>
+    <line x1="540" y1="72" x2="540" y2="640" class="uml-lifeline"/>
+    <line x1="700" y1="72" x2="700" y2="640" class="uml-lifeline"/>
+    <line x1="830" y1="72" x2="830" y2="640" class="uml-lifeline"/>
+  </g>
+
+  <defs>
+    <marker id="arrSeq" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <marker id="arrSeqRet" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,5 L10,0 M0,5 L10,10" stroke="#656d76" fill="none" stroke-width="1"/>
+    </marker>
+  </defs>
+
+  <!-- 1. progress() -->
+  <line x1="70" y1="100" x2="220" y2="100" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="80" y="92" class="uml-text">progress(dataloader_iter)</text>
+  <rect x="216" y="100" width="8" height="500" class="uml-activation"/>
+
+  <!-- 2. next(iter) -->
+  <line x1="220" y1="130" x2="220" y2="130" class="uml-msg-sync"/>
+  <path d="M 224,128 Q 250,128 250,140 Q 250,152 224,152" class="uml-msg-sync" fill="none" marker-end="url(#arrSeq)"/>
+  <text x="260" y="142" class="uml-text">next(iter)  ← peek_cpu</text>
+
+  <!-- 3. _build_schedule -->
+  <line x1="220" y1="180" x2="540" y2="180" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="260" y="172" class="uml-text">_build_schedule()  → (schedule, pool)</text>
+  <rect x="536" y="180" width="8" height="20" class="uml-activation"/>
+
+  <!-- 4. validate co-location -->
+  <path d="M 224,210 Q 250,210 250,222 Q 250,234 224,234" class="uml-msg-sync" fill="none" marker-end="url(#arrSeq)"/>
+  <text x="260" y="225" class="uml-text">_validate_set_context_colocation()</text>
+
+  <!-- 5. H2D on pool's memcpy stream -->
+  <line x1="220" y1="260" x2="540" y2="260" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="260" y="252" class="uml-text">pool.use("memcpy") + _to_device(peek_cpu) → peek_gpu</text>
+  <rect x="536" y="260" width="8" height="20" class="uml-activation"/>
+
+  <!-- 6. record_stream onto consumers -->
+  <path d="M 224,290 Q 280,290 280,302 Q 280,314 224,314" class="uml-msg-sync" fill="none" marker-end="url(#arrSeq)"/>
+  <text x="290" y="305" class="uml-text">peek_gpu.record_stream(default, data_dist, prefetch?)</text>
+
+  <!-- 7. _rewrite_model -->
+  <line x1="220" y1="340" x2="380" y2="340" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="225" y="332" class="uml-text">_rewrite_model(peek_gpu, dist=data_dist, default=default)</text>
+  <rect x="376" y="340" width="8" height="60" class="uml-activation"/>
+  <text x="385" y="358" class="uml-text-mute">FX trace + install PipelinedForward</text>
+  <text x="385" y="375" class="uml-text-mute">monkey-patches</text>
+
+  <!-- 8. return pipelined_modules -->
+  <line x1="380" y1="400" x2="220" y2="400" class="uml-msg-return" marker-end="url(#arrSeqRet)"/>
+  <text x="225" y="392" class="uml-text-mute">→ (pipelined_modules, model, ...)</text>
+
+  <!-- 9. wait_stream + bootstrap _start_data_dist -->
+  <line x1="220" y1="430" x2="540" y2="430" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="260" y="422" class="uml-text">data_dist.wait_stream(memcpy)</text>
+
+  <line x1="220" y1="460" x2="380" y2="460" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="225" y="452" class="uml-text">_start_data_dist(modules, peek, peek_ctx)  [in data_dist stream ctx]</text>
+
+  <!-- 10. _override_input_dist_forwards -->
+  <line x1="220" y1="495" x2="380" y2="495" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="225" y="487" class="uml-text">_override_input_dist_forwards(modules)</text>
+
+  <!-- 11. SchedulablePipeline construction -->
+  <line x1="220" y1="525" x2="700" y2="525" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="260" y="517" class="uml-text">SchedulablePipeline(schedule, pool, executor=ThreadedExecutor(...))</text>
+  <rect x="696" y="525" width="8" height="80" class="uml-activation"/>
+
+  <!-- 12. _seed_first_batch -->
+  <line x1="220" y1="560" x2="700" y2="560" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="260" y="552" class="uml-text">_seed_first_batch({batch_cpu, batch_gpu, torchrec_ctx, ...})</text>
+
+  <line x1="700" y1="585" x2="830" y2="585" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="710" y="577" class="uml-text">ring.at(max_offset).set(...)</text>
+
+  <!-- 13. delegate to engine progress -->
+  <line x1="220" y1="620" x2="700" y2="620" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="260" y="612" class="uml-text">progress(dataloader_iter)  → (loss, tokens, output)</text>
+</svg>
+</div><figcaption>
+<span class="en">Bootstrap is a one-time cost on first <code>progress()</code>. The peek batch is fully integrated into the engine via <code>_seed_first_batch</code>; subsequent calls skip steps 2–12 and go straight to <code>SchedulablePipeline.progress()</code>.</span>
+<span class="zh">引导只在首次 <code>progress()</code> 时发生一次。peek batch 通过 <code>_seed_first_batch</code> 完整融入引擎；后续调用直接跳过第 2–12 步进入 <code>SchedulablePipeline.progress()</code>。</span>
+</figcaption></figure>
+</section>
+
+<section id="seq-steady">
+<h3><span class="en">6.2 Steady-state iteration</span><span class="zh">6.2 稳态迭代</span></h3>
+
+<figure><div class="svg-wrap">
+<svg width="900" height="600" viewBox="0 0 900 600" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">Sequence: steady-state iter under HSTU_DEFAULT_THREAD_MAP</text>
+
+  <!-- Lifelines header -->
+  <g>
+    <rect x="20" y="40" width="120" height="32" class="uml-actor-rect"/>
+    <text x="80" y="60" text-anchor="middle" class="uml-text-em">SchedulablePipeline</text>
+
+    <rect x="180" y="40" width="120" height="32" class="uml-box-fill"/>
+    <text x="240" y="60" text-anchor="middle" class="uml-text-em">ThreadedExecutor</text>
+
+    <rect x="340" y="40" width="120" height="32" class="uml-box-fill" style="fill: #fff8c5;"/>
+    <text x="400" y="60" text-anchor="middle" class="uml-text-em">io thread</text>
+
+    <rect x="500" y="40" width="120" height="32" class="uml-box-fill" style="fill: #ddf4ff;"/>
+    <text x="560" y="60" text-anchor="middle" class="uml-text-em">compute thread</text>
+
+    <rect x="660" y="40" width="100" height="32" class="uml-box-fill"/>
+    <text x="710" y="60" text-anchor="middle" class="uml-text-em">_NcclLock</text>
+
+    <rect x="780" y="40" width="100" height="32" class="uml-box-fill"/>
+    <text x="830" y="60" text-anchor="middle" class="uml-text-em">CUDA streams</text>
+  </g>
+
+  <!-- Lifelines -->
+  <g>
+    <line x1="80" y1="72" x2="80" y2="580" class="uml-lifeline"/>
+    <line x1="240" y1="72" x2="240" y2="580" class="uml-lifeline"/>
+    <line x1="400" y1="72" x2="400" y2="580" class="uml-lifeline"/>
+    <line x1="560" y1="72" x2="560" y2="580" class="uml-lifeline"/>
+    <line x1="710" y1="72" x2="710" y2="580" class="uml-lifeline"/>
+    <line x1="830" y1="72" x2="830" y2="580" class="uml-lifeline"/>
+  </g>
+
+  <!-- 1. _run_one_internal_iter -->
+  <line x1="80" y1="100" x2="240" y2="100" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="90" y="92" class="uml-text">execute_stage(stage, ctx, iter, mask)</text>
+
+  <!-- 2. partition active tasks -->
+  <path d="M 244,120 Q 290,120 290,135 Q 290,150 244,150" class="uml-msg-sync" fill="none" marker-end="url(#arrSeq)"/>
+  <text x="298" y="142" class="uml-text">partition by thread, compute cpu_deps</text>
+
+  <!-- par fragment header -->
+  <rect x="260" y="170" width="600" height="370" class="uml-frag"/>
+  <text x="270" y="186" class="uml-text-em" style="fill: #0969da;">par  [io ‖ compute]</text>
+
+  <!-- io thread chain -->
+  <line x1="240" y1="210" x2="400" y2="210" class="uml-msg-async" marker-end="url(#arrSeq)"/>
+  <text x="245" y="202" class="uml-text">submit io chain</text>
+  <rect x="396" y="210" width="8" height="200" class="uml-activation"/>
+
+  <text x="404" y="226" class="uml-text-em">h2d (memcpy stream)</text>
+  <line x1="404" y1="232" x2="830" y2="232" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="500" y="226" class="uml-text">enqueue H2D copy</text>
+
+  <text x="404" y="262" class="uml-text-em">start_shuffle (nccl)</text>
+  <line x1="404" y1="268" x2="710" y2="268" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="500" y="262" class="uml-text">acquire(0)</text>
+  <line x1="710" y1="280" x2="830" y2="280" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="720" y="277" class="uml-text">AllGather workloads</text>
+  <line x1="404" y1="296" x2="710" y2="296" class="uml-msg-async" marker-end="url(#arrSeq)"/>
+  <text x="500" y="289" class="uml-text">release(0)</text>
+
+  <text x="404" y="320" class="uml-text-em">finish_shuffle (nccl)</text>
+  <line x1="404" y1="326" x2="710" y2="326" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="500" y="320" class="uml-text">acquire(1)</text>
+  <line x1="710" y1="340" x2="830" y2="340" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="720" y="337" class="uml-text">AllGather batch + index_select</text>
+  <line x1="404" y1="356" x2="710" y2="356" class="uml-msg-async" marker-end="url(#arrSeq)"/>
+  <text x="500" y="349" class="uml-text">release(1)</text>
+  <text x="404" y="395" class="uml-text-mute">signal completion[h2d/start/finish_shuffle].set()</text>
+
+  <!-- compute thread chain -->
+  <line x1="240" y1="430" x2="560" y2="430" class="uml-msg-async" marker-end="url(#arrSeq)"/>
+  <text x="245" y="422" class="uml-text">submit compute chain</text>
+  <rect x="556" y="430" width="8" height="105" class="uml-activation"/>
+
+  <text x="564" y="446" class="uml-text-em">start_input_dist → wait_input_dist → ... → forward</text>
+  <text x="564" y="460" class="uml-text-mute">(serial within thread; nccl tasks acquire tickets 2,3 from _NcclLock)</text>
+  <text x="564" y="476" class="uml-text-em">backward (nccl) — depends_on=("prefetch_embeddings",) [pf only]</text>
+  <line x1="564" y1="482" x2="830" y2="482" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="600" y="475" class="uml-text">wait_stream(prefetch); DDP AllReduce</text>
+  <text x="564" y="510" class="uml-text-em">finalize_model_grads → optimizer.step → watchdog</text>
+
+  <!-- barrier -->
+  <line x1="240" y1="555" x2="80" y2="555" class="uml-msg-return" marker-end="url(#arrSeqRet)"/>
+  <text x="90" y="548" class="uml-text-mute">barrier: future.result() on every chain</text>
+</svg>
+</div><figcaption>
+<span class="en">The <code>par</code> fragment marks parallel execution: io chain and compute chain run concurrently. Within each chain, tasks fire in declaration order. NCCL-tagged tasks acquire tickets from <code>_NcclOrderedLock</code> in declaration order (0, 1, 2, 3 here), guaranteeing deterministic submission order across ranks.</span>
+<span class="zh"><code>par</code> 片段标记并行执行：io 链与 compute 链并发跑。链内任务按声明顺序触发。带 NCCL 标记的任务按声明顺序从 <code>_NcclOrderedLock</code> 取票（这里是 0、1、2、3），从而在所有 rank 上保证确定的提交顺序。</span>
+</figcaption></figure>
+</section>
+
+<section id="seq-nccl">
+<h3><span class="en">6.3 NCCL ticket lock</span><span class="zh">6.3 NCCL 票据锁</span></h3>
+
+<figure><div class="svg-wrap">
+<svg width="780" height="380" viewBox="0 0 780 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="390" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">Sequence: two threads acquiring NCCL tickets</text>
+
+  <g>
+    <rect x="60" y="40" width="120" height="32" class="uml-box-fill" style="fill: #fff8c5;"/>
+    <text x="120" y="60" text-anchor="middle" class="uml-text-em">io thread</text>
+    <rect x="320" y="40" width="120" height="32" class="uml-box-fill"/>
+    <text x="380" y="60" text-anchor="middle" class="uml-text-em">_NcclOrderedLock</text>
+    <rect x="580" y="40" width="120" height="32" class="uml-box-fill" style="fill: #ddf4ff;"/>
+    <text x="640" y="60" text-anchor="middle" class="uml-text-em">compute thread</text>
+  </g>
+
+  <line x1="120" y1="72" x2="120" y2="360" class="uml-lifeline"/>
+  <line x1="380" y1="72" x2="380" y2="360" class="uml-lifeline"/>
+  <line x1="640" y1="72" x2="640" y2="360" class="uml-lifeline"/>
+
+  <!-- io: acquire(0) -->
+  <line x1="120" y1="100" x2="380" y2="100" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="200" y="92" class="uml-text">acquire(0)  [next_ticket=0, immediate]</text>
+  <rect x="116" y="100" width="8" height="50" class="uml-activation"/>
+
+  <!-- compute: acquire(2) blocks -->
+  <line x1="640" y1="130" x2="380" y2="130" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="430" y="123" class="uml-text">acquire(2)  → cond.wait()  [BLOCKS]</text>
+  <rect x="636" y="130" width="8" height="170" class="uml-activation"/>
+
+  <!-- io: release(0) -->
+  <line x1="120" y1="160" x2="380" y2="160" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="200" y="152" class="uml-text">release()  [next_ticket=1, notify_all]</text>
+
+  <!-- io: acquire(1) -->
+  <line x1="120" y1="195" x2="380" y2="195" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="200" y="187" class="uml-text">acquire(1)  [matches, immediate]</text>
+  <rect x="116" y="195" width="8" height="50" class="uml-activation"/>
+
+  <!-- compute is woken but K=2, next=1, still wait -->
+  <text x="450" y="190" class="uml-text-mute" style="fill: #cf222e;">compute woken; sees next=1, K=2; cond.wait() again</text>
+
+  <!-- io: release(1) -->
+  <line x1="120" y1="245" x2="380" y2="245" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="200" y="237" class="uml-text">release()  [next_ticket=2, notify_all]</text>
+
+  <!-- compute woken, matches -->
+  <text x="450" y="270" class="uml-text-em" style="fill: #1a7f37;">compute woken; sees next=2 == K; proceeds</text>
+  <line x1="380" y1="285" x2="640" y2="285" class="uml-msg-return" marker-end="url(#arrSeqRet)"/>
+  <text x="430" y="277" class="uml-text-mute">return from acquire(2)</text>
+
+  <!-- compute: release(2) -->
+  <line x1="640" y1="320" x2="380" y2="320" class="uml-msg-sync" marker-end="url(#arrSeq)"/>
+  <text x="430" y="312" class="uml-text">release()  [next_ticket=3, notify_all]</text>
+</svg>
+</div><figcaption>
+<span class="en">Tickets 0 and 1 are issued to NCCL tasks declared first (on io thread); ticket 2 went to a NCCL task declared later (on compute thread). The lock guarantees ticket 0 → 1 → 2 submission order across ranks even though the threads run concurrently.</span>
+<span class="zh">票据 0 和 1 发给最早声明的 NCCL 任务（在 io 线程）；票据 2 给的是后声明的 NCCL 任务（在 compute 线程）。即使两个线程并发执行，锁仍保证所有 rank 上的提交顺序为 0 → 1 → 2。</span>
+</figcaption></figure>
+
+</section>
+
+<section id="seq-pipeline">
+<h3><span class="en">6.4 Multi-batch overlap (timing diagram)</span><span class="zh">6.4 多批次重叠（时序图）</span></h3>
+
+<figure><div class="svg-wrap">
+<svg width="900" height="280" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">Pipeline timing — non-prefetch HSTU, in_flight=3</text>
+
+  <!-- iter columns -->
+  <g font-family="ui-monospace, monospace" font-size="11" fill="#656d76">
+    <text x="160" y="50" text-anchor="middle">i=0 (prefill)</text>
+    <text x="290" y="50" text-anchor="middle">i=1 (prefill)</text>
+    <text x="420" y="50" text-anchor="middle">i=2 (steady)</text>
+    <text x="550" y="50" text-anchor="middle">i=3 (steady)</text>
+    <text x="680" y="50" text-anchor="middle">i=M (drain)</text>
+    <text x="810" y="50" text-anchor="middle">i=M+1 (drain)</text>
+  </g>
+
+  <!-- row labels -->
+  <g font-family="ui-monospace, monospace" font-size="11" fill="#1f2328">
+    <text x="20" y="92" font-weight="700">offset 2</text>
+    <text x="20" y="106">h2d/shuffle</text>
+    <text x="20" y="142" font-weight="700">offset 1</text>
+    <text x="20" y="156">input_dist</text>
+    <text x="20" y="192" font-weight="700">offset 0</text>
+    <text x="20" y="206">forward+bwd+opt</text>
+  </g>
+
+  <!-- Color batches -->
+  <!-- offset 2 row -->
+  <g>
+    <rect x="105" y="70" width="100" height="40" fill="#dafbe1" stroke="#1a7f37"/>
+    <text x="155" y="93" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 0</text>
+    <rect x="235" y="70" width="100" height="40" fill="#fff8c5" stroke="#d4a72c"/>
+    <text x="285" y="93" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 1</text>
+    <rect x="365" y="70" width="100" height="40" fill="#ddf4ff" stroke="#0969da"/>
+    <text x="415" y="93" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 2</text>
+    <rect x="495" y="70" width="100" height="40" fill="#ffebe9" stroke="#cf222e"/>
+    <text x="545" y="93" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 3</text>
+    <rect x="625" y="70" width="100" height="40" fill="#f6f8fa" stroke="#999" stroke-dasharray="3 3"/>
+    <text x="675" y="93" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="#999">—</text>
+    <rect x="755" y="70" width="100" height="40" fill="#f6f8fa" stroke="#999" stroke-dasharray="3 3"/>
+    <text x="805" y="93" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="#999">—</text>
+  </g>
+
+  <!-- offset 1 row -->
+  <g>
+    <rect x="105" y="120" width="100" height="40" fill="#f6f8fa" stroke="#999" stroke-dasharray="3 3"/>
+    <text x="155" y="143" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="#999">—</text>
+    <rect x="235" y="120" width="100" height="40" fill="#dafbe1" stroke="#1a7f37"/>
+    <text x="285" y="143" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 0</text>
+    <rect x="365" y="120" width="100" height="40" fill="#fff8c5" stroke="#d4a72c"/>
+    <text x="415" y="143" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 1</text>
+    <rect x="495" y="120" width="100" height="40" fill="#ddf4ff" stroke="#0969da"/>
+    <text x="545" y="143" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 2</text>
+    <rect x="625" y="120" width="100" height="40" fill="#ffebe9" stroke="#cf222e"/>
+    <text x="675" y="143" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 3</text>
+    <rect x="755" y="120" width="100" height="40" fill="#f6f8fa" stroke="#999" stroke-dasharray="3 3"/>
+    <text x="805" y="143" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="#999">—</text>
+  </g>
+
+  <!-- offset 0 row -->
+  <g>
+    <rect x="105" y="170" width="100" height="40" fill="#f6f8fa" stroke="#999" stroke-dasharray="3 3"/>
+    <text x="155" y="193" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="#999">—</text>
+    <rect x="235" y="170" width="100" height="40" fill="#f6f8fa" stroke="#999" stroke-dasharray="3 3"/>
+    <text x="285" y="193" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="#999">—</text>
+    <rect x="365" y="170" width="100" height="40" fill="#dafbe1" stroke="#1a7f37"/>
+    <text x="415" y="193" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 0</text>
+    <rect x="495" y="170" width="100" height="40" fill="#fff8c5" stroke="#d4a72c"/>
+    <text x="545" y="193" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 1</text>
+    <rect x="625" y="170" width="100" height="40" fill="#ddf4ff" stroke="#0969da"/>
+    <text x="675" y="193" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 2</text>
+    <rect x="755" y="170" width="100" height="40" fill="#ffebe9" stroke="#cf222e"/>
+    <text x="805" y="193" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11">batch 3</text>
+  </g>
+
+  <!-- result row -->
+  <text x="20" y="247" font-family="ui-monospace, monospace" font-size="11" fill="#1f2328">progress() returns:</text>
+  <text x="155" y="247" text-anchor="middle" class="uml-text-mute">—</text>
+  <text x="285" y="247" text-anchor="middle" class="uml-text-mute">—</text>
+  <text x="415" y="247" text-anchor="middle" class="uml-text-em">batch 0 result</text>
+  <text x="545" y="247" text-anchor="middle" class="uml-text-em">batch 1 result</text>
+  <text x="675" y="247" text-anchor="middle" class="uml-text-em">batch 2 result</text>
+  <text x="805" y="247" text-anchor="middle" class="uml-text-em">batch 3 result</text>
+
+  <text x="450" y="270" text-anchor="middle" class="uml-text-mute">prefill absorbs 2 iters; 4 batches in flight at iter ≥ 2 if M is large</text>
+</svg>
+</div><figcaption>
+<span class="en">Each column is one <code>progress()</code>-internal iteration. Rows show what runs at each batch_offset. After 2 prefill iters, 3 batches are in flight simultaneously (different stages on different streams via the io/compute split). The <code>progress()</code> return tracks offset 0's <code>step_result</code>.</span>
+<span class="zh">每列是一次 <code>progress()</code> 内部迭代。各行表示在不同 batch_offset 上跑的内容。经过 2 轮预热后，3 个 batch 同时在飞（io/compute 拆分让不同阶段落在不同流上）。<code>progress()</code> 的返回值对应 offset 0 的 <code>step_result</code>。</span>
+</figcaption></figure>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="class-ref">
+<h2><span class="en">7. Class &amp; method reference</span><span class="zh">7. 类与方法参考</span></h2>
+
+<section id="cls-engine">
+<h3><span class="en">7.1 Engine classes</span><span class="zh">7.1 引擎类</span></h3>
+
+<figure><div class="svg-wrap">
+<svg width="900" height="510" viewBox="0 0 900 510" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="22" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700">Class diagram: engine core</text>
+
+  <!-- SchedulablePipeline -->
+  <g>
+    <rect x="40" y="40" width="240" height="180" class="uml-box-fill"/>
+    <line x1="40" y1="68" x2="280" y2="68" stroke="#1f2328"/>
+    <line x1="40" y1="118" x2="280" y2="118" stroke="#1f2328"/>
+    <text x="160" y="60" text-anchor="middle" class="uml-text-em">SchedulablePipeline</text>
+    <text x="50" y="84" class="uml-text">- _schedule: Schedule</text>
+    <text x="50" y="98" class="uml-text">- _stream_pool: StreamPool</text>
+    <text x="50" y="112" class="uml-text">- _executor, _ring, _ctx</text>
+    <text x="50" y="134" class="uml-text">+ progress(iter) → object</text>
+    <text x="50" y="148" class="uml-text">+ step(batch) → object</text>
+    <text x="50" y="162" class="uml-text">+ shutdown()</text>
+    <text x="50" y="176" class="uml-text">+ basic(model, opt, ...)</text>
+    <text x="50" y="194" class="uml-text-mute">- _seed_first_batch(slot_contents)</text>
+    <text x="50" y="208" class="uml-text-mute">- _run_one_internal_iter(iter)</text>
+  </g>
+
+  <!-- Schedule + Stage -->
+  <g>
+    <rect x="320" y="40" width="200" height="100" class="uml-box-fill"/>
+    <line x1="320" y1="68" x2="520" y2="68" stroke="#1f2328"/>
+    <line x1="320" y1="98" x2="520" y2="98" stroke="#1f2328"/>
+    <text x="420" y="60" text-anchor="middle" class="uml-text-em">Schedule</text>
+    <text x="330" y="84" class="uml-text">+ stages: Tuple[Stage, ...]</text>
+    <text x="330" y="116" class="uml-text">+ stream_slots: Tuple[str, ...]</text>
+    <text x="330" y="130" class="uml-text">+ in_flight_batches @property</text>
+  </g>
+  <g>
+    <rect x="560" y="40" width="180" height="100" class="uml-box-fill"/>
+    <line x1="560" y1="68" x2="740" y2="68" stroke="#1f2328"/>
+    <text x="650" y="60" text-anchor="middle" class="uml-text-em">Stage</text>
+    <text x="570" y="84" class="uml-text">+ tasks: Tuple[Task, ...]</text>
+  </g>
+
+  <!-- Task + DataSlot -->
+  <g>
+    <rect x="320" y="160" width="200" height="200" class="uml-box-fill"/>
+    <line x1="320" y1="188" x2="520" y2="188" stroke="#1f2328"/>
+    <line x1="320" y1="290" x2="520" y2="290" stroke="#1f2328"/>
+    <text x="420" y="180" text-anchor="middle" class="uml-text-em">Task</text>
+    <text x="330" y="204" class="uml-text">+ name: str</text>
+    <text x="330" y="218" class="uml-text">+ stream: str</text>
+    <text x="330" y="232" class="uml-text">+ batch_offset: int</text>
+    <text x="330" y="246" class="uml-text">+ reads, writes: Tuple[DataSlot]</text>
+    <text x="330" y="260" class="uml-text">+ depends_on: Tuple[str]</text>
+    <text x="330" y="274" class="uml-text">+ nccl: bool</text>
+    <text x="330" y="306" class="uml-text">+ run(ctx) → None</text>
+    <text x="330" y="320" class="uml-text">+ init(ctx) → None</text>
+    <text x="330" y="334" class="uml-text">+ from_fn(name, fn, ...)</text>
+  </g>
+  <g>
+    <rect x="560" y="160" width="180" height="80" class="uml-box-fill"/>
+    <line x1="560" y1="188" x2="740" y2="188" stroke="#1f2328"/>
+    <text x="650" y="180" text-anchor="middle" class="uml-text-em">DataSlot</text>
+    <text x="570" y="204" class="uml-text">+ name: str</text>
+    <text x="570" y="218" class="uml-text">+ batch_offset: int</text>
+  </g>
+
+  <!-- BatchRing + TaskContext -->
+  <g>
+    <rect x="40" y="240" width="240" height="100" class="uml-box-fill"/>
+    <line x1="40" y1="268" x2="280" y2="268" stroke="#1f2328"/>
+    <line x1="40" y1="298" x2="280" y2="298" stroke="#1f2328"/>
+    <text x="160" y="260" text-anchor="middle" class="uml-text-em">BatchRing</text>
+    <text x="50" y="284" class="uml-text">- _slots: List[SlotStore]</text>
+    <text x="50" y="316" class="uml-text">+ at(offset) → SlotStore</text>
+    <text x="50" y="330" class="uml-text">+ advance() → None</text>
+  </g>
+
+  <g>
+    <rect x="40" y="360" width="240" height="120" class="uml-box-fill"/>
+    <line x1="40" y1="388" x2="280" y2="388" stroke="#1f2328"/>
+    <line x1="40" y1="418" x2="280" y2="418" stroke="#1f2328"/>
+    <text x="160" y="380" text-anchor="middle" class="uml-text-em">TaskContext</text>
+    <text x="50" y="404" class="uml-text">- _ring, _stream_pool</text>
+    <text x="50" y="436" class="uml-text">+ slots @property → SlotStore</text>
+    <text x="50" y="450" class="uml-text">+ stream_pool @property</text>
+    <text x="50" y="464" class="uml-text">+ iter_count: int  [thread-local]</text>
+    <text x="50" y="478" class="uml-text-mute">- _active_offset  [thread-local]</text>
+  </g>
+
+  <!-- StreamPool -->
+  <g>
+    <rect x="320" y="380" width="200" height="100" class="uml-box-fill"/>
+    <line x1="320" y1="408" x2="520" y2="408" stroke="#1f2328"/>
+    <line x1="320" y1="438" x2="520" y2="438" stroke="#1f2328"/>
+    <text x="420" y="400" text-anchor="middle" class="uml-text-em">StreamPool</text>
+    <text x="330" y="424" class="uml-text">- _streams: Dict[str, Stream]</text>
+    <text x="330" y="456" class="uml-text">+ get(name) → Stream</text>
+    <text x="330" y="470" class="uml-text">+ use(name) ctx-mgr</text>
+  </g>
+
+  <!-- Relationships -->
+  <line x1="280" y1="80" x2="320" y2="80" class="uml-msg-sync"/>
+  <text x="285" y="74" class="uml-text-mute">1</text>
+  <text x="305" y="74" class="uml-text-mute">1</text>
+  <line x1="520" y1="80" x2="560" y2="80" class="uml-msg-sync"/>
+  <text x="525" y="74" class="uml-text-mute">1</text>
+  <text x="550" y="74" class="uml-text-mute">*</text>
+  <line x1="650" y1="140" x2="650" y2="160" class="uml-msg-sync"/>
+  <text x="660" y="155" class="uml-text-mute">tasks *</text>
+  <line x1="280" y1="290" x2="320" y2="290" class="uml-msg-sync"/>
+  <text x="285" y="284" class="uml-text-mute">_ring</text>
+  <line x1="280" y1="420" x2="320" y2="420" class="uml-msg-sync"/>
+  <text x="285" y="414" class="uml-text-mute">stream_pool</text>
+  <line x1="160" y1="220" x2="160" y2="240" class="uml-msg-sync"/>
+  <text x="165" y="234" class="uml-text-mute">_ring</text>
+</svg>
+</div><figcaption>
+<span class="en">Public + private (italicized in <code>uml-text-mute</code>) members. <code>SchedulablePipeline</code> aggregates a <code>Schedule</code>, <code>StreamPool</code>, and <code>Executor</code>; the <code>BatchRing</code> + <code>TaskContext</code> are constructed internally.</span>
+<span class="zh">公开成员 + 私有成员（<code>uml-text-mute</code> 斜体）。<code>SchedulablePipeline</code> 聚合 <code>Schedule</code>、<code>StreamPool</code>、<code>Executor</code>；<code>BatchRing</code> + <code>TaskContext</code> 由内部构造。</span>
+</figcaption></figure>
+</section>
+
+<section id="cls-exec">
+<h3><span class="en">7.2 Executor classes</span><span class="zh">7.2 执行器类</span></h3>
+<table>
+<thead><tr>
+  <th><span class="en">Class / function</span><span class="zh">类 / 函数</span></th>
+  <th><span class="en">Member</span><span class="zh">成员</span></th>
+  <th><span class="en">Description</span><span class="zh">说明</span></th>
+</tr></thead>
+<tbody>
+<tr><td rowspan="2"><code>SequentialExecutor</code></td><td><code>execute_stage(stage, ctx, iter_count, mask, cross_stream_waits, pool)</code></td><td><span class="en">Iterate over stage.tasks in order, run each under <code>pool.use(stream)</code>.</span><span class="zh">按顺序遍历 stage.tasks，每个任务在 <code>pool.use(stream)</code> 上下文里执行。</span></td></tr>
+<tr><td><code>shutdown()</code></td><td><span class="en">No-op.</span><span class="zh">空操作。</span></td></tr>
+<tr><td rowspan="3"><code>ThreadedExecutor</code></td><td><code>__init__(thread_map=None, max_workers=None)</code></td><td><span class="en">Lazy <code>ThreadPoolExecutor</code>; resizes on stage demand.</span><span class="zh">懒构造 <code>ThreadPoolExecutor</code>；按 stage 需要扩容。</span></td></tr>
+<tr><td><code>execute_stage(...)</code></td><td><span class="en">Partition active by thread_id, build cpu_deps, submit chains, barrier.</span><span class="zh">按 thread_id 切分活跃任务，构造 cpu_deps，提交各链，最后做屏障。</span></td></tr>
+<tr><td><code>shutdown()</code></td><td><span class="en">Joins worker threads.</span><span class="zh">合并 worker 线程。</span></td></tr>
+<tr><td rowspan="4"><code>_NcclOrderedLock</code></td><td><code>acquire(ticket)</code></td><td><span class="en">Block until <code>next_ticket == ticket</code> or raise on <code>_failed</code>.</span><span class="zh">阻塞至 <code>next_ticket == ticket</code>，或在 <code>_failed</code> 时抛错。</span></td></tr>
+<tr><td><code>release(failed=False)</code></td><td><span class="en">Increment <code>next_ticket</code>; if <code>failed</code>, set <code>_failed</code>.</span><span class="zh">递增 <code>next_ticket</code>；若 <code>failed</code>，置位 <code>_failed</code>。</span></td></tr>
+<tr><td><code>abort()</code></td><td><span class="en">Force-set <code>_failed</code> + notify_all. Wakes blocked waiters.</span><span class="zh">强制置 <code>_failed</code> + notify_all，唤醒所有等待者。</span></td></tr>
+<tr><td><code>reset()</code></td><td><span class="en">Reset both fields. Called per stage.</span><span class="zh">重置两个字段，每个 stage 调用一次。</span></td></tr>
+<tr><td><code>_resolve_thread_id(task, thread_map)</code></td><td><span class="en">helper</span><span class="zh">辅助函数</span></td><td><span class="en">Maps a task to its thread id given any thread_map spec.</span><span class="zh">在任意 thread_map 规约下把任务映射到 thread id。</span></td></tr>
+<tr><td><code>_compute_cpu_deps(active, thread_id_of, completion)</code></td><td><span class="en">helper</span><span class="zh">辅助函数</span></td><td><span class="en">Build cross-thread <code>{name → [Event]}</code>.</span><span class="zh">构造跨线程的 <code>{name → [Event]}</code>。</span></td></tr>
+<tr><td><code>_apply_cross_stream_waits(task, waits, pool)</code></td><td><span class="en">helper</span><span class="zh">辅助函数</span></td><td><span class="en">GPU-side <code>wait_stream</code> emission.</span><span class="zh">发出 GPU 端的 <code>wait_stream</code>。</span></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="cls-hstu">
+<h3><span class="en">7.3 HSTU classes</span><span class="zh">7.3 HSTU 类</span></h3>
+
+<table>
+<thead><tr>
+  <th><span class="en">Class</span><span class="zh">类</span></th>
+  <th><span class="en">Member</span><span class="zh">成员</span></th>
+  <th><span class="en">Visibility</span><span class="zh">可见性</span></th>
+  <th><span class="en">Purpose</span><span class="zh">用途</span></th>
+</tr></thead>
+<tbody>
+<tr><td rowspan="6"><code>HSTUPipeline</code></td><td><code>__init__(model, optimizer, device, *, prefetch=False, prefetch_depth=1, batch_shuffler=None, threaded=True, thread_map=None, ...)</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Construct the adapter; pipeline lazily built on first <code>progress()</code>.</span><span class="zh">构造适配器；流水线在首次 <code>progress()</code> 时懒构建。</span></td></tr>
+<tr><td><code>progress(dataloader_iter) → (loss, tokens, output)</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Drive one full iter; matches legacy return signature.</span><span class="zh">驱动一次完整迭代；返回签名与遗留实现一致。</span></td></tr>
+<tr><td><code>attach(model=None)</code> / <code>detach() → Module</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Pause/resume hooks (matches legacy).</span><span class="zh">暂停/恢复钩子（与遗留一致）。</span></td></tr>
+<tr><td><code>shutdown()</code> + context-manager</td><td><span class="badge badge-pub">public</span></td><td><span class="en">Tear down executor + threads.</span><span class="zh">拆解执行器与线程。</span></td></tr>
+<tr><td><code>_build_schedule()</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">Assemble Schedule + StreamPool from variant flags.</span><span class="zh">根据变体参数装配 Schedule + StreamPool。</span></td></tr>
+<tr><td><code>_rewrite_model(peek, dist, default, memcpy=None)</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">Bootstrap torchrec FX trace + monkey-patches.</span><span class="zh">引导 torchrec FX 追踪与 monkey-patch。</span></td></tr>
+<tr><td rowspan="3"><code>HSTUPipelineFactory</code></td><td><code>register(name, factory)</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Register a custom variant.</span><span class="zh">注册自定义变体。</span></td></tr>
+<tr><td><code>create(name, **kwargs) → HSTUPipeline</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Look up + instantiate.</span><span class="zh">查找并实例化。</span></td></tr>
+<tr><td><code>list() → List[str]</code></td><td><span class="badge badge-pub">public</span></td><td><span class="en">Enumerate registered names.</span><span class="zh">列出已注册名称。</span></td></tr>
+<tr><td colspan="4"><strong><span class="en">Pre-registered variants</span><span class="zh">预注册变体</span></strong>: <code>"hstu_sparse_dist"</code> (native), <code>"hstu_prefetch_sparse_dist"</code> (prefetch).</td></tr>
+<tr><td rowspan="3"><code>PipelineState</code></td><td><code>model, optimizer, device, batch_shuffler</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">Captured at construction.</span><span class="zh">构造时捕获。</span></td></tr>
+<tr><td><code>pipelined_modules, pipelined_postprocs</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">Populated by <code>_rewrite_model</code>.</span><span class="zh">由 <code>_rewrite_model</code> 填充。</span></td></tr>
+<tr><td><code>create_torchrec_ctx() → TrainPipelineContext</code></td><td><span class="badge badge-int">internal</span></td><td><span class="en">v1 only — asserts <code>ctx.version == 1</code>.</span><span class="zh">仅 v1 —— 断言 <code>ctx.version == 1</code>。</span></td></tr>
+</tbody>
+</table>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="user-api">
+<h2><span class="en">8. User-facing API examples</span><span class="zh">8. 用户接口与示例</span></h2>
+
+<section id="user-t1">
+<h3><span class="en">8.1 T1: vanilla preset (≤ 8-line diff)</span><span class="zh">8.1 T1：基础预设（≤ 8 行 diff）</span></h3>
+<pre><span class="kw">from</span> commons.pipeline.engine <span class="kw">import</span> SchedulablePipeline
+
+<span class="cm"># Before — manual loop:</span>
+<span class="cm"># for batch in loader:</span>
+<span class="cm">#     opt.zero_grad()</span>
+<span class="cm">#     loss = model(batch).sum()</span>
+<span class="cm">#     loss.backward()</span>
+<span class="cm">#     opt.step()</span>
+
+<span class="cm"># After — preset:</span>
+pipe = <span class="ty">SchedulablePipeline</span>.basic(model, optimizer, loss_fn=<span class="kw">lambda</span> out: out.sum())
+<span class="kw">for</span> batch <span class="kw">in</span> loader:
+    pipe.step(batch)</pre>
+</section>
+
+<section id="user-t2">
+<h3><span class="en">8.2 T2: with prefetch + memcpy stream</span><span class="zh">8.2 T2：带 prefetch + memcpy 流</span></h3>
+<pre>pipe = <span class="ty">SchedulablePipeline</span>.basic(
+    model, optimizer,
+    loss_fn=<span class="kw">lambda</span> out: out.sum(),
+    prefetch=<span class="kw">True</span>,
+    memcpy_stream=<span class="kw">True</span>,
+)
+<span class="cm"># Drive with cpu-resident batches; engine moves them to GPU on memcpy stream</span>
+<span class="kw">for</span> cpu_batch <span class="kw">in</span> cpu_loader:
+    pipe.step(cpu_batch)</pre>
+</section>
+
+<section id="user-hstu">
+<h3><span class="en">8.3 HSTU usage</span><span class="zh">8.3 HSTU 使用</span></h3>
+<pre><span class="kw">from</span> commons.pipeline.hstu_pipeline <span class="kw">import</span> HSTUPipelineFactory
+
+pipe = <span class="ty">HSTUPipelineFactory</span>.create(
+    <span class="st">"hstu_prefetch_sparse_dist"</span>,
+    model=model_train,
+    optimizer=dense_optimizer,
+    device=torch.device(<span class="st">"cuda"</span>),
+    batch_shuffler=batch_shuffler,
+)
+
+<span class="cm"># Create the iterator ONCE outside the loop. SPEC_p4 v2's</span>
+<span class="cm"># iterator-identity reset means a fresh `iter(dataloader)` per</span>
+<span class="cm"># step would restart the engine each time and discard in-flight</span>
+<span class="cm"># batches.</span>
+dataloader_iter = <span class="kw">iter</span>(dataloader)
+<span class="kw">for</span> _ <span class="kw">in</span> range(max_train_iters):
+    <span class="kw">try</span>:
+        loss, tokens, output = pipe.progress(dataloader_iter)
+    <span class="kw">except</span> <span class="ty">StopIteration</span>:
+        <span class="kw">break</span>
+pipe.shutdown()</pre>
+<p>
+<span class="en">Matches legacy's return signature; use case is drop-in replacement of <code>JaggedMegatronTrainPipelineSparseDist</code> / <code>JaggedMegatronPrefetchTrainPipelineSparseDist</code>.</span>
+<span class="zh">返回签名与遗留一致；可作为 <code>JaggedMegatronTrainPipelineSparseDist</code> / <code>JaggedMegatronPrefetchTrainPipelineSparseDist</code> 的直接替换。</span>
+</p>
+</section>
+
+<section id="user-thread">
+<h3><span class="en">8.4 Custom thread_map</span><span class="zh">8.4 自定义 thread_map</span></h3>
+<pre><span class="cm"># by_stream (default for non-HSTU SchedulablePipeline.basic)</span>
+pipe = <span class="ty">SchedulablePipeline</span>.basic(model, opt, threaded=<span class="kw">True</span>, thread_map=<span class="st">"by_stream"</span>)
+
+<span class="cm"># per_task — every task its own thread</span>
+pipe = <span class="ty">SchedulablePipeline</span>.basic(model, opt, threaded=<span class="kw">True</span>, thread_map=<span class="st">"per_task"</span>)
+
+<span class="cm"># Explicit dict</span>
+pipe = <span class="ty">SchedulablePipeline</span>.basic(
+    model, opt,
+    threaded=<span class="kw">True</span>,
+    thread_map={
+        <span class="st">"h2d"</span>: <span class="st">"io"</span>,
+        <span class="st">"forward"</span>: <span class="st">"compute"</span>,
+        <span class="st">"backward"</span>: <span class="st">"compute"</span>,
+        <span class="st">"optimizer_step"</span>: <span class="st">"compute"</span>,
+    },
+)
+
+<span class="cm"># Callable</span>
+pipe = <span class="ty">SchedulablePipeline</span>.basic(
+    model, opt,
+    threaded=<span class="kw">True</span>,
+    thread_map=<span class="kw">lambda</span> task: <span class="st">"io"</span> <span class="kw">if</span> task.stream == <span class="st">"memcpy"</span> <span class="kw">else</span> <span class="st">"compute"</span>,
+)</pre>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="internal-api">
+<h2><span class="en">9. Internal API examples</span><span class="zh">9. 内部接口与示例</span></h2>
+
+<section id="int-task">
+<h3><span class="en">9.1 Custom Task subclass</span><span class="zh">9.1 自定义 Task 子类</span></h3>
+<pre><span class="kw">from</span> commons.pipeline.engine <span class="kw">import</span> Task, DataSlot
+
+<span class="kw">class</span> <span class="ty">CountTokensTask</span>(<span class="ty">Task</span>):
+    name = <span class="st">"count_tokens"</span>
+    stream = <span class="st">"default"</span>
+    batch_offset = 0
+    reads = (<span class="ty">DataSlot</span>(<span class="st">"batch_gpu"</span>, 0),)
+    writes = (<span class="ty">DataSlot</span>(<span class="st">"token_count"</span>, 0),)
+
+    <span class="kw">def</span> run(<span class="kw">self</span>, ctx):
+        batch = ctx.slots[<span class="st">"batch_gpu"</span>]
+        ctx.slots.set(<span class="st">"token_count"</span>, batch.numel())</pre>
+</section>
+
+<section id="int-schedule">
+<h3><span class="en">9.2 Hand-built Schedule</span><span class="zh">9.2 手工搭建 Schedule</span></h3>
+<pre><span class="kw">from</span> commons.pipeline.engine <span class="kw">import</span> (
+    Schedule, Stage, StreamPool, Task, DataSlot, SchedulablePipeline,
+)
+
+<span class="cm"># Two tasks: producer on memcpy stream, consumer on default</span>
+producer = <span class="ty">Task</span>.from_fn(
+    <span class="st">"producer"</span>,
+    <span class="kw">lambda</span> ctx: ctx.slots.set(<span class="st">"x"</span>, torch.randn(8, device=<span class="st">"cuda"</span>)),
+    stream=<span class="st">"memcpy"</span>,
+    writes=(<span class="ty">DataSlot</span>(<span class="st">"x"</span>, 0),),
+)
+consumer = <span class="ty">Task</span>.from_fn(
+    <span class="st">"consumer"</span>,
+    <span class="kw">lambda</span> ctx: ctx.slots.set(<span class="st">"step_result"</span>, ctx.slots[<span class="st">"x"</span>].sum()),
+    stream=<span class="st">"default"</span>,
+    reads=(<span class="ty">DataSlot</span>(<span class="st">"x"</span>, 0),),
+    writes=(<span class="ty">DataSlot</span>(<span class="st">"step_result"</span>, 0),),
+)
+
+schedule = <span class="ty">Schedule</span>(
+    stages=(<span class="ty">Stage</span>(tasks=(producer, consumer)),),
+    stream_slots=(<span class="st">"default"</span>, <span class="st">"memcpy"</span>),
+)
+pool = <span class="ty">StreamPool</span>({
+    <span class="st">"default"</span>: torch.cuda.default_stream(),
+    <span class="st">"memcpy"</span>: torch.cuda.<span class="ty">Stream</span>(priority=-1),
+})
+pipe = <span class="ty">SchedulablePipeline</span>(schedule, pool, executor=<span class="st">"threaded"</span>)
+result = pipe.step(<span class="kw">None</span>)  <span class="cm"># engine fills batch_cpu but our tasks don't use it</span></pre>
+</section>
+
+<section id="int-executor">
+<h3><span class="en">9.3 Plug in a custom Executor</span><span class="zh">9.3 接入自定义 Executor</span></h3>
+<pre><span class="cm"># An executor must implement: execute_stage(...) and shutdown().</span>
+<span class="kw">class</span> <span class="ty">VerboseExecutor</span>:
+    <span class="kw">def</span> __init__(<span class="kw">self</span>, inner):
+        <span class="kw">self</span>._inner = inner
+
+    <span class="kw">def</span> execute_stage(<span class="kw">self</span>, stage, ctx, iter_count, should_run, waits, pool):
+        <span class="kw">for</span> task <span class="kw">in</span> stage.tasks:
+            <span class="kw">if</span> should_run(task):
+                <span class="kw">print</span>(<span class="st">f"[iter {iter_count}] running {task.name}"</span>)
+        <span class="kw">return</span> <span class="kw">self</span>._inner.execute_stage(stage, ctx, iter_count, should_run, waits, pool)
+
+    <span class="kw">def</span> shutdown(<span class="kw">self</span>):
+        <span class="kw">self</span>._inner.shutdown()
+
+<span class="cm"># Use:</span>
+<span class="kw">from</span> commons.pipeline.engine <span class="kw">import</span> SequentialExecutor
+pipe = <span class="ty">SchedulablePipeline</span>(schedule, pool, executor=<span class="ty">VerboseExecutor</span>(<span class="ty">SequentialExecutor</span>()))</pre>
+</section>
+</section>
+
+<!-- =========================================================== -->
+<section id="limits">
+<h2><span class="en">10. Limitations &amp; followups</span><span class="zh">10. 限制与后续工作</span></h2>
+
+<p>
+<span class="en">Tracked in <code>tasks/followups.md</code>. The non-resolved items relevant to current users:</span>
+<span class="zh">完整列表在 <code>tasks/followups.md</code>。与当前用户相关的未解决项：</span>
+</p>
+
+<table>
+<thead><tr>
+  <th><span class="en">Item</span><span class="zh">条目</span></th>
+  <th><span class="en">Status</span><span class="zh">状态</span></th>
+  <th><span class="en">Trigger to resume</span><span class="zh">恢复触发条件</span></th>
+</tr></thead>
+<tbody>
+<tr><td><span class="en">Engine offset-aware cross-stream sync (<code>wait_event</code> instead of <code>wait_stream</code>)</span><span class="zh">引擎层 offset 感知的跨流同步（用 <code>wait_event</code> 代替 <code>wait_stream</code>）</span></td><td><span class="en">SPEC drafted (<code>SPEC_p3.md</code>)</span><span class="zh">SPEC 已草拟（<code>SPEC_p3.md</code>）</span></td><td><span class="en">Perf profile shows io ↔ compute overlap collapse under non-identity shuffler</span><span class="zh">非 identity shuffler 下性能 profile 显示 io ↔ compute 重叠崩溃</span></td></tr>
+<tr><td><span class="en">Adam optimizer parity</span><span class="zh">Adam 优化器 parity</span></td><td><span class="en">xfail — torchrec checkpoint Adam-state limitation</span><span class="zh">xfail —— torchrec checkpoint 的 Adam state 限制</span></td><td><span class="en">Upstream torchrec fix lands</span><span class="zh">上游 torchrec 修复合入</span></td></tr>
+<tr><td><span class="en">Real multi-rank NCCL ordering test</span><span class="zh">真正的多 rank NCCL 顺序测试</span></td><td><span class="en">only Python-call-order tested in unit suite</span><span class="zh">单元测试只覆盖了 Python 调用顺序</span></td><td><span class="en">Add multi-process NCCL fixture; partly covered by 4-GPU parity tests on real workloads</span><span class="zh">补充多进程 NCCL fixture；4-GPU parity 测试已部分覆盖</span></td></tr>
+<tr><td><span class="en">Non-Megatron DDP support in HSTU adapter</span><span class="zh">HSTU 适配层支持非 Megatron DDP</span></td><td><span class="en"><code>finalize_model_grads</code> + <code>zero_grad_buffer</code> hardcoded</span><span class="zh"><code>finalize_model_grads</code> + <code>zero_grad_buffer</code> 写死</span></td><td><span class="en">Generic DDP user wants to adopt</span><span class="zh">有通用 DDP 用户想接入</span></td></tr>
+<tr><td><span class="en">Semantic B (autonomous data pipeline)</span><span class="zh">Semantic B（自治的数据流水线）</span></td><td><span class="en">Engine has Semantic A only (<code>prefetch_depth</code>)</span><span class="zh">引擎目前只有 Semantic A（<code>prefetch_depth</code>）</span></td><td><span class="en">Workload with high input_dist latency variance</span><span class="zh">有 input_dist 延迟方差较大的负载</span></td></tr>
+</tbody>
+</table>
+
+<div class="note">
+  <strong><span class="en">Test baseline</span><span class="zh">测试基线</span></strong>
+  <span class="en">(commit <code>338f0c46</code>, 4-GPU on <code>ipp1-2028</code>): 25 passed, 16 xfailed (all adam), 0 failed. Anti-flake mode: 2 consecutive runs, 50-step long-run drift check, ≥2-thread utilization probe, NCCL deadlock regression guard.</span>
+  <span class="zh">（提交 <code>338f0c46</code>，<code>ipp1-2028</code> 上 4-GPU）：25 passed、16 xfailed（全部为 adam）、0 failed。抗抖动模式：连跑 2 次、50 步长程漂移检查、≥2 线程利用率探针、NCCL 死锁回归守卫。</span>
+</div>
+
+</section>
+
+<hr>
+<p class="meta">
+<span class="en">Document generated to summarize the schedulable-pipeline rework on branch <code>junzhang/rework-mtms</code>. Source: <code>SPEC.md</code>, <code>SPEC_p2.md</code>, <code>SPEC_p3.md</code>, <code>tasks/followups.md</code>. SVG diagrams hand-authored to UML 2.5 conventions (lifelines + activations + sync/async/return arrows for sequence; class boxes with stereotype-free attribute/operation compartments for class diagrams).</span>
+<span class="zh">本文档总结分支 <code>junzhang/rework-mtms</code> 上的可调度流水线重写。来源：<code>SPEC.md</code>、<code>SPEC_p2.md</code>、<code>SPEC_p3.md</code>、<code>tasks/followups.md</code>。SVG 图形按照 UML 2.5 规范手工绘制（时序图：lifeline + activation + 同步/异步/返回箭头；类图：无 stereotype 的属性/操作分栏）。</span>
+</p>
+</main>
+</div>
+
+<script>
+  // Bilingual toggle: persist choice in localStorage; default = English.
+  (function () {
+    var KEY = "pipelineDocLang";
+    function applyLang(lang) {
+      if (lang !== "en" && lang !== "zh") lang = "en";
+      document.documentElement.setAttribute("data-lang", lang);
+      document.documentElement.setAttribute("lang", lang === "zh" ? "zh" : "en");
+      try { localStorage.setItem(KEY, lang); } catch (e) {}
+    }
+    window.setLang = applyLang;
+    var saved = null;
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (!saved) {
+      var n = (navigator.language || "en").toLowerCase();
+      saved = n.indexOf("zh") === 0 ? "zh" : "en";
+    }
+    applyLang(saved);
+  })();
+</script>
+</body>
+</html>

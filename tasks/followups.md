@@ -32,13 +32,27 @@ deferred, and a concrete next-step trigger.
 
 ## From Problem #3 (multi-threaded executor)
 
-### Real CUDA / NCCL ordering test
-- **Why deferred**: codex-rescue round flagged that the NCCL ordering
-  test (`test_threaded_executor_nccl_ordering`) only checks Python
-  call order, not actual GPU collective launch order. A true test
-  needs multi-process + real NCCL collectives.
-- **Trigger to resume**: when HSTU pipeline (Problem #2) lands and we
-  can hook into a multi-rank test fixture.
+### Real CUDA / NCCL ordering test — RESOLVED (via 8-GPU e2e
+- **Status**: Trigger satisfied 2026-04-26. The
+  ``examples/hstu/training/pretrain_gr_ranking.py`` 8-GPU benchmark
+  (synthetic 8-layer 1024-hidden, prefetch + cutlass) runs
+  HSTUPipeline (threaded=True with HSTU_DEFAULT_THREAD_MAP) end-to-
+  end through 1000 iterations across 8 ranks. Every NCCL collective
+  the schedule declares — shuffle AllGather (when non-identity),
+  input_dist all-to-all, global_tokens AllReduce, backward DDP grad
+  reduce, finalize_model_grads TP AllReduce — must all submit in the
+  same order across ranks for the run to make forward progress; a
+  ranking-order mismatch would either deadlock NCCL or produce
+  divergent loss across ranks.
+- **Verification**: legacy 568.24 / new 565.76 TFLOPS (within 0.4%);
+  loss curves monotonically decrease over 1000 iters; nsys shows
+  3240 NCCL kernels with 81.8% overlap on compute. See
+  ``tasks/nsys_runs/RESULTS.md``.
+- **Note**: A focused 2-rank pytest fixture was attempted but the
+  multi-rank checkpoint sync + DDP warmup added enough scope that the
+  e2e benchmark was a better signal-to-cost trade. If a tighter
+  pytest-level test is later wanted, model it on
+  ``test_collective.py`` (which already runs multi-rank).
 
 ### NVTX integration — RESOLVED
 - **Status**: Fixed in f77111e5 (2026-04-26).
@@ -216,32 +230,28 @@ deferred, and a concrete next-step trigger.
 - **Verification**: engine 183/2/0; HSTU parity 24/8/0 unchanged.
   io/compute overlap improvement is workload-dependent — current
   HSTU tests use identity shuffler, so wall-clock parity does not
-  exercise the perf delta. Re-profile under non-identity shuffler
-  if quantification needed (`tasks/SPEC_p4_micro_repro.py` is a
-  starter scaffold).
+  exercise the perf delta. Real-workload perf delta will be measured
+  via 8-GPU pretrain ranking benchmark + nsys profile (no micro
+  repro needed).
 
 ### HSTU: torchrec_ctx mutation chain not modeled as DAG edges — RESOLVED
-- **Status**: Fixed in dc8e3ea4 (2026-04-26) on top of the
-  earlier runtime-validator partial fix from 2026-04-24. Originally
-  Codex C-LOW.
-- **Resolution**: ``prefetch_embeddings`` now declares
-  ``writes=("module_input_post_prefetch",
-  "module_contexts_post_prefetch")`` as pseudo-slots — the task body
-  still mutates ``torchrec_ctx`` in place, but the slot names give
-  the engine a dependency identifier. ``forward`` (in the prefetch
-  variant) declares the matching reads. ``deps.
-  infer_cross_stream_event_deps`` now sees the
-  ``prefetch_embeddings → forward`` cross-iter data edge and emits
-  ``wait_event(prefetch_embeddings_event_at_offset_0)`` before
-  forward, with stream-level fallback on iteration 1 when the ring
-  slot has no event yet. SPEC_p4 v2 §8 documents the pseudo-slot
-  mutation-chain syntax decision. The runtime
+- **Status**: Fixed across dc8e3ea4 → 9a2c7a12 → 08542668 (2026-04-26)
+  on top of earlier runtime-validator partial fix from 2026-04-24.
+  Originally Codex C-LOW.
+- **Resolution**: HSTU prefetch variant now declares
+  ``forward.depends_on=("prefetch_embeddings",)`` as a bare-name
+  edge. The engine auto-infers within-iter vs cross-iter from the
+  lookahead diff: producer's ``lookahead > consumer's lookahead``
+  triggers a cross-iter wait at consumer's lookahead. Earlier
+  iterations of the design used a pseudo-slot leaking
+  HSTU-internal field names; the bare-name form keeps the user
+  surface clean. The runtime
   ``_validate_set_context_colocation`` validator is preserved as
-  belt-and-suspenders.
+  belt-and-suspenders. SPEC_p4 v2 §8 documents the bare-name
+  mutation-chain decision.
 - **Verification**: HSTU parity 24/8/0; first-iter forward →
   prefetch race is now structurally covered by the explicit DAG
-  edge instead of the cross-iter chain via
-  ``backward.depends_on=prefetch_embeddings``.
+  edge.
 
 ### HSTU threaded parity test: stress-mode missing — RESOLVED
 - **Status**: Codex E-LOW. Fixed 2026-04-24.
