@@ -383,12 +383,31 @@ class HSTUPipeline:
         #
         # 6 in-flight batches; prefetch.la − forward.la is unchanged (=1)
         # so dynamicemb prefetch cache outstanding keys budget is intact.
-        h2d_lookahead = 5
-        start_shuffle_lookahead = 4
-        finish_shuffle_lookahead = 3
-        start_input_dist_lookahead = 3
-        wait_input_dist_lookahead = 2
-        prefetch_lookahead = 1 if self._prefetch else None
+        # HSTU_LA_DEPTH={3,6} env var selects pipeline depth = max(la)+1.
+        #   depth=6 (default) = 6-la cascade as commented above (5/4/3/3/2/1)
+        #   depth=3           = round2-era depth+1 plateau cascade (2/2/2/1/1/1)
+        # Variant naming: <thread_map>_d{depth} encodes la directly into the
+        # variant label, so dispatch + analysis read the depth straight off
+        # the experiment name without any "OLD/NEW" preset shorthand.
+        import os as _os
+
+        _depth = int(_os.environ.get("HSTU_LA_DEPTH", "6"))
+        if _depth == 3:
+            h2d_lookahead = 2
+            start_shuffle_lookahead = 2
+            finish_shuffle_lookahead = 2
+            start_input_dist_lookahead = 1
+            wait_input_dist_lookahead = 1
+            prefetch_lookahead = 1 if self._prefetch else None
+        elif _depth == 6:
+            h2d_lookahead = 5
+            start_shuffle_lookahead = 4
+            finish_shuffle_lookahead = 3
+            start_input_dist_lookahead = 3
+            wait_input_dist_lookahead = 2
+            prefetch_lookahead = 1 if self._prefetch else None
+        else:
+            raise ValueError(f"HSTU_LA_DEPTH={_depth} not supported; expected 3 or 6")
 
         # Apply auto-scheduler / explicit overrides. Only the off-default
         # tasks accept lookahead via factory args; default-stream tasks
