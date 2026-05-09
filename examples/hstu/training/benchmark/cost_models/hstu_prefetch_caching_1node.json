@@ -1,0 +1,16 @@
+{
+  "h2d":                       {"cpu_us": 0.0, "gpu_us":   300.0},
+  "start_shuffle":             {"cpu_us": 0.0, "gpu_us":  4600.0},
+  "finish_shuffle":            {"cpu_us": 0.0, "gpu_us":  2300.0},
+  "start_input_dist":          {"cpu_us": 0.0, "gpu_us":  8600.0},
+  "wait_input_dist":           {"cpu_us": 0.0, "gpu_us":   400.0},
+  "prefetch_embeddings":       {"cpu_us": 0.0, "gpu_us":  1100.0},
+  "zero_grad":                 {"cpu_us": 0.0, "gpu_us":    90.0},
+  "global_tokens_allreduce":   {"cpu_us": 0.0, "gpu_us":   120.0},
+  "nccl_safety_barrier":       {"cpu_us": 0.0, "gpu_us":    20.0},
+  "forward":                   {"cpu_us": 0.0, "gpu_us": 28850.0},
+  "backward":                  {"cpu_us": 0.0, "gpu_us": 12320.0},
+  "finalize_model_grads":      {"cpu_us": 0.0, "gpu_us":   290.0},
+  "optimizer_step":            {"cpu_us": 0.0, "gpu_us": 66610.0},
+  "watchdog_step":             {"cpu_us": 0.0, "gpu_us":    80.0}
+}

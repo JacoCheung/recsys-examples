@@ -156,6 +156,11 @@ export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5}
 export CACHE_DEBUG=${CACHE_DEBUG:-0}
 export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy}
 export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-}
+# Auto-scheduler hook: when set, points at a JSON cost model the
+# engine consults to recommend per-task lookaheads (bit-exact only;
+# default-stream tasks frozen). Empty = disabled.
+export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-}
+export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5}
 
 # Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
 LAUNCH_BLOCKING_ENV=""
