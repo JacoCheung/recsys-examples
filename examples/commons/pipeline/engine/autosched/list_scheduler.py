@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Critical-path list scheduler (SPEC §4.3).
+"""Critical-path list scheduler.
 
 Inputs:
   - A bag of `Task`s (user-authored or preset-generated).
@@ -21,7 +21,7 @@ Inputs:
   - `stream_slots` — the declared stream inventory.
 
 Output: a `Schedule` (stages + stream bindings) that respects all
-slot + `depends_on` edges AND is valid per SPEC §4.2.
+slot + `depends_on` edges and passes the engine validator.
 
 Algorithm: topological + priority-based list scheduling.
 
@@ -68,7 +68,7 @@ def schedule_tasks(
         per-stream resource contention; out of scope here).
 
     Raises `ScheduleValidationError` if the resulting Schedule
-    violates SPEC §4.2.
+    violates the pipeline schedule contract.
     """
     if not tasks:
         raise ValueError("schedule_tasks() called with no tasks")
@@ -77,8 +77,7 @@ def schedule_tasks(
     for task in tasks:
         if task.name in task_by_name:
             raise ValueError(
-                f"Duplicate task name {task.name!r} in input — cannot "
-                f"schedule (SPEC §4.2 rule 1)."
+                f"Duplicate task name {task.name!r} in input — cannot " f"schedule."
             )
         task_by_name[task.name] = task
 
@@ -97,7 +96,7 @@ def schedule_tasks(
             if producer is None:
                 continue  # cross-iter or engine-populated; no intra-iter edge
             if producer.name == consumer.name:
-                continue  # self-loops on a slot are impossible (rule 4)
+                continue  # self-loops on one exact slot are impossible
             adjacency_out[producer.name].append(consumer.name)
             indegree[consumer.name] += 1
 
@@ -140,9 +139,8 @@ def schedule_tasks(
     if len(ordered) != len(tasks):
         raise ValueError(
             "List scheduler produced fewer tasks than input — the "
-            "intra-iter DAG has a cycle. Expected SPEC §4.2 rule 7 "
-            "to reject this upstream, but the input wasn't validated "
-            "first."
+            "intra-iter DAG has a cycle. Validate the input schedule "
+            "before list scheduling."
         )
 
     schedule = Schedule(
@@ -150,7 +148,7 @@ def schedule_tasks(
         stream_slots=stream_slots,
     )
     # Consolidate: run the full validator on the output. Catches
-    # any rule violation introduced by scheduler bugs.
+    # any contract violation introduced by scheduler bugs.
     validate(schedule)
     return schedule
 

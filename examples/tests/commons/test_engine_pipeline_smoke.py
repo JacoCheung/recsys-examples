@@ -13,12 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""V1 smoke test — single-stream, single-stage forward through the engine.
-
-Proves the Task/Schedule/StreamPool/SchedulablePipeline API is wired:
-one plain Task calls `model(batch)` inside `progress()`, writes the
-result to the `step_result` slot, and `progress()` returns it.
-"""
+"""Basic smoke tests for the schedulable pipeline engine."""
 
 import pytest
 import torch
@@ -78,7 +73,7 @@ def test_single_stage_forward() -> None:
 
 
 def test_in_flight_batches_is_derived() -> None:
-    """Schedule.in_flight_batches is a derived @property (SPEC §4.2 rule 4)."""
+    """Schedule.in_flight_batches is derived from task lookahead."""
     fwd = Task.from_fn(name="t", fn=lambda ctx: None, stream="default")
     schedule = Schedule(stages=(Stage(tasks=(fwd,)),), stream_slots=("default",))
     assert schedule.in_flight_batches == 1
@@ -95,7 +90,7 @@ def test_task_from_fn_stream_binding() -> None:
     captured = {}
 
     def _capture(ctx):
-        captured["stream_name"] = "default"  # V1 single-stream; V3 will exercise
+        captured["stream_name"] = "default"
         captured["iter"] = ctx.iter_count
 
     t = Task.from_fn(name="capture", fn=_capture, stream="default")
@@ -105,8 +100,6 @@ def test_task_from_fn_stream_binding() -> None:
 
     pipe.progress(iter([object()]))  # opaque payload — task doesn't read it
 
-    # SPEC §4.8: iter_count is 0-indexed (internal iter at task-run time).
-    # First progress call = internal iter 0.
     assert captured == {"stream_name": "default", "iter": 0}
 
 

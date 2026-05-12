@@ -2,8 +2,8 @@
 
 A framework-agnostic PyTorch training-pipeline engine that decouples
 **tasks** (what to do) from **schedules** (when to do it, on which
-stream). HugeCTR-inspired; see [SPEC.md](../../../../../SPEC.md) for
-the full design.
+stream). HugeCTR-inspired, with framework adapters kept outside the
+engine core.
 
 ## TL;DR
 
@@ -46,8 +46,8 @@ python examples/commons/pipeline/engine/examples/adopt_existing_loop.py
 python examples/commons/pipeline/engine/examples/minimal_mlp.py
 ```
 
-(Run inside the devel container on `ipp1-2029`; the engine needs
-`torch` + `nvtx`.)
+Run in an environment with `torch`; `nvtx` is optional and used only for
+profiler ranges.
 
 ## Public API
 
@@ -61,7 +61,7 @@ Import surface (from `commons.pipeline.engine`):
 | `Schedule`, `Stage` | Declarative plan consumed by the pipeline. |
 | `StreamPool` | Named stream registry. |
 | `TaskContext` | Per-iteration handle passed to every `Task.run(ctx)`. Exposes `ctx.slots`, `ctx.stream_pool`, `ctx.iter_count`. |
-| `ScheduleValidationError` | Raised when a `Schedule` violates [SPEC §4.2](../../../../../SPEC.md) rules. |
+| `ScheduleValidationError` | Raised when a `Schedule` violates the engine contract. |
 | `ThreadedExecutor` | Multi-threaded executor. Threads and CUDA streams are decoupled; `thread_map` controls task→thread assignment. NCCL ordering safety built in. |
 | `SequentialExecutor` | Single-threaded executor (default). |
 
@@ -81,16 +81,11 @@ from commons.pipeline.engine.autosched import (
   `torchrec`, `megatron`, `fbgemm_gpu`, or `commons.distributed.*`.
   Enforced by
   [`test_engine_import_hygiene.py`](../../../../tests/commons/test_engine_import_hygiene.py).
-- **Legacy pipeline untouched**:
-  `examples/commons/pipeline/train_pipeline.py` +
-  `train_pipeline_factory.py` + `utils.py` stay byte-identical on
-  the engine branch. Enforced by
-  [`test_engine_legacy_untouched.py`](../../../../tests/commons/test_engine_legacy_untouched.py).
 - **Single-rank**: the engine is per-rank. Multi-GPU dispatch is
   the trainer's job, not the engine's.
 - **Eager execution only**: no CUDA graph capture.
 - **Backward is a plain Task**: PyTorch autograd is atomic; no
-  intra-backward decomposition. See [SPEC §4.6](../../../../../SPEC.md).
+  intra-backward decomposition.
 
 ## Scope boundaries
 

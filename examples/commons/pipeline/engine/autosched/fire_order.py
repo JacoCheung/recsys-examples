@@ -13,17 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fire-order auto-scheduler — derive per-task ``lookahead`` and within-
-thread fire order from a resource-conflict overlap matrix and a cost
-model, with the explicit goal of hiding NCCL/IO behind the longest
+"""Fire-order auto-scheduler.
+
+Derives per-task ``lookahead`` recommendations from a resource-conflict
+matrix and a cost model, with the goal of hiding NCCL/IO behind the
 default-stream compute chain.
 
-The contract is bit-exact: the scheduler may only reassign
-``lookahead`` (and equivalently the topo-sort tie-break) within the
-DAG; it never replaces ``optimizer_step`` with a stale/async version
-nor moves it to a non-default stream where the next iteration's
-``forward`` could read pre-update parameters. See
-``feedback_no_async_optimizer.md``.
+The contract is bit-exact: the scheduler only adjusts ``lookahead`` for
+eligible off-default tasks. It never moves forward/backward/optimizer
+work off the default stream or into a stale-update mode.
 
 ## What this module produces
 
@@ -89,10 +87,8 @@ __all__ = [
 ]
 
 
-# Tasks that MUST stay on the default stream at lookahead=0 — moving
-# them would break bit-exact convergence (see
-# ``feedback_no_async_optimizer.md``). We enforce this as a hard check
-# in :func:`auto_assign_lookaheads`.
+# Tasks that must stay on the default stream at lookahead=0 for
+# bit-exact convergence. Enforced in ``auto_assign_lookaheads``.
 DEFAULT_BIT_EXACT_TASKS: FrozenSet[str] = frozenset(
     {
         "optimizer_step",
@@ -154,8 +150,7 @@ _DEFAULT_NCCL_COMM_FOR_NCCL_TASKS = "dp"
 def _normalize_stream(stream: Optional[str], default_stream: str) -> str:
     """``Task.stream`` is Optional[str]; both ``None`` and ``""`` mean
     "no explicit stream" and should map to ``default_stream``. Use this
-    helper at every site that compares a task's stream to the default —
-    avoids falsy-string bypasses (codex MAJOR).
+    helper at every site that compares a task's stream to the default.
     """
     if stream is None or stream == "":
         return default_stream
@@ -306,7 +301,7 @@ def auto_assign_lookaheads(
     rebuilder (e.g. the HSTU pipeline factory) — this function does
     NOT mutate the input ``schedule``.
 
-    Rules:
+    Policy:
 
     1. Tasks on the default stream keep their existing lookahead. We
        never reorder the compute chain (fwd → bwd → opt) because doing
@@ -333,16 +328,7 @@ def auto_assign_lookaheads(
         tasks, cost_model, default_stream=default_stream
     )
 
-    # Hard-guard bit-exact tasks (CRITICAL #1 from codex review). Any
-    # task in the bit-exact set must already be on the default stream
-    # at lookahead=0 in the input schedule; otherwise the recommended
-    # mapping cannot honor the bit-exact contract.
-    #
-    # ``Task.stream`` is an Optional[str] but the engine treats both
-    # ``None`` and ``""`` as "no explicit stream"; the executor maps
-    # both to the same default-stream context. We use the module-level
-    # ``_normalize_stream`` helper at every site to avoid a falsy-
-    # string bypass (codex MAJOR).
+    # Bit-exact tasks must stay on the default stream at lookahead=0.
     for t in tasks:
         if t.name in bit_exact_tasks:
             if _normalize_stream(t.stream, default_stream) != default_stream:
@@ -364,8 +350,7 @@ def auto_assign_lookaheads(
     # Slot writers (slot.name → producers list) for read/write dep
     # traversal. The engine permits multiple writers at different
     # offsets when the (name, offset) pair is unique; we track every
-    # writer so propagation does not bump only the most recently
-    # declared one.  (codex MAJOR #3.)
+    # writer so propagation considers every producer.
     writers_by_slot_name: Dict[str, List[str]] = {}
     for t in tasks:
         for slot in t.writes:
@@ -373,8 +358,7 @@ def auto_assign_lookaheads(
 
     # Cross-iter constraints: each (consumer.name) → list of
     # (-neg_offset) requirements.  When we want to bump a consumer's
-    # lookahead, we need ``consumer.la + neg_offset >= 0`` (codex
-    # CRITICAL #2). Keep a per-task upper-bound floor.
+    # lookahead, ``consumer.la + neg_offset`` must stay in the ring.
     cross_iter_la_cap: Dict[str, int] = {t.name: max_in_flight - 1 for t in tasks}
     for t in tasks:
         for _producer, neg_offset in getattr(t, "cross_iter_depends_on", ()) or ():
@@ -389,8 +373,8 @@ def auto_assign_lookaheads(
 
     cap = max_in_flight - 1
 
-    # Pre-flight: any task whose authored la already exceeds cap is a
-    # configuration error. We never silently shrink (codex MAJOR #4).
+    # Pre-flight: authored lookahead above the budget is an error. We
+    # never silently shrink user-authored offsets.
     for t in tasks:
         if t.batch_offset > cap:
             raise ValueError(
@@ -443,9 +427,8 @@ def auto_assign_lookaheads(
             if dep_name in by_name:
                 need = max(need, out[dep_name])
 
-        # Cross-iter cap (CRITICAL #2): if user authored
-        # ``cross_iter_depends_on`` we cannot bump the consumer's
-        # lookahead because that would shift slot_offset out of range.
+        # If the user authored ``cross_iter_depends_on`` we cannot bump
+        # the consumer's lookahead beyond its ring-safe cap.
         cap_for_t = min(cap, cross_iter_la_cap[t.name])
         recommended = max(floor, min(need, cap_for_t))
         out[t.name] = recommended
@@ -491,10 +474,8 @@ def auto_assign_lookaheads(
                         new_la = min(target, cross_iter_la_cap[producer])
                         if new_la < target:
                             # Cross-iter cap binds below what the
-                            # consumer needs — would leave consumer's
-                            # la > producer's la, breaking ring slot
-                            # invariant. Surface to caller (codex
-                            # MAJOR #2 from second review).
+                            # consumer needs; surface the inconsistent
+                            # schedule instead of weakening the edge.
                             raise ValueError(
                                 f"Auto-scheduler inconsistency: "
                                 f"consumer {t.name!r} la={target} requires "
