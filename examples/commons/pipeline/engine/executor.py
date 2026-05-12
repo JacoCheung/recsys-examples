@@ -13,34 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Task execution strategies for SchedulablePipeline.
+"""Task execution strategies for ``SchedulablePipeline``.
 
-SequentialExecutor: single-threaded, declaration-order execution (default).
-ThreadedExecutor: task-level multi-threaded execution with pluggable
-    thread mapping.
-
-Key design: **threads and CUDA streams are decoupled.** A task's
-``stream`` attribute decides which CUDA stream context it runs in; the
-``thread_map`` decides which CPU worker thread submits it. The same
-stream's tasks may run on different threads (if the DAG allows), and
-different streams' tasks may share a thread.
-
-Thread mapping strategies (``thread_map`` parameter):
-
-  ``"by_stream"`` (default)
-      Group tasks by ``task.stream``. Same-stream tasks share a thread.
-      Good default that avoids most cross-thread sync overhead.
-
-  ``"per_task"``
-      Every task gets its own thread. Maximum parallelism; useful when
-      tasks have heavy CPU-side work.
-
-  ``dict[str, str]``
-      Explicit mapping ``{task_name: thread_id}``. Tasks not in the dict
-      fall back to ``"default"`` thread.
-
-  ``Callable[[Task], str]``
-      Arbitrary function mapping each task to a thread id string.
+Threads and CUDA streams are separate concerns: ``task.stream`` selects
+the CUDA stream, while ``thread_map`` selects the CPU worker that submits
+the task. ``ThreadedExecutor`` supports ``"by_stream"``, ``"per_task"``,
+explicit dicts, and callables.
 """
 
 import contextlib
@@ -80,17 +58,9 @@ def _apply_cross_stream_waits(
 ) -> None:
     """Apply GPU-side cross-stream waits before a task runs.
 
-    Prefers fine-grained ``wait_event(producer_event)`` (event-based
-    sync) when ``event_deps`` and ``ctx`` are provided AND the producer
-    has already recorded its completion event onto the ring slot for
-    this iteration. Falls back to ``wait_stream(producer_stream)`` for
-    edges that have no event yet — typically iteration 1 before the
-    ring is fully primed, or producers that did not run this iteration.
-
-    The fallback uses ``cross_stream_waits`` (stream-name list, computed
-    by ``deps.infer_cross_stream_waits``). The fine-grained mode uses
-    ``event_deps`` (triples of producer task / producer stream / slot
-    offset, computed by ``deps.infer_cross_stream_event_deps``).
+    Uses recorded producer events when available; falls back to
+    stream-level waits during ring warmup or when a producer did not
+    record an event for this slot.
     """
     anchor = stream_pool.anchor_device
     if anchor is None:
@@ -108,17 +78,14 @@ def _apply_cross_stream_waits(
             if event is not None:
                 consumer.wait_event(event)
             else:
-                # Fallback: ring slot has no event for this producer
-                # yet (first-iter / not-run-this-iter). Use the
-                # coarser stream-level wait so we don't drop a
-                # required ordering edge.
+                # Warmup/no-event fallback: keep the ordering edge.
                 prod = stream_pool.get(producer_stream)
                 if prod is None:
                     prod = torch.cuda.default_stream(anchor)
                 consumer.wait_stream(prod)
         return
 
-    # Legacy path: stream-list only, no event lookup.
+    # Stream-list fallback: no event lookup.
     waits = cross_stream_waits.get(task.name, ())
     if waits:
         for producer_stream in waits:
@@ -130,17 +97,7 @@ def _apply_cross_stream_waits(
 
 @contextlib.contextmanager
 def _nvtx_range(task: Task) -> Iterator[None]:
-    """Wrap a task's execution in an NVTX range labelled by
-    ``task.nvtx_tag`` (falling back to ``task.name`` when the tag is
-    unset). No-op when nvtx is not importable or when CUDA is not
-    available — the range would have no profiler to record into.
-
-    Prefixed with ``[engine]`` and colored ``orange`` so it visually
-    separates from the inner task-body ``nvtx.annotate("## ... ##")``
-    ranges. The outer range covers the whole task slot (cross-thread
-    Event.wait + body + completion bookkeeping); the inner range
-    covers only the actual task body work.
-    """
+    """Wrap a task in an outer NVTX range when nvtx/CUDA are available."""
     if _nvtx is None or not torch.cuda.is_available():
         yield
         return
@@ -155,28 +112,10 @@ def _record_completion_event(
     producers_to_record: Optional[set] = None,
 ) -> None:
     """Record a CUDA event on the task's current stream and store it on
-    the ring slot at ``task.batch_offset``, keyed by ``task.name``.
+    the task's ring slot.
 
-    Called after the task body returns successfully, while still inside
-    the ``stream_pool.use(task.stream)`` context — so
-    ``torch.cuda.current_stream()`` is the task's stream.
-
-    The event object is **reused across iterations**: SlotStore preserves
-    its event registry across ``BatchRing.advance()`` (the slot rotates
-    in place), so the same ``torch.cuda.Event`` is re-recorded each iter
-    that this task runs at this offset. ``Event.record()`` overwriting
-    the previous record is the intended semantics — see SPEC §4.2 rule 8
-    (event-based cross-stream sync).
-
-    ``producers_to_record`` is the set of producer task names whose
-    events some cross-stream consumer actually waits on (computed once
-    at construction by
-    ``deps.producers_with_cross_stream_consumers``). When provided,
-    tasks not in the set skip ``Event.record()`` entirely — same-stream
-    FIFO already orders their work and no other stream waits on the
-    event, so the record is wasted.
-
-    No-op on CPU-only runs (no CUDA available).
+    SlotStore keeps event objects across ring rotation, so re-recording
+    the same ``torch.cuda.Event`` each iteration is intentional.
     """
     if not torch.cuda.is_available():
         return
@@ -213,19 +152,9 @@ def _compute_cpu_deps(
 ) -> Dict[str, List[threading.Event]]:
     """Compute CPU-side dependency events between tasks on different threads.
 
-    Uses the task DAG (reads/writes + depends_on) to find cross-thread
-    edges that need CPU-side ordering.  Same-thread edges are handled by
-    sequential execution within the thread.
-
-    Also: when ``thread_map`` splits same-stream tasks across worker
-    threads (e.g. ``thread_map="per_task"``), CUDA stream FIFO order
-    is determined by host-thread enqueue race rather than declaration
-    order. We add a CPU dep from each same-stream predecessor (declared
-    earlier) on a different thread, so submission order matches the
-    schedule.
-
-    GPU-side cross-stream waits are separate and handled by
-    ``_apply_cross_stream_waits``.
+    Same-thread edges are handled by sequential execution. Cross-stream
+    CUDA waits remain GPU-side; these events only order host submission
+    when the DAG or same-stream declaration order crosses worker threads.
     """
     # Build writer map for CPU-side ordering. Unlike GPU stream-wait
     # inference, host thread events should only model dependencies
@@ -237,7 +166,8 @@ def _compute_cpu_deps(
         for slot in task.writes:
             writers[slot] = task.name
 
-    active_names = {t.name for t in active}
+    task_by_name = {t.name: t for t in active}
+    active_names = set(task_by_name.keys())
     cpu_deps: Dict[str, List[threading.Event]] = defaultdict(list)
     # Track the most recent task on each stream in declaration order.
     last_on_stream: Dict[str, str] = {}
@@ -269,9 +199,7 @@ def _compute_cpu_deps(
         for dep_name in task.depends_on or ():
             if dep_name not in active_names:
                 continue
-            producer = next((t for t in active if t.name == dep_name), None)
-            if producer is None:
-                continue
+            producer = task_by_name[dep_name]
             if producer.batch_offset > task.batch_offset:
                 continue  # cross-la — handled by ring rotation, no CPU edge
             dep_names.add(dep_name)
@@ -287,21 +215,16 @@ def _compute_cpu_deps(
             if dep_name in active_names:
                 dep_names.add(dep_name)
 
-        # ``cross_iter_depends_on`` with Δ=0 — auto-promoted to the
-        # same_progress_sync mechanical contract (per
-        # SPEC_cross_iter_delta0_autoconvert.md). When
-        # producer.la + N == consumer.la, the producer ran in the
-        # current progress on a different batch, identical wait
-        # semantics to same_progress_sync. Emit the same CPU edge.
+        # ``cross_iter_depends_on`` with Δ=0 has the same mechanical
+        # contract as ``same_progress_sync``: the producer ran in the
+        # current progress on a different batch, so emit the same CPU edge.
         # Δ ≥ 1 entries contribute no CPU edge here — those are
         # handled by ring-rotated wait_event in
         # ``_apply_cross_stream_waits``.
         for dep_name, neg_offset in getattr(task, "cross_iter_depends_on", ()):
             if dep_name not in active_names:
                 continue
-            producer_task = next((t for t in active if t.name == dep_name), None)
-            if producer_task is None:
-                continue
+            producer_task = task_by_name[dep_name]
             N = -neg_offset
             delta = producer_task.batch_offset + N - task.batch_offset
             if delta == 0:
@@ -429,35 +352,8 @@ class ThreadedExecutor:
 
     Tasks are grouped by ``thread_map`` into thread chains. Each chain
     runs sequentially on one worker thread. Chains with no mutual
-    dependencies run concurrently.
-
-    CUDA stream context (``stream_pool.use(task.stream)``) is entered
-    per-task, independent of thread assignment. This means the same
-    CUDA stream can be used from different threads, and tasks on the
-    same thread can target different CUDA streams.
-
-    Parameters
-    ----------
-    thread_map : str | dict | callable, optional
-        How to assign tasks to threads. See module docstring for details.
-        Default: ``"by_stream"`` (group by task.stream).
-    max_workers : int, optional
-        Maximum worker threads. Auto-sized to the number of active
-        thread groups if not specified.
-    inline_thread : str, optional
-        Name of one thread chain to run **on the calling thread**
-        (typically Python's main thread) instead of submitting to the
-        worker pool. Default: ``"compute"``. Set to ``None`` to disable
-        and run all chains in the pool.
-
-        Why: ``nsys`` projects an NVTX range onto a CUDA stream only when
-        the emitting thread launched kernels on that stream during the
-        range. With every task body on a worker thread, a main-thread
-        range like ``step N`` projects to no GPU stream because the main
-        thread itself launches no kernels — it just dispatches. Running
-        the kernel-heavy chain (default-stream forward / backward / opt)
-        inline on the main thread restores the NVTX → default-stream GPU
-        projection.
+    dependencies run concurrently. ``inline_thread`` can keep one chain
+    on the caller thread for profiler/NVTX attribution.
     """
 
     def __init__(

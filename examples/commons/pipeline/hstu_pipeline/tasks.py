@@ -15,11 +15,9 @@
 
 """HSTU-specific Task factories.
 
-Each factory returns a `commons.pipeline.engine.Task` that performs
-one step from the legacy `JaggedMegatronTrainPipelineSparseDist.progress()`
-loop. Tasks are stateless closures over a shared ``PipelineState`` that
-the HSTUPipeline owns — references to the optimizer, pipelined
-modules, shuffler, etc., are captured at schedule-build time.
+Each factory returns a `commons.pipeline.engine.Task`. Tasks are
+stateless closures over the shared ``PipelineState`` owned by
+``HSTUPipeline``.
 
 Slot conventions:
 
@@ -66,23 +64,13 @@ class PipelineState:
     # Prefetch variants use PrefetchTrainPipelineContext; non-prefetch
     # uses TrainPipelineContext. Set at HSTUPipeline construction.
     torchrec_context_type: Any = None
-    # True when the engine schedule includes the prefetch_embeddings
-    # task (i.e. ``HSTUPipeline(prefetch=True)``). Read by
-    # ``make_compute_output_dist_task`` to choose where to source the
-    # KJT input + module ctx from. Set at HSTUPipeline construction.
-    uses_prefetch: bool = False
 
     def create_torchrec_ctx(self):
-        """Factory for a fresh per-batch torchrec context.
+        """Create a fresh per-batch TorchRec context.
 
-        **v1 only** — the v0 (single-shared-context, deprecated) branch
-        in `commons/pipeline/utils.py::_start_data_dist` is forbidden
-        in HSTUPipeline. v0 was a legacy compat code path that mixes
-        cross-batch state in one context object; HSTUPipeline's engine
-        treats every batch as having its own context (per-batch slot
-        in the BatchRing). Mixing the two semantic models was the root
-        cause of the ``prefetch + dynamic_emb`` xfail (see
-        tasks/followups.md).
+        HSTUPipeline always uses version=1 contexts so context state
+        travels with the engine's batch slot instead of being shared
+        across in-flight batches.
         """
         if self.torchrec_context_type is None:
             from commons.pipeline.utils import TrainPipelineContext
@@ -98,8 +86,7 @@ class PipelineState:
         return ctx
 
     def set_module_context(self, torchrec_ctx) -> None:
-        """Point every PipelinedForward at the given per-batch context.
-        Matches legacy ``TrainPipelineSparseDist._set_module_context``."""
+        """Point every pipelined forward wrapper at a per-batch context."""
         for module in self.pipelined_modules:
             module.forward.set_context(torchrec_ctx)
 
@@ -165,7 +152,6 @@ def make_h2d_task(
 
 def make_zero_grad_task(state: PipelineState) -> Task:
     def _fn(ctx):
-        # Legacy gates zero_grad + zero_grad_buffer on model.training.
         if not state.model.training:
             return
         with nvtx.annotate("## zero_grad ##"):
@@ -189,8 +175,6 @@ def make_global_tokens_task(state: PipelineState) -> Task:
     def _fn(ctx):
         batch_gpu = ctx.slots.get("batch_gpu", None)
         if batch_gpu is None or not state.model.training:
-            # drain phase OR eval mode — no AllReduce (legacy guards
-            # this behind `if self._model.training`).
             ctx.slots.set("global_tokens", None)
             return
         with nvtx.annotate("## global_tokens ##"):
@@ -387,6 +371,7 @@ def make_wait_input_dist_task(
         _fn,
         stream="data_dist",
         lookahead=lookahead,
+        reads=("torchrec_ctx",),
         depends_on=("start_input_dist",),
         # awaitable.wait() triggers the tensors all_to_all NCCL op —
         # must participate in the declaration-order NCCL chain.
@@ -408,10 +393,7 @@ def make_prefetch_task(
 ) -> Task:
     """Calls ShardedModule.prefetch on the prefetch stream and stores
     the result into the context's ``module_input_post_prefetch`` /
-    ``module_contexts_post_prefetch`` — matching legacy ``_prefetch``
-    (train_pipeline.py:663-692). Without this post-step,
-    ``PrefetchPipelinedForward.__call__`` asserts because its
-    required slot is empty."""
+    ``module_contexts_post_prefetch``."""
 
     def _fn(ctx):
         shuffled = ctx.slots.get("shuffled_batch", None)
@@ -420,13 +402,11 @@ def make_prefetch_task(
             return
         from commons.pipeline.utils import _prefetch_embeddings
 
-        # Legacy clears these dicts before populating — mirror exactly.
+        # Clear stale per-module prefetch data before populating.
         torchrec_ctx.module_input_post_prefetch.clear()
         torchrec_ctx.module_contexts_post_prefetch.clear()
 
         with nvtx.annotate("## prefetch ##"):
-            # record_stream so the prefetch stream can safely use the
-            # batch tensor (legacy does this too).
             shuffled.record_stream(torch.cuda.current_stream())
 
             data_per_module = _prefetch_embeddings(
@@ -438,8 +418,6 @@ def make_prefetch_task(
                 data_dist_stream=ctx.stream_pool.get("data_dist"),
                 default_stream=ctx.stream_pool.get("default"),
             )
-            # Populate ctx.module_input_post_prefetch + _contexts_
-            # (legacy does this in _prefetch after _prefetch_embeddings).
             for sharded_module in state.pipelined_modules:
                 fwd = sharded_module.forward
                 data = data_per_module[fwd._name]
@@ -453,6 +431,7 @@ def make_prefetch_task(
         _fn,
         stream="prefetch",
         lookahead=lookahead,
+        reads=("shuffled_batch", "torchrec_ctx"),
         depends_on=("wait_input_dist",),
         same_progress_sync=same_progress_sync,
     )
@@ -463,32 +442,17 @@ def make_prefetch_task(
 # ----------------------------------------------------------------------
 
 
-def make_compute_output_dist_task(state: PipelineState, *, lookahead: int = 0) -> Task:
-    """Run ``module.compute_and_output_dist(ctx, data)`` for every
-    pipelined module in this batch. Local lookup + cross-rank
-    ``all_to_all`` (NCCL) for the output dist; the returned awaitables
-    are stashed into ``torchrec_ctx.embedding_a2a_requests`` for the
-    forward task (``HSTUPipelinedForward``) to consume.
+def make_compute_output_dist_task(
+    state: PipelineState,
+    *,
+    lookahead: int = 0,
+    prefetch: bool = False,
+) -> Task:
+    """Run sparse lookup + output distribution for each pipelined module.
 
-    Stream: ``default`` — same stream as forward / backward / NCCL
-    DDP. Running compute_and_output_dist on the default stream avoids
-    a cross-stream ``wait_event`` between this task's a2a awaitable
-    and ``forward``'s consumer (both are on default → FIFO orders
-    them automatically). NCCL ordering against other DP-comm
-    collectives is preserved by ``_NcclOrderedLock`` (this task
-    participates as a ticket via ``nccl=True``).
-
-    Branches on ``state.uses_prefetch``: with prefetch, KJT input
-    comes from ``module_input_post_prefetch`` (populated by the
-    upstream ``prefetch_embeddings`` task); without prefetch, it comes
-    from ``input_dist_tensors_requests[name].wait()`` (populated by
-    upstream ``wait_input_dist``). See
-    ``commons.pipeline.hstu_pipeline.embedding_split._compute_and_output_dist_for_module``.
-
-    NCCL: marked ``nccl=True`` because ``compute_and_output_dist``
-    submits an a2a collective on the DP comm — must participate in
-    the engine's ``_NcclOrderedLock`` chain for cross-rank submission
-    ordering.
+    The returned awaitables are stored in the per-batch TorchRec context
+    for the forward wrapper to consume. The task runs on the default
+    stream and is marked ``nccl=True`` because it submits output a2a.
     """
     from commons.pipeline.hstu_pipeline.embedding_split import (
         _compute_and_output_dist_for_module,
@@ -503,20 +467,24 @@ def make_compute_output_dist_task(state: PipelineState, *, lookahead: int = 0) -
                 _compute_and_output_dist_for_module(
                     module,
                     torchrec_ctx,
-                    is_prefetch=state.uses_prefetch,
+                    is_prefetch=prefetch,
                 )
+
+    depends_on = (
+        ("wait_input_dist", "prefetch_embeddings") if prefetch else ("wait_input_dist",)
+    )
 
     return Task.from_fn(
         "compute_output_dist",
         _fn,
         stream="default",
         lookahead=lookahead,
-        # depends_on declared as bare-name docs — wait_input_dist
-        # (la=2/1) and prefetch_embeddings (la=1) are cross-la vs
-        # compute_output_dist (la=0), so the engine's same-progress
-        # DAG builder filters them out. Cross-iter ordering is
-        # satisfied by ring-rotated slot reads (torchrec_ctx@0).
-        depends_on=("wait_input_dist", "prefetch_embeddings"),
+        reads=("torchrec_ctx",),
+        # depends_on documents the upstream input-dist path. These
+        # producers run at higher lookahead than compute_output_dist,
+        # so the same-progress DAG filters them out and event sync is
+        # mediated by ring rotation.
+        depends_on=depends_on,
         nccl=True,
     )
 
@@ -529,13 +497,8 @@ def make_compute_output_dist_task(state: PipelineState, *, lookahead: int = 0) -
 def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
     """Sets module context, runs model(batch), writes losses + output.
 
-    If ``prefetch=True``, ``forward`` declares an ordering edge to
-    ``prefetch_embeddings`` via bare-name ``depends_on``; the engine
-    derives the cross-iter offset from the lookahead diff
-    (``prefetch_embeddings.lookahead=1`` vs ``forward.lookahead=0``)
-    and emits the appropriate ``wait_event`` so the first iteration
-    is structurally synchronized — without the user writing the
-    iteration arithmetic.
+    In prefetch mode, the dependency on ``prefetch_embeddings`` lets the
+    engine derive the cross-iteration wait.
     """
 
     def _fn(ctx):
@@ -545,13 +508,7 @@ def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
             ctx.slots.set("losses", None)
             ctx.slots.set("output", None)
             return
-        # NCCL safety fence (folded in from former nccl_safety_barrier
-        # task): default stream waits for memcpy stream's finish_shuffle
-        # AllGather before any subsequent default-stream NCCL
-        # (backward DDP AllReduce / finalize_model_grads). Without
-        # this, GPU-side execution order on the DP comm can diverge
-        # across ranks → deadlock. _NcclOrderedLock only guarantees
-        # host submission order; this guarantees GPU execution order.
+        # Keep GPU execution order aligned with host NCCL ticket order.
         if not state.is_identity_shuffler:
             memcpy = ctx.stream_pool.get("memcpy")
             if memcpy is not None:
@@ -563,13 +520,8 @@ def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
         ctx.slots.set("losses", losses)
         ctx.slots.set("output", output)
 
-    # Explicit depends_on so a custom thread_map can't put forward on a
-    # different worker thread and lose ordering. The hard topo edge is
-    # ``compute_output_dist`` → ``forward`` (same la=0): forward consumes
-    # ``embedding_a2a_requests`` populated by compute_output_dist's
-    # ``module.compute_and_output_dist`` calls. ``wait_input_dist`` /
-    # ``prefetch_embeddings`` are listed for documentation but are
-    # cross-la → no topo edge (handled by ring rotation).
+    # compute_output_dist is the same-lookahead hard edge; input_dist /
+    # prefetch edges are cross-lookahead and resolved by ring rotation.
     depends_on: tuple = ("compute_output_dist", "wait_input_dist")
     if prefetch:
         depends_on = ("compute_output_dist", "prefetch_embeddings")
@@ -587,10 +539,7 @@ def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
 
 
 # ----------------------------------------------------------------------
-# (former #10 nccl_safety_barrier task has been folded into make_forward_task —
-# default_stream.wait_stream(memcpy) now runs at the start of forward's
-# body. Removing the standalone Task slot saves one dispatch + NVTX +
-# completion event per iter; NCCL safety semantic is unchanged.)
+# The NCCL safety barrier lives in forward.
 # ----------------------------------------------------------------------
 
 
@@ -607,14 +556,9 @@ def make_backward_task(
 ) -> Task:
     """Build the backward task.
 
-    ``depends_on`` carries same-batch logical dependency edges
-    (e.g. zero_grad → backward, both for batch K).
-
-    ``same_progress_sync`` carries same-progress GPU coherency edges
-    (e.g. prefetch_embeddings → backward in prefetch variant —
-    different batches but shared dynamicemb cache, mirroring legacy
-    ``default_stream.wait_stream(prefetch_stream)`` at
-    train_pipeline.py:993-997).
+    ``depends_on`` carries same-batch model-state ordering.
+    ``same_progress_sync`` carries same-progress GPU coherency edges,
+    such as prefetch-to-backward cache ordering.
     """
     from megatron.core import parallel_state
 
@@ -703,19 +647,15 @@ def make_optimizer_step_task(state: PipelineState) -> Task:
 
 
 # ----------------------------------------------------------------------
-# 14. watchdog_step (optional no-op)
+# 14. watchdog_step (optional diagnostic)
 # ----------------------------------------------------------------------
 
 
 def make_watchdog_task() -> Task:
     def _fn(ctx):
-        try:
-            from commons.utils.cuda_mem_watchdog import get_cuda_mem_watchdog
+        from commons.utils.watchdog import get_cuda_mem_watchdog
 
-            get_cuda_mem_watchdog().step()
-        except Exception:
-            # Watchdog is optional; missing module → no-op.
-            pass
+        get_cuda_mem_watchdog().step()
 
     return Task.from_fn(
         "watchdog_step",

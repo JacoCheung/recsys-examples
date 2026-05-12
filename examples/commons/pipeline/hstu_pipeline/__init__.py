@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HSTU pipeline adapter.
-
-Ports the HSTU-specific training pipeline onto the schedulable engine
-without touching the legacy pipeline files.
-
-Public API:
-    HSTUPipeline — the adapter class with `progress()` matching legacy.
-    HSTUPipelineFactory — registry for named pipeline variants.
-"""
+"""HSTU pipeline adapter public API."""
 
 from .factory import HSTUPipelineFactory
 from .pipeline import (

@@ -11,45 +11,10 @@ T = TypeVar("T")
 
 
 class StackDumpWatchdog:
-    """Watch an iterator, automatically print stack traces if no activity for a timeout period.
+    """Iterator watchdog that dumps Python stacks after inactivity.
 
-    This is useful for debugging hangs in training loops or other long-running iterations.
-    When no heartbeat (iteration) occurs within the timeout period, the watchdog will
-    automatically dump the stack trace of the watched thread to stderr.
-
-    Args:
-        timeout: Seconds of inactivity before dumping stack trace. Default: 60.
-        check_interval: How often to check for timeout (seconds). Default: 10.
-        on: Enable/disable the watchdog. When False, zero overhead. Default: True.
-
-    Examples:
-        Basic usage with context manager::
-
-            with StackDumpWatchdog(timeout=60) as watchdog:
-                for batch in watchdog.watch(dataloader):
-                    train_step(batch)
-
-        Multiple loops sharing one watchdog::
-
-            with StackDumpWatchdog(timeout=60) as watchdog:
-                for batch in watchdog.watch(train_loader):
-                    train_step(batch)
-                for batch in watchdog.watch(val_loader):
-                    val_step(batch)
-
-        Conditional enable via environment variable::
-
-            import os
-            debug_mode = os.getenv("DEBUG_WATCHDOG", "0") == "1"
-
-            with StackDumpWatchdog(timeout=60, on=debug_mode) as watchdog:
-                for batch in watchdog.watch(dataloader):
-                    train_step(batch)
-
-        One-liner using watched_iter helper::
-
-            for batch in watched_iter(dataloader, timeout=60):
-                train_step(batch)
+    This is a diagnostic utility for long-running training loops. Set
+    ``on=False`` to make the wrapper a pass-through.
     """
 
     def __init__(
@@ -77,35 +42,14 @@ class StackDumpWatchdog:
                 self._heartbeat()
 
     def _dump_stacks(self, elapsed: float):
-        # rank/pid tag — multi-process torchrun runs land all 8 ranks'
-        # stack dumps into the same stderr stream; the tag is the only
-        # way to read them apart. Resolve once per dump in case rank
-        # was set lazily (e.g. by torch.distributed.init_process_group
-        # after watchdog construction).
         pid = os.getpid()
         rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "?"
 
-        # Format the entire dump into ONE string and emit it via a
-        # single sys.stderr.write() + flush(). With 8 torchrun ranks
-        # all sharing the same stderr pipe, the previous per-line
-        # print() calls interleave at sub-frame granularity (we
-        # observed engine_0 frames from rank 2 mixed into rank 5's
-        # MainThread block). A single write() of the whole rank's
-        # dump is the simplest atomicity story — POSIX pipe writes up
-        # to PIPE_BUF (4 KiB) are atomic across processes, and even
-        # larger writes get a kernel-side fast path that vastly
-        # reduces interleaving compared to N separate prints.
-
         frames = sys._current_frames()
-        # Map tid -> Thread object for friendly names. Threads without
-        # a Python `Thread` wrapper (e.g. native NCCL watchdog threads
-        # spawned by libtorch_cuda) won't appear here — they show up
-        # in `frames` but `threading.enumerate()` does NOT enumerate
-        # them.
         thread_by_id = {t.ident: t for t in threading.enumerate()}
 
-        # Dump the watched (main) thread first, then everything else
-        # in deterministic ident order.
+        # Emit the whole dump in one write to reduce multi-rank stderr
+        # interleaving. Put the watched thread first for readability.
         ordered_ids = []
         if self._watched_thread_id and self._watched_thread_id in frames:
             ordered_ids.append(self._watched_thread_id)
@@ -201,23 +145,11 @@ class StackDumpWatchdog:
 
 
 class CudaMemoryWatchdog:
-    """Watchdog that calls torch.cuda.empty_cache() when GPU memory fragmentation
-    exceeds a threshold.
+    """Optional CUDA allocator defragmentation watchdog.
 
-    Fragmentation is measured as (reserved - allocated) / total. When the PyTorch
-    caching allocator holds much more memory than is actually in use, NCCL and
-    other non-PyTorch CUDA allocations (cudaMalloc) can fail with OOM even though
-    the allocator could release the memory.
-
-    Enable via environment variables:
-        CUDA_MEM_WATCHDOG=1                  # enable (default: disabled)
-        CUDA_MEM_WATCHDOG_THRESHOLD=0.5      # fragmentation ratio threshold (default: 0.5)
-        CUDA_MEM_WATCHDOG_MIN_FREE_MB=2048   # or trigger when physical free < this (default: 2048)
-
-    Usage:
-        watchdog = CudaMemoryWatchdog.from_env()  # reads env vars
-        # In training loop:
-        watchdog.step()  # checks and defragments if needed
+    Enabled with ``CUDA_MEM_WATCHDOG=1``. ``step()`` calls
+    ``torch.cuda.empty_cache()`` when fragmentation or low free memory
+    crosses the configured thresholds.
     """
 
     def __init__(
@@ -283,37 +215,10 @@ def watched_iter(
     check_interval: float = 10,
     on: bool = True,
 ) -> Iterator[T]:
-    """One-liner helper to wrap an iterator with stack dump watchdog.
+    """Wrap an iterable with ``StackDumpWatchdog``.
 
-    This is a convenience function that creates a StackDumpWatchdog and wraps
-    the iterable. The watchdog starts monitoring AFTER the first item is yielded,
-    so initialization overhead (e.g., dataloader prefetching) is not counted.
-
-    Args:
-        iterable: The iterable to watch (e.g., dataloader).
-        timeout: Seconds of inactivity before dumping stack trace. Default: 60.
-        check_interval: How often to check for timeout (seconds). Should be less
-            than timeout for accurate detection. Default: 10.
-        on: Enable/disable the watchdog. When False, zero overhead. Default: True.
-
-    Yields:
-        Items from the wrapped iterable.
-
-    Examples:
-        Basic usage::
-
-            for batch in watched_iter(dataloader, timeout=60):
-                train_step(batch)
-
-        With smaller check interval for faster detection::
-
-            for batch in watched_iter(dataloader, timeout=5, check_interval=1):
-                train_step(batch)
-
-        Disabled (zero overhead)::
-
-            for batch in watched_iter(dataloader, timeout=60, on=False):
-                train_step(batch)
+    Monitoring starts after the first item is yielded so dataloader
+    startup does not count as an inactivity timeout.
     """
     if not on:
         yield from iterable

@@ -50,11 +50,14 @@ def initialize_distributed():
     backend = "nccl"
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend=backend)
-    global_rank = torch.distributed.get_rank()
-    print(
-        f"[Rank {global_rank}] PID={os.getpid()}, Node={os.environ.get('SLURM_NODEID', 'N/A')}, LocalRank={rank}",
-        flush=True,
-    )
+    if os.environ.get("RECSYS_PRINT_RANK_PID", "0") == "1":
+        global_rank = torch.distributed.get_rank()
+        node = os.environ.get("SLURM_NODEID", "N/A")
+        print(
+            f"[Rank {global_rank}] PID={os.getpid()}, Node={node}, "
+            f"LocalRank={rank}",
+            flush=True,
+        )
 
 
 def initialize_model_parallel(tensor_model_parallel_size=1):
@@ -70,7 +73,8 @@ def initialize_model_parallel(tensor_model_parallel_size=1):
 def destroy_global_state():
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
-    # TODO, find the reason why destroying pg hit nccl error when tpsize > 1
+    # Explicit group destruction can trip NCCL teardown when TP spans
+    # more than one rank; let destroy_model_parallel handle that case.
     if parallel_state.model_parallel_is_initialized():
         if parallel_state.get_tensor_model_parallel_world_size() == 1:
             torch.distributed.destroy_process_group(

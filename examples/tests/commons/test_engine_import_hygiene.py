@@ -15,10 +15,9 @@
 
 """Import hygiene guard for the schedulable-pipeline engine package.
 
-Enforces SPEC §5 code-style rule: the engine must not import TorchRec,
-Megatron, FBGEMM-GPU, or repo-local commons.distributed.*. Runs on
-every Python file under engine/ (including tests and examples — the
-whole package stays framework-agnostic).
+The engine must not import TorchRec, Megatron, FBGEMM-GPU, or repo-local
+commons.distributed.*. The check covers every Python file under
+engine/, including tests and examples.
 
 Examples under engine/examples/ may use torch.distributed (which does
 not match any forbidden prefix below), but they must still avoid
@@ -91,5 +90,5 @@ def test_no_forbidden_imports(path: pathlib.Path) -> None:
                     f"{path.relative_to(ENGINE_ROOT)} imports "
                     f"'{imported}' which matches forbidden prefix "
                     f"'{prefix}'. Engine must stay framework-agnostic "
-                    f"(SPEC §5 code style)."
+                    f"at the core package boundary."
                 )
