@@ -204,6 +204,19 @@ def test_cuda_mem_watchdog_task_is_env_gated(monkeypatch) -> None:
     assert "watchdog_step" in names
 
 
+def test_split_ranking_forward_env_adds_embedding_task(monkeypatch) -> None:
+    monkeypatch.setenv("HSTU_SPLIT_RANKING_FORWARD", "1")
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    schedule, pool = pipe._build_schedule()
+    from commons.pipeline.engine.autosched.validator import validate
+
+    validate(schedule, pool)
+    names = [t.name for stage in schedule.stages for t in stage.tasks]
+    assert "ranking_embedding_forward" in names
+    assert names.index("compute_output_dist") < names.index("ranking_embedding_forward")
+    assert names.index("ranking_embedding_forward") < names.index("forward")
+
+
 def test_no_v0_context_references_in_hstu_pipeline() -> None:
     """Executable HSTU adapter code must stay on v1 contexts."""
     import pathlib
@@ -263,7 +276,7 @@ def test_default_thread_map_covers_every_task_name() -> None:
         f"Add them to the map in hstu_pipeline/pipeline.py."
     )
 
-    optional = {"watchdog_step"}
+    optional = {"ranking_embedding_forward", "watchdog_step"}
     extra = set(HSTU_DEFAULT_THREAD_MAP) - task_names
     assert extra <= optional, (
         "HSTU_DEFAULT_THREAD_MAP has unexpected entries for tasks not "

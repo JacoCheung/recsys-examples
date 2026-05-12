@@ -102,22 +102,18 @@ class RankingGR(BaseModel):
     def get_logit_and_labels(
         self, batch: HSTUBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Get the logits and labels for the batch.
+        embeddings = self.forward_embeddings(batch)
+        return self._get_logit_and_labels_after_embeddings(batch, embeddings)
 
-        Args:
-            batch (HSTUBatch): The batch of ranking data.
+    def forward_embeddings(self, batch: HSTUBatch) -> Dict[str, JaggedTensor]:
+        embeddings = self._embedding_collection(batch.features)
+        return self._embedding_collection._maybe_detach(embeddings)
 
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The logits and labels.
-        """
-        # DMP embedding
-        embeddings: Dict[str, JaggedTensor] = self._embedding_collection(batch.features)
-        # maybe freeze embedding for debugging
-        embeddings = self._embedding_collection._maybe_detach(embeddings)
-        # For model-parallel embedding, torchrec does gradient division by (tp_size * dp_size). However, we only need to divide by dp size. In such case, we need to scale the gradient by tp_size.
-        # But simultaneously, the DP embedding might be scaled by tp_size unintentionally. On the other hand, the DDP will divide the DP embedding gradient by dp_size (allreduce avg).
-        # We need to perform allreduce sum across tp ranks after/before the DDP allreduce avg.
+    def _get_logit_and_labels_after_embeddings(
+        self,
+        batch: HSTUBatch,
+        embeddings: Dict[str, JaggedTensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         grad_scaling_factor = self._tp_size
         embeddings = jt_dict_grad_scaling_and_allgather(
             embeddings,
@@ -134,6 +130,24 @@ class RankingGR(BaseModel):
         logits = self._mlp(hidden_states)
         return logits, seqlen_after_preprocessor, batch.labels.values()
 
+    def forward_after_embeddings(
+        self,
+        batch: HSTUBatch,
+        embeddings: Dict[str, JaggedTensor],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]:
+        (
+            jagged_item_logit,
+            seqlen_after_preprocessor,
+            labels,
+        ) = self._get_logit_and_labels_after_embeddings(batch, embeddings)
+        losses = self._loss_module(jagged_item_logit.float(), labels)
+        return losses, (
+            losses.detach(),
+            jagged_item_logit.detach(),
+            labels.detach(),
+            seqlen_after_preprocessor,
+        )
+
     def forward(  # type: ignore[override]
         self,
         batch: HSTUBatch,
@@ -147,15 +161,5 @@ class RankingGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]: The losses and a tuple of losses, logits, and labels.
         """
-        (
-            jagged_item_logit,
-            seqlen_after_preprocessor,
-            labels,
-        ) = self.get_logit_and_labels(batch)
-        losses = self._loss_module(jagged_item_logit.float(), labels)
-        return losses, (
-            losses.detach(),
-            jagged_item_logit.detach(),
-            labels.detach(),
-            seqlen_after_preprocessor,  # used to compute achieved flops/s
-        )
+        embeddings = self.forward_embeddings(batch)
+        return self.forward_after_embeddings(batch, embeddings)
