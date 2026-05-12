@@ -189,6 +189,62 @@ HSTU_THREAD_MAP_PRESETS: dict = {
     },
 }
 
+_NONCRITICAL_TASKS = (
+    "h2d",
+    "start_shuffle",
+    "finish_shuffle",
+    "start_input_dist",
+    "wait_input_dist",
+    "prefetch_embeddings",
+)
+
+
+def _parse_gate_names(raw: str) -> tuple:
+    value = raw.strip()
+    if not value or value.lower() in {"none", "off", "0", "-"}:
+        return ()
+    return tuple(part.strip() for part in value.split("+") if part.strip())
+
+
+def _resolve_noncritical_gates(default_gate: str = "forward") -> Dict[str, tuple]:
+    """Resolve per-task same-progress gates for HSTU lookahead work.
+
+    Benchmark sweeps can set:
+      HSTU_NONCRITICAL_GATE_DEFAULT=compute_output_dist
+      HSTU_NONCRITICAL_GATES=h2d=global_tokens_allreduce^prefetch_embeddings=forward
+
+    A value of ``none`` clears the gate for that task. Multiple producer
+    names can be joined with ``+`` when an experiment needs it. Both ``,``
+    and ``^`` are accepted between task entries; benchmark scripts use ``^``
+    because Slurm's ``--export`` also uses commas.
+    """
+
+    default = os.environ.get("HSTU_NONCRITICAL_GATE_DEFAULT", "").strip()
+    if not default:
+        default = default_gate
+    gates = {task: _parse_gate_names(default) for task in _NONCRITICAL_TASKS}
+
+    spec = os.environ.get("HSTU_NONCRITICAL_GATES", "").strip()
+    if not spec:
+        return gates
+
+    for item in spec.replace("^", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"HSTU_NONCRITICAL_GATES entries must be task=gate, got {item!r}"
+            )
+        task_name, gate_value = (part.strip() for part in item.split("=", 1))
+        if task_name not in gates:
+            raise ValueError(
+                f"Unknown non-critical HSTU task {task_name!r} in "
+                f"HSTU_NONCRITICAL_GATES. Known: {sorted(gates)}"
+            )
+        gates[task_name] = _parse_gate_names(gate_value)
+    return gates
+
 
 def resolve_hstu_thread_map_variant(name: Optional[str]) -> Any:
     """Resolve a named variant from ``HSTU_THREAD_MAP_PRESETS``.
@@ -383,34 +439,34 @@ class HSTUPipeline:
                     "prefetch_embeddings", prefetch_lookahead
                 )
 
-        # Gate lookahead work behind compute_output_dist so the current
-        # critical chain submits before future-batch IO/NCCL.
-        critical_gate: tuple = ("compute_output_dist",)
+        # Default gate keeps lookahead work behind the dense forward
+        # tail. Benchmark sweeps may override per non-critical task.
+        gates = _resolve_noncritical_gates(default_gate="forward")
         tasks = [
             make_h2d_task(
                 self._state,
                 lookahead=h2d_lookahead,
-                same_progress_sync=critical_gate,
+                same_progress_sync=gates["h2d"],
             ),
             make_start_shuffle_task(
                 self._state,
                 lookahead=start_shuffle_lookahead,
-                same_progress_sync=critical_gate,
+                same_progress_sync=gates["start_shuffle"],
             ),
             make_finish_shuffle_task(
                 self._state,
                 lookahead=finish_shuffle_lookahead,
-                same_progress_sync=critical_gate,
+                same_progress_sync=gates["finish_shuffle"],
             ),
             make_start_input_dist_task(
                 self._state,
                 lookahead=start_input_dist_lookahead,
-                same_progress_sync=critical_gate,
+                same_progress_sync=gates["start_input_dist"],
             ),
             make_wait_input_dist_task(
                 self._state,
                 lookahead=wait_input_dist_lookahead,
-                same_progress_sync=critical_gate,
+                same_progress_sync=gates["wait_input_dist"],
             ),
         ]
         # Keep prefetch after forward in declaration order: forward
@@ -428,7 +484,7 @@ class HSTUPipeline:
                 make_prefetch_task(
                     self._state,
                     lookahead=prefetch_lookahead,
-                    same_progress_sync=critical_gate,
+                    same_progress_sync=gates["prefetch_embeddings"],
                 )
             )
         # compute_output_dist produces awaitables consumed by forward.
