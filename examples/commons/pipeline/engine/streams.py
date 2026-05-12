@@ -30,30 +30,9 @@ import torch
 class StreamPool:
     """Named stream registry.
 
-    A mapping from stream-slot name (e.g. `"default"`, `"memcpy"`) to
-    either a concrete `torch.cuda.Stream` or `None`.
-
-    **Two different semantics for `None`:**
-
-    - `get(name)` returns the raw slot value — `None` stays `None`.
-      This is the storage-layer access and preserves the user's
-      explicit intent (e.g. "I passed `device=cpu`, so `default` is
-      `None`").
-
-    - `use(name)` is the runtime context. On a CUDA host (any
-      concrete stream or CUDA available), `None` is resolved to
-      `default_stream(anchor_device)` so the task body runs on a
-      stream the pool *declared* (the anchor-device default) rather
-      than on whatever ambient stream happens to be current from an
-      outer `torch.cuda.stream(...)` context. Without this, stream
-      assignments would silently leak across tasks or from unrelated
-      outer contexts, breaking the user's declared stream inventory.
-
-    On pure-CPU hosts (no CUDA), both paths keep `None` as-is;
-    `torch.cuda.stream(None)` is a safe no-op.
-
-    Used for name→stream lookup. Multi-stream pools support
-    auto-inferred `wait_stream` edges.
+    ``get(name)`` returns the raw registered value. ``use(name)`` is the
+    runtime context and resolves ``None`` to the anchor device's default
+    CUDA stream when CUDA is available.
     """
 
     def __init__(self, streams: Mapping[str, Optional[torch.cuda.Stream]]) -> None:
@@ -101,21 +80,7 @@ class StreamPool:
 
     @contextmanager
     def use(self, name: str) -> Iterator[None]:
-        """Context manager that sets the named stream as current.
-
-        On CUDA: when the slot holds `None` we enter
-        `default_stream(anchor_device)` instead of a no-op context.
-        This guarantees the task body runs on a stream the
-        StreamPool *declared* (the anchor-device default), not on
-        whatever ambient stream was set by some outer
-        `torch.cuda.stream(...)` context. Without this resolution,
-        stream assignments could silently leak across tasks or from
-        unrelated outer contexts, breaking the user's declared
-        stream inventory.
-
-        On pure-CPU hosts (`anchor_device is None`): truly a no-op,
-        matching the `None` sentinel's meaning when no CUDA exists.
-        """
+        """Set the named stream as current for the task body."""
         stream = self.get(name)
         if stream is None and self._anchor_device is not None:
             stream = torch.cuda.default_stream(self._anchor_device)

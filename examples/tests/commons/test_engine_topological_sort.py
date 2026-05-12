@@ -143,10 +143,7 @@ def test_topo_cross_lookahead_depends_on_no_edge() -> None:
 
 def test_topo_cross_iter_depends_on_no_edge() -> None:
     """``cross_iter_depends_on`` is a different-batch dep — does NOT
-    participate in the within-progress DAG. Mirror of the
-    cross-lookahead-depends_on test: cross_iter declarations don't add
-    edges, so a configuration that would otherwise cycle stays
-    acyclic."""
+    participate in the within-progress DAG."""
     # cons (la=2) cross_iter_depends_on prod (la=2, -1). If an edge
     # were added it would still be acyclic in isolation, but adding a
     # slot edge that goes the OTHER direction would cycle. Use the
@@ -161,7 +158,6 @@ def test_topo_cross_iter_depends_on_no_edge() -> None:
     )
     b = Task.from_fn(name="b", fn=_noop, lookahead=2, stream="default")
     sorted_tasks = topological_sort(_schedule(a, b))
-    # No within-progress edge → declaration order preserved.
     assert _names(sorted_tasks) == ["a", "b"]
 
 

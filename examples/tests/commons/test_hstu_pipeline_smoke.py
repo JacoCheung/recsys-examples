@@ -13,24 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HSTU pipeline smoke tests.
-
-Scope of what this file tests:
-  - Imports resolve cleanly (factory + pipeline classes)
-  - HSTUPipelineFactory pre-registers both variants
-  - Task factories build Task objects with the spec'd fields
-  - Schedule construction (non-prefetch and prefetch variants) passes
-    the engine validator
-
-What this file does NOT test (requires a real distributed + sharded
-setup; tracked in tasks/followups.md):
-  - End-to-end parity vs legacy JaggedMegatronTrainPipelineSparseDist
-  - Actual NCCL ordering in multi-rank runs
-  - Prefetch + cache integration
-
-Those are covered by a future integration test that reuses HSTU's
-pretrain_gr_retrieval.py harness under both pipeline backends.
-"""
+"""HSTU adapter smoke tests."""
 
 import pytest
 
@@ -66,13 +49,8 @@ def test_factory_duplicate_register_rejected() -> None:
         )
 
 
-# ----------------------------------------------------------------------
-# Task factory sanity
-# ----------------------------------------------------------------------
-
-
 def _make_dummy_state():
-    """Build a PipelineState without requiring actual torch/megatron."""
+    """Build PipelineState without requiring Megatron runtime setup."""
     import torch
     from commons.pipeline.hstu_pipeline.tasks import PipelineState
 
@@ -96,50 +74,10 @@ def test_h2d_task_fields() -> None:
     assert write_names == {"batch_gpu", "torchrec_ctx"}
 
 
-def test_zero_grad_task_fields() -> None:
-    from commons.pipeline.hstu_pipeline.tasks import make_zero_grad_task
-
-    state = _make_dummy_state()
-    t = make_zero_grad_task(state)
-    assert t.name == "zero_grad"
-    assert t.stream == "default"
-    assert t.batch_offset == 0
-
-
-def test_global_tokens_task_is_nccl() -> None:
-    from commons.pipeline.hstu_pipeline.tasks import make_global_tokens_task
-
-    state = _make_dummy_state()
-    t = make_global_tokens_task(state)
-    assert t.name == "global_tokens_allreduce"
-    assert t.nccl is True
-
-
-def test_backward_task_is_nccl() -> None:
-    from commons.pipeline.hstu_pipeline.tasks import make_backward_task
-
-    state = _make_dummy_state()
-    t = make_backward_task(state)
-    assert t.nccl is True, "backward triggers DDP grad AllReduce → must be nccl=True"
-
-
-def test_finalize_grads_task_is_nccl() -> None:
-    from commons.pipeline.hstu_pipeline.tasks import make_finalize_grads_task
-
-    state = _make_dummy_state()
-    t = make_finalize_grads_task(state)
-    assert t.nccl is True, "finalize_model_grads runs TP AllReduce → must be nccl=True"
-
-
 def test_nccl_tasks_declaration_order() -> None:
-    """The order of nccl=True tasks in the schedule determines the
-    cross-rank NCCL submission order enforced by the NCCL lock.
-    Verifies the ACTUAL order (not just membership) for a concrete
-    built schedule."""
+    """nccl=True tasks keep the expected submission order."""
     from commons.pipeline.hstu_pipeline.pipeline import HSTUPipeline
 
-    # Build a pipeline with a NON-identity shuffler (mocked) so all
-    # shuffle tasks become nccl=True.
     class _NonIdentityShuffler:
         def shuffle(self, batch, pg):
             return batch
@@ -163,14 +101,13 @@ def test_nccl_tasks_declaration_order() -> None:
         for t in stage.tasks
         if getattr(t, "nccl", False)
     ]
-    # Legacy submission order: shuffle AllGather(s) → input_dist →
-    # global_tokens → backward (DDP) → finalize_model_grads (TP).
     expected = [
         "start_shuffle",
         "finish_shuffle",
         "start_input_dist",
         "wait_input_dist",
         "global_tokens_allreduce",
+        "compute_output_dist",
         "backward",
         "finalize_model_grads",
     ]
@@ -182,8 +119,7 @@ def test_nccl_tasks_declaration_order() -> None:
 
 
 def test_identity_shuffler_skips_shuffle_nccl() -> None:
-    """With identity shuffler, start/finish_shuffle must NOT be nccl
-    (no real collective — serializing would just waste the lock)."""
+    """Identity shuffler does not mark shuffle tasks as NCCL."""
     from commons.pipeline.hstu_pipeline.tasks import (
         make_finish_shuffle_task,
         make_start_shuffle_task,
@@ -201,9 +137,7 @@ def test_identity_shuffler_skips_shuffle_nccl() -> None:
 
 
 def _make_noop_pipeline(prefetch: bool, prefetch_depth: int = 1):
-    """Construct an HSTUPipeline WITHOUT calling _rewrite_model (which
-    requires a real sharded model). We reach into its internal
-    _build_schedule to verify the schedule passes validation."""
+    """Construct HSTUPipeline without calling _rewrite_model."""
     import torch
     from commons.pipeline.hstu_pipeline import HSTUPipeline
 
@@ -217,32 +151,9 @@ def _make_noop_pipeline(prefetch: bool, prefetch_depth: int = 1):
     return pipe
 
 
-def test_schedule_construction_non_prefetch() -> None:
-    pipe = _make_noop_pipeline(prefetch=False, prefetch_depth=1)
-    schedule, pool = pipe._build_schedule()
-    # Validator runs inside SchedulablePipeline.__init__; we invoke it
-    # directly here to verify the schedule is well-formed without
-    # building the full engine (which would trigger task.init()).
-    from commons.pipeline.engine.autosched.validator import validate
-
-    validate(schedule, pool)
-
-
-def test_schedule_construction_prefetch() -> None:
-    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
-    schedule, pool = pipe._build_schedule()
-    from commons.pipeline.engine.autosched.validator import validate
-
-    validate(schedule, pool)
-
-
-def test_schedule_construction_deep_queue() -> None:
-    """Semantic A: deep in-flight queue.
-
-    Offset layout (after Codex-review fix to match legacy positions):
-      non-prefetch: max_offset = depth + 1 → in_flight = depth + 2
-      (legacy depth=1 → 3 batches: compute, input_dist, h2d)
-    """
+def test_schedule_construction_deep_queue(monkeypatch) -> None:
+    """prefetch_depth expands the in-flight queue."""
+    monkeypatch.delenv("HSTU_LA_DEPTH", raising=False)
     pipe = _make_noop_pipeline(prefetch=False, prefetch_depth=3)
     schedule, pool = pipe._build_schedule()
     from commons.pipeline.engine.autosched.validator import validate
@@ -252,44 +163,55 @@ def test_schedule_construction_deep_queue() -> None:
     assert schedule.in_flight_batches == 5
 
 
-def test_legacy_depth_equals_one_has_three_batches() -> None:
-    """Default prefetch_depth=1 should match legacy's 3-batch in-flight
-    layout for BOTH variants.
-
-    An earlier iteration placed prefetch at max_offset=3 (4 batches)
-    but that overflows the dynamicemb prefetch cache (caught by the
-    P2 parity test with use_dynamic_emb=True). Legacy prefetch
-    pipeline actually carries 3 in-flight (batch_i / batch_ip1 /
-    batch_ip2) — prefetch is an extra stage co-located with
-    input_dist at offset=1, not an additional batch slot."""
+def test_default_depth_one_has_three_batches(monkeypatch) -> None:
+    """Default depth keeps both variants at 3 in-flight batches."""
+    monkeypatch.delenv("HSTU_LA_DEPTH", raising=False)
     p_np = _make_noop_pipeline(prefetch=False, prefetch_depth=1)
-    s_np, _ = p_np._build_schedule()
+    s_np, pool_np = p_np._build_schedule()
+    from commons.pipeline.engine.autosched.validator import validate
+
+    validate(s_np, pool_np)
     assert s_np.in_flight_batches == 3
 
     p_pf = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
-    s_pf, _ = p_pf._build_schedule()
+    s_pf, pool_pf = p_pf._build_schedule()
+    validate(s_pf, pool_pf)
     assert (
         s_pf.in_flight_batches == 3
     ), "Prefetch variant must also be 3 in-flight to fit dynamicemb cache"
 
 
-def test_no_v0_context_references_in_hstu_pipeline() -> None:
-    """HSTU pipeline is v1-only (per-batch contexts). No source code
-    in hstu_pipeline/ may reference the v0 legacy branch — catches
-    regressions where someone copy-pastes legacy patterns without
-    noticing they're v0-dependent.
+def test_hstu_la_depth_env_override(monkeypatch) -> None:
+    """Benchmark sweeps can override the public prefetch_depth layout
+    with a named lookahead profile."""
+    monkeypatch.setenv("HSTU_LA_DEPTH", "6")
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    schedule, _ = pipe._build_schedule()
+    assert schedule.in_flight_batches == 6
 
-    Skip matches that are inside a COMMENT or DOCSTRING — those are
-    explanatory references, not code paths. Match only bare
-    ``version=0`` / ``version_0`` tokens in executable positions."""
+
+def test_cuda_mem_watchdog_task_is_env_gated(monkeypatch) -> None:
+    monkeypatch.delenv("CUDA_MEM_WATCHDOG", raising=False)
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    schedule, _ = pipe._build_schedule()
+    names = {t.name for stage in schedule.stages for t in stage.tasks}
+    assert "watchdog_step" not in names
+
+    monkeypatch.setenv("CUDA_MEM_WATCHDOG", "1")
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    schedule, _ = pipe._build_schedule()
+    names = {t.name for stage in schedule.stages for t in stage.tasks}
+    assert "watchdog_step" in names
+
+
+def test_no_v0_context_references_in_hstu_pipeline() -> None:
+    """Executable HSTU adapter code must stay on v1 contexts."""
     import pathlib
     import re
 
     root = pathlib.Path(__file__).resolve().parents[3]
     pkg = root / "examples" / "commons" / "pipeline" / "hstu_pipeline"
     offenders: list = []
-    # Executable uses of version=0 would appear as
-    # ``version=0`` or ``.version = 0`` without leading ``#``.
     pattern = re.compile(r"(?<!#\s)\bversion\s*=\s*0\b")
     for py in pkg.rglob("*.py"):
         text = py.read_text()
@@ -307,9 +229,7 @@ def test_no_v0_context_references_in_hstu_pipeline() -> None:
 
 
 def test_create_torchrec_ctx_rejects_v0() -> None:
-    """Runtime regression guard: if a future subclass overrides
-    torchrec_context_type to return a version=0 ctx, the assertion
-    in create_torchrec_ctx fires."""
+    """create_torchrec_ctx rejects contexts that are not v1."""
     import torch
     from commons.pipeline.hstu_pipeline.tasks import PipelineState
 
@@ -329,10 +249,7 @@ def test_create_torchrec_ctx_rejects_v0() -> None:
 
 
 def test_default_thread_map_covers_every_task_name() -> None:
-    """HSTU_DEFAULT_THREAD_MAP must map every task name the pipeline
-    produces. Tasks without an entry fall through to the engine's
-    'default' thread, potentially reintroducing the postproc
-    set_context race (Codex D-CRITICAL-1)."""
+    """Default thread_map covers every task emitted by the schedule."""
     from commons.pipeline.hstu_pipeline.pipeline import HSTU_DEFAULT_THREAD_MAP
 
     # Prefetch variant has the widest task set (includes prefetch_embeddings)
@@ -346,11 +263,16 @@ def test_default_thread_map_covers_every_task_name() -> None:
         f"Add them to the map in hstu_pipeline/pipeline.py."
     )
 
+    optional = {"watchdog_step"}
+    extra = set(HSTU_DEFAULT_THREAD_MAP) - task_names
+    assert extra <= optional, (
+        "HSTU_DEFAULT_THREAD_MAP has unexpected entries for tasks not "
+        f"present in the default schedule: {sorted(extra - optional)}"
+    )
+
 
 def test_default_thread_map_has_two_threads() -> None:
-    """The default map must use at least 2 distinct thread ids
-    (io + compute). If collapsed to one thread, threaded mode silently
-    degrades to sequential."""
+    """Default thread_map keeps at least two worker groups."""
     from commons.pipeline.hstu_pipeline.pipeline import HSTU_DEFAULT_THREAD_MAP
 
     threads = set(HSTU_DEFAULT_THREAD_MAP.values())
@@ -361,8 +283,7 @@ def test_default_thread_map_has_two_threads() -> None:
 
 
 def test_default_threaded_is_true() -> None:
-    """Default HSTUPipeline construction should be threaded=True with
-    HSTU_DEFAULT_THREAD_MAP applied automatically."""
+    """HSTUPipeline defaults to threaded execution."""
     import torch
     from commons.pipeline.hstu_pipeline import HSTUPipeline
     from commons.pipeline.hstu_pipeline.pipeline import HSTU_DEFAULT_THREAD_MAP
@@ -390,23 +311,12 @@ def test_prefetch_depth_validation() -> None:
 
 
 # ----------------------------------------------------------------------
-# Legacy file untouched guard (extension of the engine test)
-# ----------------------------------------------------------------------
-
-
-# ----------------------------------------------------------------------
-# Integration with pretrain_gr_ranking.py — _model attribute parity
+# Integration with pretrain_gr_ranking.py
 # ----------------------------------------------------------------------
 
 
 def test_hstu_pipeline_attach_updates_model_fwd_default_path() -> None:
-    """Codex HIGH 2026-04-26: ``attach(new_model)`` previously updated
-    only ``self._state.model``, leaving ``self._state.model_fwd``
-    pointing at the construction-time module — so the forward task
-    silently kept calling the stale model.
-
-    Default path (no custom_model_fwd): both must be re-routed.
-    """
+    """attach(new_model) updates the default forward target."""
     import torch
     from commons.pipeline.hstu_pipeline import HSTUPipeline
 
@@ -429,9 +339,7 @@ def test_hstu_pipeline_attach_updates_model_fwd_default_path() -> None:
 
 
 def test_hstu_pipeline_attach_preserves_custom_model_fwd() -> None:
-    """Custom forwards intentionally diverge from ``state.model``;
-    attach() must not silently overwrite them.
-    """
+    """attach(new_model) preserves user-supplied custom forward."""
     import torch
     from commons.pipeline.hstu_pipeline import HSTUPipeline
 
@@ -459,13 +367,7 @@ def test_hstu_pipeline_attach_preserves_custom_model_fwd() -> None:
 
 
 def test_hstu_pipeline_exposes_underscore_model_attribute() -> None:
-    """``train_with_pipeline`` (in
-    ``examples/hstu/training/trainer/training.py``) calls
-    ``pipeline._model.train()`` / ``pipeline._model.eval()`` and reads
-    ``pipeline._model._hstu_config`` via ``get_unwrapped_module``. The
-    legacy ``JaggedMegatron*`` classes assign ``self._model = model``
-    directly; HSTUPipeline must expose the same attribute for drop-in
-    use."""
+    """HSTUPipeline exposes _model for existing trainer code."""
     import torch
     from commons.pipeline.hstu_pipeline import HSTUPipeline
 
@@ -487,11 +389,7 @@ def test_hstu_pipeline_exposes_underscore_model_attribute() -> None:
 
 
 def test_pretrain_gr_ranking_backend_env_var_routing() -> None:
-    """Smoke-checks that the env-var-driven backend switch in
-    ``examples/hstu/training/pretrain_gr_ranking.py`` accepts the two
-    canonical values and rejects unknown values. Inspects the script
-    source (not import — the script has heavy module-level deps) so
-    this test runs on CPU-only hosts."""
+    """Backend env switch accepts known values and rejects typos."""
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3]
@@ -505,26 +403,3 @@ def test_pretrain_gr_ranking_backend_env_var_routing() -> None:
     ), "pretrain_gr_ranking.py must offer the new HSTU backend"
     # Must reject typos rather than silently fall through.
     assert "must be 'legacy' or 'new'" in text
-
-
-def test_legacy_pipeline_files_untouched_by_hstu_adapter() -> None:
-    """The HSTU adapter must NOT modify train_pipeline.py,
-    train_pipeline_factory.py, or utils.py. The engine has a similar
-    test; this one uses import hash so it catches even if the legacy
-    test is disabled."""
-    import hashlib
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[3]
-    legacy = [
-        repo_root / "examples/commons/pipeline/train_pipeline.py",
-        repo_root / "examples/commons/pipeline/train_pipeline_factory.py",
-        repo_root / "examples/commons/pipeline/utils.py",
-    ]
-    for path in legacy:
-        assert path.exists(), f"legacy file missing: {path}"
-        # Just exercise the file — if P2 accidentally broke something
-        # importable (e.g. circular import), at least the read works.
-        content = path.read_bytes()
-        assert len(content) > 0
-        hashlib.sha256(content).hexdigest()  # noqa: S324

@@ -196,8 +196,7 @@ def _make_optimizer_task(
     stream: str = "default",
 ) -> Task:
     """Runs `optimizer_step_fn()` (defaults to `optimizer.step`).
-    `depends_on=('backward',)` encodes the pure-ordering edge (SPEC
-    §4.2 rule 6)."""
+    `depends_on=('backward',)` encodes the pure-ordering edge."""
 
     _step_fn = optimizer_step_fn if optimizer_step_fn is not None else optimizer.step
 

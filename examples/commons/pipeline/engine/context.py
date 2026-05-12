@@ -242,7 +242,7 @@ class TaskContext(Generic[In]):
         return self._stream_pool
 
     # ------------------------------------------------------------------
-    # Explicit Event escape hatch (see tasks/followups.md)
+    # Explicit Event escape hatch
     # ------------------------------------------------------------------
     #
     # Most cross-stream sync is auto-inferred by the engine from the

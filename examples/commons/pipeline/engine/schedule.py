@@ -19,9 +19,8 @@
 A `Schedule` is a tuple of `Stage`s plus a declared stream inventory.
 Each `Stage` groups Tasks that share a dependency frontier for
 visual/organizational purposes; cross-stream waits are inserted by the
-engine from slot/`depends_on` edges regardless of stage boundaries
-(SPEC §4.2). `in_flight_batches` is a derived property — never
-authored.
+engine from slot/`depends_on` edges. `in_flight_batches` is a derived
+property — never authored.
 """
 
 from dataclasses import dataclass
@@ -59,7 +58,7 @@ class Schedule:
             tasks. Validator enforces.
 
     `in_flight_batches` is computed from `max(task.batch_offset) + 1`
-    across all tasks (SPEC §4.2 rule 4). Never authored.
+    across all tasks. Never authored.
     """
 
     stages: Tuple[Stage, ...]
@@ -84,7 +83,7 @@ class Schedule:
 
     @property
     def in_flight_batches(self) -> int:
-        """Derived from task batch_offsets (SPEC §4.2 rule 4)."""
+        """Derived from task batch_offsets."""
         offsets = [task.batch_offset for stage in self.stages for task in stage.tasks]
         return max(offsets, default=0) + 1
 

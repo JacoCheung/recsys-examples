@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""V9 — `CostModel` + `CostProfiler` unit tests (SPEC §4.3)."""
+"""CostModel and CostProfiler tests."""
 
 import pathlib
 
@@ -58,9 +58,7 @@ def test_cost_model_get_unknown_task_raises() -> None:
 
 
 def test_cost_profiler_gathers_task_timings() -> None:
-    """End-to-end: build a pipe, run the profiler for 3 steps, dump
-    JSON, reload. Every task in the pipe must appear in the cost
-    model with positive cpu_us."""
+    """Profiler records positive CPU time for every preset task."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(0)
     model = torch.nn.Linear(4, 2).to(device)
@@ -91,8 +89,7 @@ def test_cost_profiler_gathers_task_timings() -> None:
 
 
 def test_cost_profiler_reset_clears_aggregates() -> None:
-    """`reset()` should clear prior data so subsequent `run()`s don't
-    accumulate."""
+    """reset() clears prior measurements."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(0)
     model = torch.nn.Linear(4, 2).to(device)

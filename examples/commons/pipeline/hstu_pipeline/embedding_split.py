@@ -13,42 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HSTU-specific extensions for splitting embedding
-``compute_and_output_dist`` out of the forward task into its own
-engine task.
+"""HSTU embedding-output distribution helpers.
 
-Background
-----------
-TorchRec's ``PipelinedForward.__call__`` (and ``PrefetchPipelinedForward``)
-calls ``module.compute_and_output_dist(ctx, data)`` inline. That call
-does the local embedding lookup PLUS a cross-rank ``all_to_all`` (NCCL)
-for the output dist. Inline-in-forward means the NCCL collective ends
-up serialized on the default stream during ``forward``, even though
-the a2a is logically independent of the dense compute that follows.
-
-Split design
-------------
-This module factors the compute_and_output_dist call into a separate
-engine task whose body runs on the ``data_dist`` stream. The plumbing:
-
-  * ``HSTUTrainPipelineContext`` — context type carrying both the
-    PrefetchTrainPipelineContext fields (so the prefetch path keeps
-    working) AND ``embedding_a2a_requests`` (the awaitable returned
-    by ``compute_and_output_dist``, queued by the new task and consumed
-    by the forward task).
-
-  * ``HSTUPipelinedForward`` — drop-in replacement for both
-    ``PipelinedForward`` and ``PrefetchPipelinedForward``. ``__call__``
-    only reads the pre-populated awaitable and returns it. NO NCCL is
-    submitted from inside forward anymore.
-
-  * ``_compute_and_output_dist_for_module`` — helper consumed by the
-    engine's ``compute_output_dist`` task to populate
-    ``embedding_a2a_requests`` for each pipelined module. Branches on
-    whether the prefetch task ran (data + ctx come from the
-    ``module_input_post_prefetch`` / ``module_contexts_post_prefetch``
-    dicts) or not (data from ``input_dist_tensors_requests.wait()``,
-    ctx from ``module_contexts``).
+The engine runs ``compute_and_output_dist`` as a task before forward.
+Forward wrappers in this module then consume the pre-populated awaitable
+from the per-batch TorchRec context.
 """
 
 from dataclasses import dataclass, field
@@ -111,10 +80,7 @@ class _HSTUPipelinedForwardMixin:
             f"have run before this forward call."
         )
         awaitable = self._context.embedding_a2a_requests.pop(self._name)
-        # Mirror stock wrapper stream sync: ensure default stream
-        # waits for the producer stream where output a2a NCCL was
-        # submitted (no-op when self._stream IS the default stream,
-        # which is the post-2026-05-08 layout).
+        # Preserve the stock wrapper's producer-stream wait.
         if self._stream is not None:
             torch.get_device_module(self._device).current_stream().wait_stream(
                 self._stream
@@ -171,17 +137,21 @@ def _compute_and_output_dist_for_module(
     """
     name = module.forward.name
     if is_prefetch:
-        if name not in context.module_input_post_prefetch:
+        if (
+            name not in context.module_input_post_prefetch
+            or name not in context.module_contexts_post_prefetch
+        ):
             return
         data = context.module_input_post_prefetch.pop(name)
         ctx = context.module_contexts_post_prefetch.pop(name)
     else:
-        if name not in context.input_dist_tensors_requests:
+        if (
+            name not in context.input_dist_tensors_requests
+            or name not in context.module_contexts
+        ):
             return
         request = context.input_dist_tensors_requests.pop(name)
         data = request.wait()
-        if name not in context.module_contexts:
-            return
         ctx = context.module_contexts.pop(name)
 
     awaitable = module.compute_and_output_dist(ctx, data)
