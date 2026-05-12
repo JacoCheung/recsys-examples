@@ -13,12 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Independent factory for HSTUPipeline variants.
-
-Kept separate from the legacy ``TrainPipelineFactory`` so that the
-legacy file stays byte-identical. HSTU training scripts opt in via
-env var or a CLI flag — they import this factory directly.
-"""
+"""Factory registry for HSTUPipeline variants."""
 
 from __future__ import annotations
 

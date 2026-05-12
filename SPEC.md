@@ -22,7 +22,7 @@
 > HugeCTR's `Pipeline` / `Scheduleable` abstractions
 > (`HugeCTR/include/pipeline.hpp`,
 > `HugeCTR/src/pybind/model_pipeline.cpp`). We take its core ideas:
-> task = callable with named-stream + priority, `init()`/`run()` split,
+> task = callable with a named stream, `init()`/`run()` split,
 > event-based dependencies as an escape hatch. We add on top:
 > (a) auto-inferred cross-stream deps from slot-level reader/writer edges
 > (so users don't write `record_done` / `wait_event` for the common case),
@@ -192,15 +192,13 @@ examples/tests/commons/
 ### 4.1 Task
 
 Modeled on HugeCTR's `Scheduleable` + `StreamContextScheduleable`: a
-callable workload with a named stream, priority, optional event deps,
-and an `init()`/`run()` split.
+callable workload with a named stream, optional event deps, and an
+`init()`/`run()` split.
 
 ```python
 class Task:
     name: str
     stream: str = "default"             # named stream slot; resolved by StreamPool
-    priority: int = 0                   # CUDA stream priority (like HugeCTR's)
-    absolute_stream: bool = False       # True ≈ HugeCTR's set_absolute_stream
     batch_offset: int = 0               # 0 = current batch, 1 = next, …
     reads: tuple[DataSlot, ...] = ()
     writes: tuple[DataSlot, ...] = ()
@@ -248,9 +246,9 @@ class Schedule:
                     for t in stage.tasks), default=0) + 1
 ```
 
-A `ScheduledTask` is a `Task` with a concrete stream binding (the
-auto-scheduler may have overridden the task's preferred stream unless
-`absolute_stream=True`).
+A `ScheduledTask` is a `Task` with a concrete stream binding. The v1
+auto-scheduler preserves each task's declared stream; stream rebinding
+would need a real resource model and is intentionally out of scope.
 
 **Stages and cross-stream waits.** Stages are **organizational** — they
 group tasks for visual clarity and for CPU-side submission order.
@@ -354,8 +352,8 @@ For readers familiar with HugeCTR:
 |---|---|---|
 | `Scheduleable` | `Task` | We add `reads`/`writes`/`batch_offset`. Still has `init()` + `run()`. |
 | `StreamContextScheduleable(lambda)` | `Task.from_fn(name, fn)` | Lambda convenience wrapper. |
-| `set_stream("dp", priority)` | `Task(stream="dp", priority=…)` | Named streams, resolved by `StreamPool`. |
-| `set_absolute_stream(name)` | `Task(stream=name, absolute_stream=True)` | Same semantics. |
+| `set_stream("dp", priority)` | `StreamPool({"dp": torch.cuda.Stream(priority=...)})` + `Task(stream="dp")` | Stream priority belongs to the stream resource, not to each task. |
+| `set_absolute_stream(name)` | `StreamPool({name: existing_stream})` + `Task(stream=name)` | Passing a concrete stream gives the same binding without a task-level flag. |
 | `record_done()` / `wait_event(events)` | Auto-inferred from slot + `depends_on` edges; no explicit events API in v1. | User cost: one less escape hatch. Re-add if a use case forces it. |
 | `GraphScheduleable(list)` | (deferred — no CUDA graph in v1) | Later spec. |
 | `Pipeline::run()` | `SchedulablePipeline.progress(...)` | |

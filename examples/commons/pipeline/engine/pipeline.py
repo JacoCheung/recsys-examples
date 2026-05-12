@@ -13,22 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SchedulablePipeline — the driver that consumes a Schedule + StreamPool.
-
-v1 scope (single-stream, single-batch, no prefill/drain):
+"""SchedulablePipeline: the driver that consumes a Schedule + StreamPool.
 
     pool = StreamPool({"default": None})
     pipe = SchedulablePipeline(schedule, pool)
     for batch in loader:
         result = pipe.progress(iter([batch]))
 
-Returns the value written to the `"step_result"` slot (SPEC §4.4).
-`None` if no task wrote it.
+Returns the value written to the `"step_result"` slot, or `None` if no
+task wrote it.
 
 Also exposes the vanilla-adoption classmethod `SchedulablePipeline.basic(
-model, optimizer)` which wraps a standard training step into a pipeline
-(SPEC §4.7 T1/T2 — ≤8 / ≤15 line diff adoption).
-
+model, optimizer)` which wraps a standard training step into a pipeline.
 """
 
 import contextlib
@@ -88,9 +84,8 @@ class SchedulablePipeline(Generic[In, Out]):
     For every `progress(batch_iter)` call:
       1. Pull one batch from `batch_iter` (raises `StopIteration` if
          exhausted).
-      2. Populate `slots["batch_cpu"]` with the pulled batch
-         (SPEC §4.7 protocol — tasks read from the slot, never call
-         `next()` themselves).
+      2. Populate `slots["batch_cpu"]` with the pulled batch; tasks
+         read from the slot and never call `next()` themselves.
       3. Execute every stage's tasks in declaration order, each under
          its bound stream context.
       4. Return the value in the `"step_result"` slot (or `None`).
@@ -123,8 +118,9 @@ class SchedulablePipeline(Generic[In, Out]):
                 stages=(Stage(tasks=sorted_tasks),),
                 stream_slots=schedule.stream_slots,
             )
-        # else: multi-stage schedules keep their original stage-level
-        # ordering (no current callsites; revisit when one appears).
+        # Multi-stage schedules keep their stage barriers. The validator
+        # rejects any same-progress dependency that would require moving
+        # a producer across those barriers.
 
         self._schedule = schedule
         self._stream_pool = stream_pool
@@ -142,7 +138,7 @@ class SchedulablePipeline(Generic[In, Out]):
                 f"or ThreadedExecutor, got {type(executor).__name__}"
             )
 
-        # Validate the schedule against §4.2 validity rules.
+        # Validate the schedule contract before touching runtime state.
         from .autosched.validator import validate as _validate
 
         _validate(schedule, stream_pool)
@@ -151,39 +147,26 @@ class SchedulablePipeline(Generic[In, Out]):
         self._ctx: TaskContext = TaskContext(self._ring, stream_pool)
         self._max_offset: int = schedule.in_flight_batches - 1
 
-        # Cross-stream wait inference (SPEC §4.2 rule 8, §4.8 deps.py).
-        # Computed once at construction; applied before each task run().
-        # Two views: stream-list (legacy, used as first-iter fallback)
-        # and event-deps (fine-grained, prefers wait_event when the
-        # producer's completion event is on the ring slot).
+        # Cross-stream waits are inferred once and applied before each
+        # task. Event deps are preferred; stream waits are the fallback
+        # during warmup or when a producer event is unavailable.
         self._cross_stream_waits = infer_cross_stream_waits(schedule)
         self._cross_stream_event_deps = infer_cross_stream_event_deps(schedule)
-        # Only producers some cross-stream consumer actually waits on
-        # need ``cudaEventRecord`` after running; the rest skip the
-        # record (same-stream FIFO already orders their work).
+        # Same-stream-only producers do not need completion events.
         self._producers_to_record = producers_with_cross_stream_consumers(schedule)
 
-        # SPEC §4.8 state: iter_count is the internal iteration
+        # Prefill/drain state: iter_count is the internal iteration
         # counter; pulled is the running count of batches pulled from
         # the iterator; exhausted flips True when next() raised.
         self._internal_iter: int = 0
         self._pulled: int = 0
         self._exhausted: bool = False
         self._prefill_done: bool = False
-        # Identity of the iterator currently being driven. When the
-        # caller hands in a new iterator (e.g. switching from the train
-        # loader to the eval loader), ``progress()`` resets the §4.8
-        # state so a fresh prefill kicks in. Mirrors legacy
-        # ``TrainPipeline._next_batch`` iterator-identity check
-        # (train_pipeline.py:418).
+        # Iterator identity marks the boundary between fully drained
+        # dataloaders; switching mid-flight is rejected in ``progress``.
         self._driving_iter: Optional[object] = None
 
-        # Bootstrap counter: how many batches have been seeded via
-        # ``_seed_first_batch`` (pre-populated into ring slots BEFORE
-        # any progress() call). Engine will NOT pull from the
-        # dataloader for the next ``_seeded`` iters — the slot already
-        # has its batch_cpu set and tasks should skip any work that's
-        # already been done externally.
+        # Number of pre-seeded batches the engine should not pull again.
         self._seeded: int = 0
 
         # One-time init hook per task (HugeCTR parity).
@@ -193,37 +176,15 @@ class SchedulablePipeline(Generic[In, Out]):
     # ------------------------------------------------------------------
     # Internal bootstrap pre-population for adapter layers
     # ------------------------------------------------------------------
-    #
-    # Underscore-prefixed: this is an internal hook used by adapter
-    # layers (e.g. HSTUPipeline) that need to run framework-setup
-    # work on a real batch before delegating to the engine. End users
-    # of SchedulablePipeline should NOT call this directly — same
-    # privacy convention as torchrec's _pipeline_model /
-    # _init_pipelined_modules.
 
     def _seed_first_batch(self, slot_contents: dict) -> None:
         """Pre-populate ring.at(max_offset) with the given slot values
-        before the first ``progress()`` call, and mark one batch as
-        pulled.
+        before the first ``progress()`` call.
 
-        The engine will:
-          1. Skip the ``next(batch_iter)`` call for the first iter
-             (per seeded batch — supports multiple seeds if needed).
-          2. Treat the pre-populated slot as a legitimate in-flight
-             batch (it'll advance down to compute naturally).
-
-        Tasks that rely on slot contents being set by earlier pipeline
-        stages (e.g. ``h2d`` sets ``batch_gpu`` from ``batch_cpu``)
-        should be made **idempotent** by checking for prior slot values
-        in their body.
-
-        Parameters
-        ----------
-        slot_contents : dict
-            Values to seed into ``ring.at(max_offset)``'s slot store.
-            Must include ``"batch_cpu"`` to satisfy the §4.8 mask;
-            typically also includes ``batch_gpu``, per-batch context
-            objects, and anything downstream tasks read.
+        Seeded tasks should be idempotent: if the slot already contains
+        their outputs, they should skip the duplicated work. ``batch_cpu``
+        is required because the prefill/drain mask counts seeded batches
+        the same way it counts dataloader pulls.
         """
         if self._pulled > 0 or self._internal_iter > 0:
             raise RuntimeError(
@@ -243,42 +204,20 @@ class SchedulablePipeline(Generic[In, Out]):
         self._seeded += 1
 
     # ------------------------------------------------------------------
-    # SPEC §4.8 prefill/drain mask
+    # Prefill/drain mask
     # ------------------------------------------------------------------
 
     def _should_run(self, task, iter_count: int, pulled: int) -> bool:
-        """SPEC §4.8 mask formula.
-
-        Task with `batch_offset = k` runs at iteration `iter_count`
-        iff `(max_offset - k) ≤ iter_count < M_known + (max_offset - k)`
-        where `M_known = pulled` while pulling is live, `= final M`
-        after StopIteration. Both cases: `pulled` tracks batches
-        loaded into the ring so far.
-        """
+        """Return whether a task's lookahead slot is live this iteration."""
         k = task.batch_offset
         lo = self._max_offset - k
         hi = pulled + (self._max_offset - k)
         return lo <= iter_count < hi
 
     def _run_one_internal_iter(self, batch_iter) -> Optional[object]:
-        """One internal pipeline iteration: pull (maybe) + apply §4.8
-        mask + run qualifying tasks + capture result + advance ring.
-
-        Raises `StopIteration` iff, after the pull attempt, no task's
-        mask can be satisfied now OR in any future iteration — this
-        is the "end" phase of §4.8. Callers that drive this from
-        prefill propagate StopIteration up to the user (which is
-        correct: if M < prefill-count the pipeline ends during
-        prefill, and the first `progress()` call raises).
-        """
+        """Run one internal iteration and advance the ring."""
         with _progress_nvtx_range(self._internal_iter, self._max_offset):
-            # Pull next batch into the furthest-ahead slot if iterator
-            # still has batches. Populates `batch_cpu` at
-            # batch_offset=max_offset per SPEC §4.7 protocol.
-            #
-            # Exception: if `_seed_first_batch` was called, the first
-            # `_seeded` iters skip the pull — the slot is already populated
-            # and `_pulled` has already been bumped.
+            # Pull into the furthest-ahead slot unless it was seeded.
             if self._seeded > 0:
                 self._seeded -= 1
             elif not self._exhausted:
@@ -289,11 +228,8 @@ class SchedulablePipeline(Generic[In, Out]):
                 except StopIteration:
                     self._exhausted = True
 
-            # End check AFTER pull attempt: at this `_internal_iter`,
-            # with this `_pulled` count, can any task's mask still fire?
-            # The k=0 task has the widest window (hi = pulled + max_offset).
-            # So once `_internal_iter >= pulled + max_offset` with the
-            # iterator exhausted, no further useful work is possible.
+            # After exhaustion, stop once even the offset=0 task's
+            # widest mask can no longer fire.
             if (
                 self._exhausted
                 and self._internal_iter >= self._pulled + self._max_offset
@@ -318,47 +254,19 @@ class SchedulablePipeline(Generic[In, Out]):
             # Restore active offset for any external inspection.
             self._ctx._active_offset = 0
 
-            # Capture result (what the offset=0 compute task wrote) BEFORE
-            # advancing the ring — the current slot is about to be evicted.
+            # Capture result before advancing; offset=0 is about to recycle.
             result = self._ring.current().get(self.RETURN_SLOT, None)
             self._ring.advance()
             self._internal_iter += 1
             return result
 
     def progress(self, batch_iter: Iterator) -> Optional[object]:
-        """User-facing driver — SPEC §4.8 contract.
+        """Advance one user-visible iteration.
 
-        M batches in → M results out. Call M+1 raises `StopIteration`.
-        Matches legacy `TrainPipeline.progress(...)`:
-
-            it = iter(dataloader)
-            while True:
-                try:
-                    r = pipe.progress(it)
-                except StopIteration:
-                    break
-                use(r)
-
-        First call absorbs `max_offset` prefill iterations so the
-        user never sees a `None` from an incomplete ring.
-
-        When the caller hands in a different iterator than last time
-        (e.g. train → eval), the §4.8 state is reset so a fresh
-        prefill kicks in on the new iterator. The previous slice must
-        already have drained (i.e. the ``StopIteration`` that ends a
-        slice has been observed) — switching iterators mid-flight
-        would silently discard in-flight batches and is rejected here
-        with a ``RuntimeError``. Mirrors legacy
-        ``TrainPipeline._next_batch`` iterator-change reset
-        (train_pipeline.py:418), with an added drain-required guard
-        (Codex MEDIUM 2026-04-26).
-
-        Concurrency note: ``progress()`` is single-driver only — a
-        single host thread should drive any one ``SchedulablePipeline``.
-        The threaded executor parallelizes tasks **inside** a single
-        ``progress()`` call; concurrent ``progress()`` invocations on
-        the same instance race on ``_driving_iter``, ``_internal_iter``,
-        ``_pulled``, and the ``BatchRing``.
+        The first call performs any needed ring prefill. A new iterator
+        resets pipeline state only after the previous iterator has fully
+        drained. One ``SchedulablePipeline`` should be driven by one host
+        thread at a time.
         """
         if self._driving_iter is not batch_iter:
             # Mid-flight = batches still propagating through deeper
@@ -388,14 +296,7 @@ class SchedulablePipeline(Generic[In, Out]):
             self._pulled = self._seeded
             self._exhausted = False
             self._prefill_done = False
-        # Prefill absorption: first user call runs `max_offset`
-        # internal iterations before returning the first steady
-        # result. Each iter advances the ring so subsequent iters
-        # see the right slot positions. If the dataloader is shorter
-        # than the prefill requires (M < max_offset), the end check
-        # inside `_run_one_internal_iter` raises StopIteration from
-        # within the prefill loop — this propagates correctly: user's
-        # first `progress()` call sees StopIteration (M=0 case).
+        # Absorb the ring prefill before returning the first steady result.
         if not self._prefill_done:
             for _ in range(self._max_offset):
                 self._run_one_internal_iter(batch_iter)
@@ -425,7 +326,7 @@ class SchedulablePipeline(Generic[In, Out]):
         self.shutdown()
 
     # ------------------------------------------------------------------
-    # Preset: vanilla training-step pipeline (SPEC §4.7)
+    # Preset: vanilla training-step pipeline
     # ------------------------------------------------------------------
 
     @classmethod
@@ -465,7 +366,7 @@ class SchedulablePipeline(Generic[In, Out]):
           backward_fn       - custom backward (e.g. scaler.scale(l).backward())
           optimizer_step_fn - clip / scaler.step / scaler.update / scheduler.step
 
-        Adoption bands (SPEC §4.7):
+        Adoption bands:
           - T1 vanilla: `SchedulablePipeline.basic(model, optimizer)` + `pipe.step(batch)` → ≤8-line diff
           - T2 AMP/clip/scheduler via escape kwargs              → ≤15-line diff
         """
@@ -535,36 +436,12 @@ class SchedulablePipeline(Generic[In, Out]):
 
 
 class Pipeline(Generic[In]):
-    """SPEC_p4 v2 user-facing declarative pipeline.
+    """User-facing declarative pipeline.
 
-    Thin wrapper over :class:`SchedulablePipeline` that takes a flat
-    list of tasks and constructs the underlying ``Schedule``
-    internally. The user describes the per-batch DAG once via
-    ``Task(...)`` declarations; ring depth, stream slots, and stage
-    layout are derived.
-
-    Differences from :class:`SchedulablePipeline` (the imperative API):
-
-    - Single argument ``tasks=[Task(...), ...]``. No ``Stage`` /
-      ``Schedule`` object construction at the call site.
-    - ``stream_slots`` is the union of ``task.stream`` across all
-      tasks (``"default"`` is always included so the engine has an
-      anchor).
-    - All tasks land in a single ``Stage``. Stage boundaries were
-      already cosmetic — engine cross-stream wait inference is
-      stage-agnostic per SPEC §4.2.
-    - Ring depth is ``max(t.lookahead) + 1`` via the existing
-      ``Schedule.in_flight_batches`` derivation; tasks can use either
-      ``lookahead=...`` (SPEC_p4 v2) or ``batch_offset=...`` (legacy)
-      since both alias the same field.
-
-    The user still constructs and passes a :class:`StreamPool` —
-    stream resources are device-specific and outside the engine's
-    pure-Python scope.
-
-    Adapter authors that need explicit multi-stage layout or other
-    ``Schedule`` controls can keep using :class:`SchedulablePipeline`
-    directly; nothing about this class makes that path go away.
+    Wraps a flat list of tasks into a single-stage ``Schedule`` and
+    derives stream slots from ``task.stream``. Use
+    ``SchedulablePipeline`` directly when an adapter needs explicit
+    multi-stage layout.
     """
 
     def __init__(
