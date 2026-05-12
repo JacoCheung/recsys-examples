@@ -33,7 +33,7 @@
 # 
 # Experiment List File Format:
 #   # Comment lines start with #
-#   exp_name,generate_gin_config_options
+#   exp_name,generate_gin_config_options[,ENV=VALUE;ENV2=VALUE2]
 #   exp0_baseline,
 #   exp1_cutlass,--kernel_backend cutlass
 #   exp4_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
@@ -323,7 +323,9 @@ else
 fi
 
 # Create timestamped batch experiment directory
-BATCH_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# Sweeps can pass a stable, human-readable name so dashboard batches are
+# self-describing.
+BATCH_TIMESTAMP=${HSTU_BENCHMARK_BATCH_NAME:-$(date +%Y%m%d_%H%M%S)}
 BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 
 # ============================================================================
@@ -340,6 +342,7 @@ fi
 # Read experiment list if provided
 declare -a EXP_NAMES
 declare -a GIN_OPTIONS
+declare -a EXP_ENV_OVERRIDES
 
 if [ -n "$EXP_FILE" ]; then
     # If relative path, make it relative to examples/hstu
@@ -359,14 +362,16 @@ if [ -n "$EXP_FILE" ]; then
     fi
 
     # Read experiment list (skip comments and empty lines)
-    while IFS=',' read -r exp_name gin_opts || [ -n "$exp_name" ]; do
+    while IFS=',' read -r exp_name gin_opts env_overrides || [ -n "$exp_name" ]; do
         # Skip empty lines and comments
         [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
         # Trim leading/trailing whitespace
         exp_name=$(echo "$exp_name" | xargs)
         gin_opts=$(echo "$gin_opts" | xargs)
+        env_overrides=$(echo "${env_overrides:-}" | xargs)
         EXP_NAMES+=("$exp_name")
         GIN_OPTIONS+=("$gin_opts")
+        EXP_ENV_OVERRIDES+=("$env_overrides")
     done < "$EXP_FILE"
 
     if [ ${#EXP_NAMES[@]} -eq 0 ]; then
@@ -456,6 +461,9 @@ echo ""
 echo -e "${BLUE}Experiments to run (${#EXP_NAMES[@]} total):${NC}"
 for i in "${!EXP_NAMES[@]}"; do
     echo "  - ${EXP_NAMES[$i]}: ${GIN_OPTIONS[$i]:-'(defaults)'}"
+    if [ -n "${EXP_ENV_OVERRIDES[$i]:-}" ]; then
+        echo "      env: ${EXP_ENV_OVERRIDES[$i]}"
+    fi
 done
 echo ""
 
@@ -490,6 +498,7 @@ echo ""
 for i in "${!EXP_NAMES[@]}"; do
     exp="${EXP_NAMES[$i]}"
     gin_opts="${GIN_OPTIONS[$i]}"
+    env_overrides="${EXP_ENV_OVERRIDES[$i]:-}"
     exp_num=$((i + 1))
     
     # Output directory for each experiment
@@ -534,7 +543,16 @@ for i in "${!EXP_NAMES[@]}"; do
     fi
     
     # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
-    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${CACHE_DEBUG},CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1},RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy},HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-},HSTU_LA_DEPTH=${HSTU_LA_DEPTH:-},HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-},HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5}"
+    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${CACHE_DEBUG},CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1},RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy},HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-},HSTU_LA_DEPTH=${HSTU_LA_DEPTH:-},HSTU_SPLIT_RANKING_FORWARD=${HSTU_SPLIT_RANKING_FORWARD:-0},HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-},HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5}"
+    if [ -n "${HSTU_NONCRITICAL_GATE_DEFAULT:-}" ]; then
+        EXPORT_VARS="${EXPORT_VARS},HSTU_NONCRITICAL_GATE_DEFAULT=${HSTU_NONCRITICAL_GATE_DEFAULT}"
+    fi
+    if [ -n "${HSTU_NONCRITICAL_GATES:-}" ]; then
+        EXPORT_VARS="${EXPORT_VARS},HSTU_NONCRITICAL_GATES=${HSTU_NONCRITICAL_GATES}"
+    fi
+    if [ -n "${env_overrides}" ]; then
+        EXPORT_VARS="${EXPORT_VARS},${env_overrides//;/,}"
+    fi
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script
@@ -542,6 +560,7 @@ for i in "${!EXP_NAMES[@]}"; do
     
     echo -e "[${exp_num}/${#EXP_NAMES[@]}] ${YELLOW}${exp}${NC}"
     echo "  Options:    ${gin_opts:-'(defaults)'}"
+    [ -n "${env_overrides}" ] && echo "  Env:        ${env_overrides}"
     echo "  Output dir: ${EXP_OUTPUT_DIR}"
     
     if [ ${DRY_RUN} -eq 1 ]; then
@@ -608,6 +627,11 @@ if [ ${DRY_RUN} -eq 0 ]; then
             job_id=$(echo ${job_info} | cut -d: -f2)
             echo "  ${exp_name}: Job ID ${job_id}"
             echo "    Output: ${BATCH_OUTPUT_DIR}/${exp_name}/"
+            for i in "${!EXP_NAMES[@]}"; do
+                if [ "${EXP_NAMES[$i]}" = "${exp_name}" ] && [ -n "${EXP_ENV_OVERRIDES[$i]:-}" ]; then
+                    echo "    Env:    ${EXP_ENV_OVERRIDES[$i]}"
+                fi
+            done
         done
         echo "================================================================================"
     } > ${SUMMARY_FILE}
