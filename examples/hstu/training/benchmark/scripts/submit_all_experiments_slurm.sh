@@ -40,7 +40,7 @@
 #
 # Experiment List File Format (all types):
 #   # Comment lines start with #
-#   exp_name,<args>
+#   exp_name,<args>[,ENV=VALUE;ENV2=VALUE2]
 # Where <args> is benchmark-type-specific:
 #   - e2e              : gin options for generate_gin_config.py
 #   - hstu-layer       : CLI args for hstu_layer_benchmark.py run
@@ -361,17 +361,19 @@ else
     RESULTS_BASE="${BENCHMARK_DIR}/results"
 fi
 
-# Create timestamped batch experiment directory
-BATCH_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-# Prefix the batch dir with the benchmark type so a glance at results/
-# tells you what kind of benchmark produced each batch.
-case "${BENCHMARK_TYPE}" in
-    e2e)              BATCH_PREFIX="e2e" ;;
-    hstu-layer)       BATCH_PREFIX="hstu_layer" ;;
-    hstu-attn-kernel) BATCH_PREFIX="hstu_kernel" ;;
-    *)                BATCH_PREFIX="${BENCHMARK_TYPE//-/_}" ;;
-esac
-BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_PREFIX}_${BATCH_TIMESTAMP}"
+# Create timestamped batch experiment directory.
+if [ -n "${HSTU_BENCHMARK_BATCH_NAME:-}" ]; then
+    BATCH_OUTPUT_DIR="${RESULTS_BASE}/${HSTU_BENCHMARK_BATCH_NAME}"
+else
+    BATCH_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    case "${BENCHMARK_TYPE}" in
+        e2e)              BATCH_PREFIX="e2e" ;;
+        hstu-layer)       BATCH_PREFIX="hstu_layer" ;;
+        hstu-attn-kernel) BATCH_PREFIX="hstu_kernel" ;;
+        *)                BATCH_PREFIX="${BENCHMARK_TYPE//-/_}" ;;
+    esac
+    BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_PREFIX}_${BATCH_TIMESTAMP}"
+fi
 
 # ============================================================================
 # Check Experiment List File
@@ -387,6 +389,7 @@ fi
 # Read experiment list if provided
 declare -a EXP_NAMES
 declare -a GIN_OPTIONS
+declare -a EXP_ENV_OVERRIDES
 
 if [ -n "$EXP_FILE" ]; then
     # If relative path, make it relative to examples/hstu
@@ -406,14 +409,16 @@ if [ -n "$EXP_FILE" ]; then
     fi
 
     # Read experiment list (skip comments and empty lines)
-    while IFS=',' read -r exp_name gin_opts || [ -n "$exp_name" ]; do
+    while IFS=',' read -r exp_name gin_opts env_overrides || [ -n "$exp_name" ]; do
         # Skip empty lines and comments
         [[ -z "$exp_name" || "$exp_name" =~ ^[[:space:]]*# ]] && continue
         # Trim leading/trailing whitespace
         exp_name=$(echo "$exp_name" | xargs)
         gin_opts=$(echo "$gin_opts" | xargs)
+        env_overrides=$(echo "${env_overrides:-}" | xargs)
         EXP_NAMES+=("$exp_name")
         GIN_OPTIONS+=("$gin_opts")
+        EXP_ENV_OVERRIDES+=("$env_overrides")
     done < "$EXP_FILE"
 
     if [ ${#EXP_NAMES[@]} -eq 0 ]; then
@@ -544,6 +549,9 @@ echo ""
 echo -e "${BLUE}Experiments to run (${#EXP_NAMES[@]} total):${NC}"
 for i in "${!EXP_NAMES[@]}"; do
     echo "  - ${EXP_NAMES[$i]}: ${GIN_OPTIONS[$i]:-'(defaults)'}"
+    if [ -n "${EXP_ENV_OVERRIDES[$i]:-}" ]; then
+        echo "      env: ${EXP_ENV_OVERRIDES[$i]}"
+    fi
 done
 echo ""
 
@@ -578,6 +586,7 @@ echo ""
 for i in "${!EXP_NAMES[@]}"; do
     exp="${EXP_NAMES[$i]}"
     gin_opts="${GIN_OPTIONS[$i]}"
+    env_overrides="${EXP_ENV_OVERRIDES[$i]:-}"
     exp_num=$((i + 1))
 
     # Per-experiment debug overrides: a line in experiments.txt can opt in to
@@ -654,7 +663,16 @@ for i in "${!EXP_NAMES[@]}"; do
 
     # Export environment variables — slurm_job.sub consumes BENCHMARK_TYPE +
     # EXP_OUTPUT_DIR and reads EXP_ARGS / GIN_OPTIONS from exp_args.txt.
-    EXPORT_VARS="ALL,BENCHMARK_TYPE=${BENCHMARK_TYPE},EXP_NAME=${exp},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},ENABLE_POST_NSYS_ANALYZE=${ENABLE_POST_NSYS_ANALYZE},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${EXP_MEM_DEBUG},CUDA_MEM_WATCHDOG=${EXP_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${EXP_CACHE_DEBUG},CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-8},RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy},HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-},HSTU_LA_DEPTH=${HSTU_LA_DEPTH:-},HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-},HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5}"
+    EXPORT_VARS="ALL,BENCHMARK_TYPE=${BENCHMARK_TYPE},EXP_NAME=${exp},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},ENABLE_POST_NSYS_ANALYZE=${ENABLE_POST_NSYS_ANALYZE},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${EXP_MEM_DEBUG},CUDA_MEM_WATCHDOG=${EXP_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${EXP_CACHE_DEBUG},CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-8},RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy},HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-},HSTU_LA_DEPTH=${HSTU_LA_DEPTH:-},HSTU_SPLIT_RANKING_FORWARD=${HSTU_SPLIT_RANKING_FORWARD:-0},HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-},HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5}"
+    if [ -n "${HSTU_NONCRITICAL_GATE_DEFAULT:-}" ]; then
+        EXPORT_VARS="${EXPORT_VARS},HSTU_NONCRITICAL_GATE_DEFAULT=${HSTU_NONCRITICAL_GATE_DEFAULT}"
+    fi
+    if [ -n "${HSTU_NONCRITICAL_GATES:-}" ]; then
+        EXPORT_VARS="${EXPORT_VARS},HSTU_NONCRITICAL_GATES=${HSTU_NONCRITICAL_GATES}"
+    fi
+    if [ -n "${env_overrides}" ]; then
+        EXPORT_VARS="${EXPORT_VARS},${env_overrides//;/,}"
+    fi
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script
@@ -662,6 +680,7 @@ for i in "${!EXP_NAMES[@]}"; do
     
     echo -e "[${exp_num}/${#EXP_NAMES[@]}] ${YELLOW}${exp}${NC}"
     echo "  Options:    ${gin_opts:-'(defaults)'}"
+    [ -n "${env_overrides}" ] && echo "  Env:        ${env_overrides}"
     echo "  Output dir: ${EXP_OUTPUT_DIR}"
     
     if [ ${DRY_RUN} -eq 1 ]; then
@@ -728,6 +747,11 @@ if [ ${DRY_RUN} -eq 0 ]; then
             job_id=$(echo ${job_info} | cut -d: -f2)
             echo "  ${exp_name}: Job ID ${job_id}"
             echo "    Output: ${BATCH_OUTPUT_DIR}/${exp_name}/"
+            for i in "${!EXP_NAMES[@]}"; do
+                if [ "${EXP_NAMES[$i]}" = "${exp_name}" ] && [ -n "${EXP_ENV_OVERRIDES[$i]:-}" ]; then
+                    echo "    Env:    ${EXP_ENV_OVERRIDES[$i]}"
+                fi
+            done
         done
         echo "================================================================================"
     } > ${SUMMARY_FILE}
