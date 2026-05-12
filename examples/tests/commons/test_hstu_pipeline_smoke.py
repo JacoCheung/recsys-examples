@@ -217,6 +217,39 @@ def test_split_ranking_forward_env_adds_embedding_task(monkeypatch) -> None:
     assert names.index("ranking_embedding_forward") < names.index("forward")
 
 
+def test_noncritical_gate_env_overrides_per_task(monkeypatch) -> None:
+    monkeypatch.setenv("HSTU_NONCRITICAL_GATE_DEFAULT", "compute_output_dist")
+    monkeypatch.setenv(
+        "HSTU_NONCRITICAL_GATES",
+        "h2d=global_tokens_allreduce,start_input_dist=none,"
+        "prefetch_embeddings=ranking_embedding_forward",
+    )
+    monkeypatch.setenv("HSTU_SPLIT_RANKING_FORWARD", "1")
+
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    schedule, pool = pipe._build_schedule()
+    from commons.pipeline.engine.autosched.validator import validate
+
+    validate(schedule, pool)
+    tasks = {t.name: t for stage in schedule.stages for t in stage.tasks}
+    assert tasks["h2d"].same_progress_sync == ("global_tokens_allreduce",)
+    assert tasks["start_shuffle"].same_progress_sync == ("compute_output_dist",)
+    assert tasks["finish_shuffle"].same_progress_sync == ("compute_output_dist",)
+    assert tasks["start_input_dist"].same_progress_sync == ()
+    assert tasks["wait_input_dist"].same_progress_sync == ("compute_output_dist",)
+    assert tasks["prefetch_embeddings"].same_progress_sync == (
+        "ranking_embedding_forward",
+    )
+
+
+def test_noncritical_gate_env_unknown_task_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("HSTU_NONCRITICAL_GATES", "typo=forward")
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+
+    with pytest.raises(ValueError, match="Unknown non-critical HSTU task"):
+        pipe._build_schedule()
+
+
 def test_no_v0_context_references_in_hstu_pipeline() -> None:
     """Executable HSTU adapter code must stay on v1 contexts."""
     import pathlib

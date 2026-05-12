@@ -93,6 +93,12 @@ echo "Total Tasks:      ${SLURM_NTASKS}"
 echo ""
 echo "Container Image:  ${CONTAINER_IMAGE}"
 echo "NSYS Profiling:   $([ ${ENABLE_NSYS} -eq 1 ] && echo 'ENABLED' || echo 'DISABLED')"
+echo "Pipeline Backend: ${RECSYS_PIPELINE_BACKEND:-legacy}"
+echo "Thread Variant:   ${HSTU_THREAD_MAP_VARIANT:-}"
+echo "LA Depth:         ${HSTU_LA_DEPTH:-}"
+echo "Split Ranking:    ${HSTU_SPLIT_RANKING_FORWARD:-0}"
+echo "Gate Default:     ${HSTU_NONCRITICAL_GATE_DEFAULT:-}"
+echo "Gate Overrides:   ${HSTU_NONCRITICAL_GATES:-}"
 echo ""
 PROJECT_ROOT="${HSTU_ROOT}/../.."
 echo "Git Branch:       $(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -145,6 +151,10 @@ export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy}
 # when RECSYS_PIPELINE_BACKEND=new). Empty string = use the pipeline's
 # built-in default. Valid values come from HSTU_THREAD_MAP_PRESETS.
 export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-}
+# RankingGR forward split and per-task non-critical gates for pipeline sweeps.
+export HSTU_SPLIT_RANKING_FORWARD=${HSTU_SPLIT_RANKING_FORWARD:-0}
+export HSTU_NONCRITICAL_GATE_DEFAULT=${HSTU_NONCRITICAL_GATE_DEFAULT:-}
+export HSTU_NONCRITICAL_GATES=${HSTU_NONCRITICAL_GATES:-}
 # Auto-scheduler hook: when set, points at a JSON cost model the
 # engine consults to recommend per-task lookaheads (bit-exact only;
 # default-stream tasks frozen). Empty = disabled.
@@ -265,6 +275,9 @@ WRAPPER_EOF
             export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1} && \
             export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && \
             export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && \
+            export HSTU_SPLIT_RANKING_FORWARD=${HSTU_SPLIT_RANKING_FORWARD:-0} && \
+            export HSTU_NONCRITICAL_GATE_DEFAULT=${HSTU_NONCRITICAL_GATE_DEFAULT:-} && \
+            export HSTU_NONCRITICAL_GATES=${HSTU_NONCRITICAL_GATES:-} && \
             export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-} && \
             export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5} && \
             ${LAUNCH_BLOCKING_ENV} \
@@ -292,7 +305,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RECSYS_PRINT_RANK_PID=${RECSYS_PRINT_RANK_PID:-1} && export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1} && export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-} && export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RECSYS_PRINT_RANK_PID=${RECSYS_PRINT_RANK_PID:-1} && export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1} && export RECSYS_PIPELINE_BACKEND=${RECSYS_PIPELINE_BACKEND:-legacy} && export HSTU_THREAD_MAP_VARIANT=${HSTU_THREAD_MAP_VARIANT:-} && export HSTU_SPLIT_RANKING_FORWARD=${HSTU_SPLIT_RANKING_FORWARD:-0} && export HSTU_NONCRITICAL_GATE_DEFAULT=${HSTU_NONCRITICAL_GATE_DEFAULT:-} && export HSTU_NONCRITICAL_GATES=${HSTU_NONCRITICAL_GATES:-} && export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-} && export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
