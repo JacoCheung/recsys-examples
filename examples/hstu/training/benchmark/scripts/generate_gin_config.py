@@ -46,6 +46,7 @@ def get_baseline_template():
 #   - Eviction Strategy: {evict}
 #   - Pipeline: {pipeline_type}
 #   - Tensor Parallel: {tp_size}
+#   - Sequence Layout: {seq_layout}
 # ============================================================================
 
 # ===== Trainer Configuration =====
@@ -72,11 +73,8 @@ TrainerArgs.ckpt_save_interval = 999999999
 # Main sequence features (item + action)
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
 item_and_action_feature/FeatureArgs.max_sequence_length = 4096
-item_and_action_feature/FeatureArgs.is_jagged = True
-item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
-item_seqlen_dist/RandomDistribution.alpha = 1.2
-item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length
-item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
+item_and_action_feature/FeatureArgs.is_jagged = {is_jagged}
+{seqlen_dist_section}
 
 {value_dist_section}
 # Contextual Features (only 3)
@@ -272,6 +270,18 @@ Examples:
     )
 
     parser.add_argument(
+        "--seq_layout",
+        type=str,
+        choices=["jagged", "dense"],
+        default="jagged",
+        help=(
+            "Sequence layout: 'jagged' (variable length, zipf-distributed "
+            "1..max_sequence_length) or 'dense' (every sample padded to "
+            "max_sequence_length). Default: jagged"
+        ),
+    )
+
+    parser.add_argument(
         "--value_dist_alpha",
         type=float,
         default=1.2,
@@ -323,6 +333,25 @@ def generate_config(args):
     else:
         balanced_shuffler_line = ""
 
+    # Generate seq_layout-dependent section. ``seqlen_dist`` is only
+    # effective when ``is_jagged=True`` (see gin_config_args.py:242), so
+    # for dense layout we omit the distribution block entirely to avoid
+    # misleading dead config.
+    if args.seq_layout == "jagged":
+        is_jagged = "True"
+        seqlen_dist_section = (
+            "item_seqlen_dist/RandomDistribution.dist_type = 'zipf'\n"
+            "item_seqlen_dist/RandomDistribution.alpha = 1.2\n"
+            "item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length\n"
+            "item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()"
+        )
+    else:
+        is_jagged = "False"
+        seqlen_dist_section = (
+            "# Sequence layout: dense — every sample padded to "
+            "max_sequence_length; seqlen_dist is not applied."
+        )
+
     # Format the template
     config = get_baseline_template().format(
         kernel_backend=args.kernel_backend,
@@ -334,6 +363,9 @@ def generate_config(args):
         evict=args.evict,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
+        seq_layout=args.seq_layout,
+        is_jagged=is_jagged,
+        seqlen_dist_section=seqlen_dist_section,
         value_dist_section=value_dist_section,
         user_id_value_dist_section=user_id_value_dist_section,
     )
