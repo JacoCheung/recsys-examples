@@ -48,6 +48,8 @@ from .tasks import (
     make_h2d_task,
     make_optimizer_step_task,
     make_prefetch_task,
+    make_ranking_embedding_task,
+    make_ranking_forward_tail_task,
     make_start_input_dist_task,
     make_start_shuffle_task,
     make_wait_input_dist_task,
@@ -94,6 +96,7 @@ HSTU_DEFAULT_THREAD_MAP: dict = {
     "zero_grad": "compute",
     "global_tokens_allreduce": "compute",
     "compute_output_dist": "compute",
+    "ranking_embedding_forward": "compute",
     "forward": "compute",
     "backward": "compute",
     "finalize_model_grads": "compute",
@@ -125,6 +128,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "zero_grad": "compute",
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
+        "ranking_embedding_forward": "compute",
         "forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
@@ -141,6 +145,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "zero_grad": "compute",
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
+        "ranking_embedding_forward": "compute",
         "forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
@@ -157,6 +162,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "zero_grad": "compute",
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
+        "ranking_embedding_forward": "compute",
         "forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
@@ -174,6 +180,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "zero_grad": "compute",
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
+        "ranking_embedding_forward": "compute",
         "forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
@@ -256,6 +263,9 @@ class HSTUPipeline:
         self._autosched_max_in_flight: int = int(
             os.environ.get("HSTU_AUTOSCHED_MAX_IN_FLIGHT", "5")
         )
+        self._split_ranking_forward: bool = (
+            os.environ.get("HSTU_SPLIT_RANKING_FORWARD", "0") == "1"
+        )
 
         # Default shuffler is identity (no-op).
         if batch_shuffler is None:
@@ -271,6 +281,7 @@ class HSTUPipeline:
             batch_shuffler=batch_shuffler,
             is_identity_shuffler=self._is_identity(batch_shuffler),
             model_fwd=custom_model_fwd if custom_model_fwd else model,
+            has_custom_model_fwd=custom_model_fwd is not None,
             assert_nan_loss=assert_nan_loss,
         )
 
@@ -422,15 +433,24 @@ class HSTUPipeline:
             )
         # compute_output_dist produces awaitables consumed by forward.
         # The memcpy safety wait is folded into forward's body.
-        tasks.extend(
-            [
-                make_compute_output_dist_task(
-                    self._state,
-                    prefetch=self._prefetch,
-                ),
-                make_forward_task(self._state, prefetch=self._prefetch),
-            ]
+        tasks.append(
+            make_compute_output_dist_task(
+                self._state,
+                prefetch=self._prefetch,
+            )
         )
+        if self._split_ranking_forward:
+            tasks.extend(
+                [
+                    make_ranking_embedding_task(
+                        self._state,
+                        prefetch=self._prefetch,
+                    ),
+                    make_ranking_forward_tail_task(self._state),
+                ]
+            )
+        else:
+            tasks.append(make_forward_task(self._state, prefetch=self._prefetch))
         # zero_grad is model-state ordering; prefetch sync is a
         # same-progress GPU coherency edge for DynamicEmb cache state.
         backward_deps = ("zero_grad",)

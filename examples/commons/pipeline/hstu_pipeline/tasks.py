@@ -41,6 +41,8 @@ import nvtx
 import torch
 from commons.pipeline.engine import Task
 
+RANKING_EMBEDDINGS_SLOT = "ranking_embeddings"
+
 
 @dataclass
 class PipelineState:
@@ -59,6 +61,7 @@ class PipelineState:
     batch_shuffler: Any = None
     is_identity_shuffler: bool = True
     model_fwd: Optional[Callable] = None
+    has_custom_model_fwd: bool = False
     assert_nan_loss: bool = False
     next_ctx_index: int = 0
     # Prefetch variants use PrefetchTrainPipelineContext; non-prefetch
@@ -89,6 +92,34 @@ class PipelineState:
         """Point every pipelined forward wrapper at a per-batch context."""
         for module in self.pipelined_modules:
             module.forward.set_context(torchrec_ctx)
+
+
+def _split_forward_owner(state: PipelineState) -> Any:
+    candidates = (
+        (state.model_fwd,)
+        if state.has_custom_model_fwd
+        else (
+            state.model_fwd,
+            state.model,
+        )
+    )
+    for candidate in candidates:
+        owner = candidate
+        for _ in range(8):
+            if owner is None:
+                break
+            if hasattr(owner, "forward_embeddings") and hasattr(
+                owner, "forward_after_embeddings"
+            ):
+                return owner
+            next_owner = getattr(owner, "module", None)
+            if next_owner is owner:
+                break
+            owner = next_owner
+    raise RuntimeError(
+        "HSTU_SPLIT_RANKING_FORWARD=1 requires model_fwd or model to expose "
+        "forward_embeddings(batch) and forward_after_embeddings(batch, embeddings)."
+    )
 
 
 # ----------------------------------------------------------------------
@@ -535,6 +566,68 @@ def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
         writes=("losses", "output"),
         depends_on=depends_on,
         # forward does NOT AllReduce; DDP hooks fire during backward.
+    )
+
+
+def make_ranking_embedding_task(
+    state: PipelineState,
+    *,
+    prefetch: bool = False,
+) -> Task:
+    def _fn(ctx):
+        batch_gpu = ctx.slots.get("batch_gpu", None)
+        torchrec_ctx = ctx.slots.get("torchrec_ctx", None)
+        if batch_gpu is None or torchrec_ctx is None:
+            return
+        if not state.is_identity_shuffler:
+            memcpy = ctx.stream_pool.get("memcpy")
+            if memcpy is not None:
+                torch.cuda.current_stream().wait_stream(memcpy)
+        shuffled = ctx.slots.get("shuffled_batch", batch_gpu)
+        state.set_module_context(torchrec_ctx)
+        owner = _split_forward_owner(state)
+        with nvtx.annotate("## ranking_embedding_forward ##"):
+            embeddings = owner.forward_embeddings(shuffled)
+        ctx.slots.set(RANKING_EMBEDDINGS_SLOT, embeddings)
+
+    depends_on: tuple = ("compute_output_dist", "wait_input_dist")
+    if prefetch:
+        depends_on = ("compute_output_dist", "prefetch_embeddings")
+
+    return Task.from_fn(
+        "ranking_embedding_forward",
+        _fn,
+        stream="default",
+        lookahead=0,
+        reads=("batch_gpu", "torchrec_ctx", "shuffled_batch"),
+        writes=(RANKING_EMBEDDINGS_SLOT,),
+        depends_on=depends_on,
+    )
+
+
+def make_ranking_forward_tail_task(state: PipelineState) -> Task:
+    def _fn(ctx):
+        batch_gpu = ctx.slots.get("batch_gpu", None)
+        embeddings = ctx.slots.get(RANKING_EMBEDDINGS_SLOT, None)
+        if batch_gpu is None or embeddings is None:
+            ctx.slots.set("losses", None)
+            ctx.slots.set("output", None)
+            return
+        shuffled = ctx.slots.get("shuffled_batch", batch_gpu)
+        owner = _split_forward_owner(state)
+        with nvtx.annotate("## ranking_forward_tail ##"):
+            losses, output = owner.forward_after_embeddings(shuffled, embeddings)
+        ctx.slots.set("losses", losses)
+        ctx.slots.set("output", output)
+
+    return Task.from_fn(
+        "forward",
+        _fn,
+        stream="default",
+        lookahead=0,
+        reads=("batch_gpu", "shuffled_batch", RANKING_EMBEDDINGS_SLOT),
+        writes=("losses", "output"),
+        depends_on=("ranking_embedding_forward",),
     )
 
 
