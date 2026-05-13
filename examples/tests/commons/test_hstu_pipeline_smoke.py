@@ -234,6 +234,16 @@ def test_schedule_config_split_ranking_forward_adds_embedding_task() -> None:
     assert names.index("ranking_embedding_forward") < names.index("forward")
 
 
+def test_default_same_progress_sync_is_empty() -> None:
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    schedule, pool = pipe._build_schedule()
+    from commons.pipeline.engine.autosched.validator import validate
+
+    validate(schedule, pool)
+    tasks = [t for stage in schedule.stages for t in stage.tasks]
+    assert all(task.same_progress_sync == () for task in tasks)
+
+
 def test_schedule_config_controls_same_progress_per_task() -> None:
     pipe = _make_noop_pipeline(
         prefetch=True,
@@ -395,6 +405,7 @@ def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
         assert "noncritical_default" not in json.dumps(data), path.name
         for task_name, spec in data["same_progress_sync"].items():
             assert isinstance(spec, list), (path.name, task_name)
+            assert spec == [], (path.name, task_name)
             for edge in spec:
                 assert set(edge) == {"task", "sides"}, (path.name, task_name)
 

@@ -392,10 +392,9 @@ class HSTUPipeline:
                     "prefetch_embeddings", prefetch_lookahead
                 )
 
-        # Default gate keeps lookahead work behind the dense forward tail.
-        # Schedule configs may override the same-progress edge per task.
+        # Same-progress gates are opt-in; schedule configs may add them per task.
         def same_progress_for(task_name: str) -> tuple:
-            default = ("forward",)
+            default = ()
             return (
                 config.same_progress_for(task_name, default)
                 if config is not None
@@ -467,16 +466,8 @@ class HSTUPipeline:
             )
         else:
             tasks.append(make_forward_task(self._state, prefetch=self._prefetch))
-        # zero_grad is model-state ordering; prefetch sync is a
-        # same-progress GPU coherency edge for DynamicEmb cache state.
         backward_deps = ("zero_grad",)
-        backward_same_progress_sync: tuple = ()
-        if self._prefetch:
-            backward_same_progress_sync = ("prefetch_embeddings",)
-        if config is not None:
-            backward_same_progress_sync = config.same_progress_for(
-                "backward", backward_same_progress_sync
-            )
+        backward_same_progress_sync = same_progress_for("backward")
         tasks.extend(
             [
                 make_backward_task(
