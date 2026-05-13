@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 from commons.pipeline.engine import (
+    SameProgressSyncSide,
     SchedulablePipeline,
     Schedule,
     Stage,
@@ -37,6 +38,12 @@ from commons.pipeline.engine import (
     ThreadedExecutor,
 )
 
+from .config import (
+    HSTU_NONCRITICAL_TASKS,
+    HSTU_PIPELINE_CONFIG_ENV,
+    HSTUPipelineScheduleConfig,
+    load_hstu_pipeline_schedule_config,
+)
 from .tasks import (
     PipelineState,
     make_backward_task,
@@ -59,6 +66,7 @@ from .tasks import (
 
 __all__ = [
     "HSTUPipeline",
+    "HSTUPipelineScheduleConfig",
     "HSTU_DEFAULT_THREAD_MAP",
     "HSTU_THREAD_MAP_PRESETS",
     "resolve_hstu_thread_map_variant",
@@ -189,15 +197,6 @@ HSTU_THREAD_MAP_PRESETS: dict = {
     },
 }
 
-_NONCRITICAL_TASKS = (
-    "h2d",
-    "start_shuffle",
-    "finish_shuffle",
-    "start_input_dist",
-    "wait_input_dist",
-    "prefetch_embeddings",
-)
-
 
 def _parse_gate_names(raw: str) -> tuple:
     value = raw.strip()
@@ -222,7 +221,7 @@ def _resolve_noncritical_gates(default_gate: str = "forward") -> Dict[str, tuple
     default = os.environ.get("HSTU_NONCRITICAL_GATE_DEFAULT", "").strip()
     if not default:
         default = default_gate
-    gates = {task: _parse_gate_names(default) for task in _NONCRITICAL_TASKS}
+    gates = {task: _parse_gate_names(default) for task in HSTU_NONCRITICAL_TASKS}
 
     spec = os.environ.get("HSTU_NONCRITICAL_GATES", "").strip()
     if not spec:
@@ -286,24 +285,36 @@ class HSTUPipeline:
         # ``threaded=False`` or a custom ``thread_map``.
         threaded: bool = True,
         thread_map: Any = None,
+        schedule_config: Optional[Any] = None,
     ) -> None:
         if prefetch_depth < 1:
             raise ValueError(f"prefetch_depth must be >= 1, got {prefetch_depth}")
 
+        config_source = (
+            schedule_config
+            if schedule_config is not None
+            else os.environ.get(HSTU_PIPELINE_CONFIG_ENV, "").strip() or None
+        )
+        self._schedule_config = load_hstu_pipeline_schedule_config(config_source)
+
         # Resolve the default map or an env-selected benchmark preset.
         if threaded and thread_map is None:
-            env_variant = os.environ.get("HSTU_THREAD_MAP_VARIANT")
-            if env_variant:
-                thread_map = resolve_hstu_thread_map_variant(env_variant)
+            if (
+                self._schedule_config is not None
+                and self._schedule_config.thread_map is not None
+            ):
+                thread_map = self._schedule_config.thread_map
             else:
-                thread_map = HSTU_DEFAULT_THREAD_MAP
-        elif (
-            threaded
-            and isinstance(thread_map, str)
-            and thread_map in HSTU_THREAD_MAP_PRESETS
-        ):
-            # Allow callers to pass a preset name directly.
-            thread_map = resolve_hstu_thread_map_variant(thread_map)
+                env_variant = os.environ.get("HSTU_THREAD_MAP_VARIANT")
+                if env_variant:
+                    thread_map = resolve_hstu_thread_map_variant(env_variant)
+                else:
+                    thread_map = HSTU_DEFAULT_THREAD_MAP
+        if threaded and isinstance(thread_map, str):
+            if thread_map in HSTU_THREAD_MAP_PRESETS:
+                thread_map = resolve_hstu_thread_map_variant(thread_map)
+            elif thread_map not in {"by_stream", "per_task"}:
+                thread_map = resolve_hstu_thread_map_variant(thread_map)
 
         self._prefetch = prefetch
         self._prefetch_depth = prefetch_depth
@@ -319,9 +330,15 @@ class HSTUPipeline:
         self._autosched_max_in_flight: int = int(
             os.environ.get("HSTU_AUTOSCHED_MAX_IN_FLIGHT", "5")
         )
-        self._split_ranking_forward: bool = (
-            os.environ.get("HSTU_SPLIT_RANKING_FORWARD", "0") == "1"
-        )
+        if (
+            self._schedule_config is not None
+            and self._schedule_config.split_ranking_forward is not None
+        ):
+            self._split_ranking_forward = self._schedule_config.split_ranking_forward
+        else:
+            self._split_ranking_forward = (
+                os.environ.get("HSTU_SPLIT_RANKING_FORWARD", "0") == "1"
+            )
 
         # Default shuffler is identity (no-op).
         if batch_shuffler is None:
@@ -381,11 +398,15 @@ class HSTUPipeline:
         (compute@0, input_dist/prefetch@1, h2d/shuffle@2). Larger depths
         add buffer slots between input distribution and compute.
         """
-        # Benchmark sweeps may override the public depth knob with a
-        # named lookahead profile.
-        import os as _os
+        config = self._schedule_config
+        config_has_lookahead = config is not None and bool(config.lookahead)
 
-        _depth_env = _os.environ.get("HSTU_LA_DEPTH", "").strip()
+        # Benchmark sweeps may override the public depth knob with a
+        # named lookahead profile. A config file has priority over the
+        # legacy HSTU_LA_DEPTH env knob.
+        _depth_env = (
+            "" if config_has_lookahead else os.environ.get("HSTU_LA_DEPTH", "").strip()
+        )
         if not _depth_env:
             h2d_lookahead = self._prefetch_depth + 1
             start_shuffle_lookahead = self._prefetch_depth + 1
@@ -439,34 +460,75 @@ class HSTUPipeline:
                     "prefetch_embeddings", prefetch_lookahead
                 )
 
+        if config_has_lookahead:
+            h2d_lookahead = config.lookahead_for("h2d", h2d_lookahead)
+            start_shuffle_lookahead = config.lookahead_for(
+                "start_shuffle", start_shuffle_lookahead
+            )
+            finish_shuffle_lookahead = config.lookahead_for(
+                "finish_shuffle", finish_shuffle_lookahead
+            )
+            start_input_dist_lookahead = config.lookahead_for(
+                "start_input_dist", start_input_dist_lookahead
+            )
+            wait_input_dist_lookahead = config.lookahead_for(
+                "wait_input_dist", wait_input_dist_lookahead
+            )
+            if prefetch_lookahead is not None:
+                prefetch_lookahead = config.lookahead_for(
+                    "prefetch_embeddings", prefetch_lookahead
+                )
+
         # Default gate keeps lookahead work behind the dense forward
         # tail. Benchmark sweeps may override per non-critical task.
-        gates = _resolve_noncritical_gates(default_gate="forward")
+        if config is None:
+            gates = _resolve_noncritical_gates(default_gate="forward")
+            sync_sides = {
+                task: SameProgressSyncSide.BOTH for task in HSTU_NONCRITICAL_TASKS
+            }
+        else:
+            gates = {
+                task: config.same_progress_for(
+                    task,
+                    ("forward",),
+                    noncritical_tasks=HSTU_NONCRITICAL_TASKS,
+                )
+                for task in HSTU_NONCRITICAL_TASKS
+            }
+            sync_sides = {
+                task: config.same_progress_side_for(task)
+                for task in HSTU_NONCRITICAL_TASKS
+            }
         tasks = [
             make_h2d_task(
                 self._state,
                 lookahead=h2d_lookahead,
                 same_progress_sync=gates["h2d"],
+                same_progress_sync_sides=sync_sides["h2d"],
             ),
             make_start_shuffle_task(
                 self._state,
                 lookahead=start_shuffle_lookahead,
                 same_progress_sync=gates["start_shuffle"],
+                same_progress_sync_sides=sync_sides["start_shuffle"],
             ),
             make_finish_shuffle_task(
                 self._state,
                 lookahead=finish_shuffle_lookahead,
                 same_progress_sync=gates["finish_shuffle"],
+                same_progress_sync_sides=sync_sides["finish_shuffle"],
             ),
             make_start_input_dist_task(
                 self._state,
                 lookahead=start_input_dist_lookahead,
                 same_progress_sync=gates["start_input_dist"],
+                same_progress_sync_sides=sync_sides["start_input_dist"],
             ),
             make_wait_input_dist_task(
                 self._state,
                 lookahead=wait_input_dist_lookahead,
                 same_progress_sync=gates["wait_input_dist"],
+                same_progress_sync_sides=sync_sides["wait_input_dist"],
             ),
         ]
         # Keep prefetch after forward in declaration order: forward
@@ -485,6 +547,7 @@ class HSTUPipeline:
                     self._state,
                     lookahead=prefetch_lookahead,
                     same_progress_sync=gates["prefetch_embeddings"],
+                    same_progress_sync_sides=sync_sides["prefetch_embeddings"],
                 )
             )
         # compute_output_dist produces awaitables consumed by forward.
@@ -511,14 +574,23 @@ class HSTUPipeline:
         # same-progress GPU coherency edge for DynamicEmb cache state.
         backward_deps = ("zero_grad",)
         backward_same_progress_sync: tuple = ()
+        backward_same_progress_sync_sides = SameProgressSyncSide.BOTH
         if self._prefetch:
             backward_same_progress_sync = ("prefetch_embeddings",)
+        if config is not None:
+            backward_same_progress_sync = config.same_progress_for(
+                "backward", backward_same_progress_sync
+            )
+            backward_same_progress_sync_sides = config.same_progress_side_for(
+                "backward"
+            )
         tasks.extend(
             [
                 make_backward_task(
                     self._state,
                     depends_on=backward_deps,
                     same_progress_sync=backward_same_progress_sync,
+                    same_progress_sync_sides=backward_same_progress_sync_sides,
                 ),
                 make_finalize_grads_task(self._state),
                 make_optimizer_step_task(self._state),
