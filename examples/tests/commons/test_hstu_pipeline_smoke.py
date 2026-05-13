@@ -152,9 +152,8 @@ def _make_noop_pipeline(prefetch: bool, prefetch_depth: int = 1, **kwargs):
     return pipe
 
 
-def test_schedule_construction_deep_queue(monkeypatch) -> None:
+def test_schedule_construction_deep_queue() -> None:
     """prefetch_depth expands the in-flight queue."""
-    monkeypatch.delenv("HSTU_LA_DEPTH", raising=False)
     pipe = _make_noop_pipeline(prefetch=False, prefetch_depth=3)
     schedule, pool = pipe._build_schedule()
     from commons.pipeline.engine.autosched.validator import validate
@@ -164,9 +163,8 @@ def test_schedule_construction_deep_queue(monkeypatch) -> None:
     assert schedule.in_flight_batches == 5
 
 
-def test_default_depth_one_has_three_batches(monkeypatch) -> None:
+def test_default_depth_one_has_three_batches() -> None:
     """Default depth keeps both variants at 3 in-flight batches."""
-    monkeypatch.delenv("HSTU_LA_DEPTH", raising=False)
     p_np = _make_noop_pipeline(prefetch=False, prefetch_depth=1)
     s_np, pool_np = p_np._build_schedule()
     from commons.pipeline.engine.autosched.validator import validate
@@ -182,11 +180,22 @@ def test_default_depth_one_has_three_batches(monkeypatch) -> None:
     ), "Prefetch variant must also be 3 in-flight to fit dynamicemb cache"
 
 
-def test_hstu_la_depth_env_override(monkeypatch) -> None:
-    """Benchmark sweeps can override the public prefetch_depth layout
-    with a named lookahead profile."""
-    monkeypatch.setenv("HSTU_LA_DEPTH", "6")
-    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+def test_schedule_config_lookahead_profile_controls_depth() -> None:
+    """Schedule config can select a deeper in-flight profile."""
+    pipe = _make_noop_pipeline(
+        prefetch=True,
+        prefetch_depth=1,
+        schedule_config={
+            "lookahead": {
+                "h2d": 5,
+                "start_shuffle": 4,
+                "finish_shuffle": 3,
+                "start_input_dist": 3,
+                "wait_input_dist": 2,
+                "prefetch_embeddings": 1,
+            }
+        },
+    )
     schedule, _ = pipe._build_schedule()
     assert schedule.in_flight_batches == 6
 
@@ -205,9 +214,12 @@ def test_cuda_mem_watchdog_task_is_env_gated(monkeypatch) -> None:
     assert "watchdog_step" in names
 
 
-def test_split_ranking_forward_env_adds_embedding_task(monkeypatch) -> None:
-    monkeypatch.setenv("HSTU_SPLIT_RANKING_FORWARD", "1")
-    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+def test_schedule_config_split_ranking_forward_adds_embedding_task() -> None:
+    pipe = _make_noop_pipeline(
+        prefetch=True,
+        prefetch_depth=1,
+        schedule_config={"split_ranking_forward": True},
+    )
     schedule, pool = pipe._build_schedule()
     from commons.pipeline.engine.autosched.validator import validate
 
@@ -218,16 +230,37 @@ def test_split_ranking_forward_env_adds_embedding_task(monkeypatch) -> None:
     assert names.index("ranking_embedding_forward") < names.index("forward")
 
 
-def test_noncritical_gate_env_overrides_per_task(monkeypatch) -> None:
-    monkeypatch.setenv("HSTU_NONCRITICAL_GATE_DEFAULT", "compute_output_dist")
-    monkeypatch.setenv(
-        "HSTU_NONCRITICAL_GATES",
-        "h2d=global_tokens_allreduce,start_input_dist=none,"
-        "prefetch_embeddings=ranking_embedding_forward",
+def test_schedule_config_controls_same_progress_per_task() -> None:
+    pipe = _make_noop_pipeline(
+        prefetch=True,
+        prefetch_depth=1,
+        schedule_config={
+            "split_ranking_forward": True,
+            "same_progress_sync": {
+                "h2d": {
+                    "wait_for": ["global_tokens_allreduce"],
+                    "sides": "both",
+                },
+                "start_shuffle": {
+                    "wait_for": ["compute_output_dist"],
+                    "sides": "both",
+                },
+                "finish_shuffle": {
+                    "wait_for": ["compute_output_dist"],
+                    "sides": "both",
+                },
+                "start_input_dist": {"wait_for": [], "sides": "both"},
+                "wait_input_dist": {
+                    "wait_for": ["compute_output_dist"],
+                    "sides": "both",
+                },
+                "prefetch_embeddings": {
+                    "wait_for": ["ranking_embedding_forward"],
+                    "sides": "both",
+                },
+            },
+        },
     )
-    monkeypatch.setenv("HSTU_SPLIT_RANKING_FORWARD", "1")
-
-    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
     schedule, pool = pipe._build_schedule()
     from commons.pipeline.engine.autosched.validator import validate
 
@@ -243,14 +276,6 @@ def test_noncritical_gate_env_overrides_per_task(monkeypatch) -> None:
     )
 
 
-def test_noncritical_gate_env_unknown_task_rejected(monkeypatch) -> None:
-    monkeypatch.setenv("HSTU_NONCRITICAL_GATES", "typo=forward")
-    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
-
-    with pytest.raises(ValueError, match="Unknown non-critical HSTU task"):
-        pipe._build_schedule()
-
-
 def test_hstu_schedule_config_file_controls_runtime_knobs(
     monkeypatch, tmp_path
 ) -> None:
@@ -258,11 +283,6 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
 
     from commons.pipeline.engine import SameProgressSyncSide
     from commons.pipeline.hstu_pipeline.pipeline import HSTU_THREAD_MAP_PRESETS
-
-    monkeypatch.setenv("HSTU_LA_DEPTH", "6")
-    monkeypatch.setenv("HSTU_THREAD_MAP_VARIANT", "per_task")
-    monkeypatch.setenv("HSTU_SPLIT_RANKING_FORWARD", "0")
-    monkeypatch.setenv("HSTU_NONCRITICAL_GATE_DEFAULT", "compute_output_dist")
 
     config_path = tmp_path / "hstu_pipeline_schedule.json"
     config_path.write_text(
@@ -280,18 +300,30 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
                     "prefetch_embeddings": 1,
                 },
                 "same_progress_sync": {
-                    "noncritical_default": ["ranking_embedding_forward"],
-                    "tasks": {
-                        "h2d": ["global_tokens_allreduce"],
-                        "start_input_dist": [],
-                        "backward": ["prefetch_embeddings"],
+                    "h2d": {
+                        "wait_for": ["global_tokens_allreduce"],
+                        "sides": "gpu",
                     },
-                },
-                "same_progress_sync_sides": {
-                    "default": "gpu",
-                    "tasks": {
-                        "start_input_dist": "cpu",
-                        "backward": "both",
+                    "start_shuffle": {
+                        "wait_for": ["ranking_embedding_forward"],
+                        "sides": "gpu",
+                    },
+                    "finish_shuffle": {
+                        "wait_for": ["ranking_embedding_forward"],
+                        "sides": "gpu",
+                    },
+                    "start_input_dist": {"wait_for": [], "sides": "cpu"},
+                    "wait_input_dist": {
+                        "wait_for": ["ranking_embedding_forward"],
+                        "sides": "gpu",
+                    },
+                    "prefetch_embeddings": {
+                        "wait_for": ["ranking_embedding_forward"],
+                        "sides": "gpu",
+                    },
+                    "backward": {
+                        "wait_for": ["prefetch_embeddings"],
+                        "sides": "both",
                     },
                 },
             }
@@ -326,6 +358,61 @@ def test_hstu_schedule_config_rejects_unknown_task() -> None:
 
     with pytest.raises(ValueError, match="Unknown HSTU task"):
         HSTUPipelineScheduleConfig.from_mapping({"lookahead": {"typo": 1}})
+
+
+def test_hstu_schedule_config_rejects_legacy_same_progress_default() -> None:
+    from commons.pipeline.hstu_pipeline import HSTUPipelineScheduleConfig
+
+    with pytest.raises(ValueError, match="Unknown HSTU task"):
+        HSTUPipelineScheduleConfig.from_mapping(
+            {
+                "same_progress_sync": {
+                    "noncritical_default": ["forward"],
+                }
+            }
+        )
+
+
+def test_hstu_schedule_config_rejects_legacy_same_progress_sides() -> None:
+    from commons.pipeline.hstu_pipeline import HSTUPipelineScheduleConfig
+
+    with pytest.raises(ValueError, match="Unknown HSTU pipeline config field"):
+        HSTUPipelineScheduleConfig.from_mapping(
+            {
+                "same_progress_sync_sides": {
+                    "default": "both",
+                }
+            }
+        )
+
+
+def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
+    import json
+    import pathlib
+
+    from commons.pipeline.hstu_pipeline.config import HSTU_PIPELINE_TASKS
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    config_dir = (
+        root
+        / "examples"
+        / "hstu"
+        / "training"
+        / "benchmark"
+        / "pipeline_configs"
+        / "thread_map_presets"
+    )
+    expected = set(HSTU_PIPELINE_TASKS)
+
+    for path in sorted(config_dir.glob("*.json")):
+        data = json.loads(path.read_text())
+        assert set(data["thread_map"]) == expected, path.name
+        assert set(data["lookahead"]) == expected, path.name
+        assert set(data["same_progress_sync"]) == expected, path.name
+        assert "same_progress_sync_sides" not in data, path.name
+        assert "noncritical_default" not in json.dumps(data), path.name
+        for task_name, spec in data["same_progress_sync"].items():
+            assert set(spec) == {"wait_for", "sides"}, (path.name, task_name)
 
 
 def test_no_v0_context_references_in_hstu_pipeline() -> None:

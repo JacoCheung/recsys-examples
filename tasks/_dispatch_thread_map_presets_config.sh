@@ -10,17 +10,30 @@ TIME_LIMIT="${TIME_LIMIT:-01:30:00}"
 PARTITION="${PARTITION:-batch_short}"
 JOBNAME_PREFIX="${JOBNAME_PREFIX:-tmcfg}"
 CLONE="${CLONE:-/lustre/fsw/portfolios/coreai/users/junzhang/workspace/recsys-rework-mtms}"
+GIT_REMOTE="${GIT_REMOTE:-forked}"
+BRANCH="${BRANCH:-junzhang/rework-mtms}"
 RESULTS_BASE="${RESULTS_BASE:-/lustre/fsw/portfolios/coreai/users/junzhang/benchmark_runs}"
 BATCH_NAME="${BATCH_NAME:-thread_map_presets_config_2n_cwdfw_$(date -u +%Y%m%d_%H%M%S)}"
 SCP_DEST="${SCP_DEST:-vnc:/home/recsys-example-dashboard/benchmark/}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"
 DRY_RUN="${DRY_RUN:-0}"
 
-CONFIG_DIR="${CLONE}/examples/hstu/training/benchmark/pipeline_configs/thread_map_presets"
-EXP_FILE="${CLONE}/examples/hstu/training/benchmark/experiments_thread_map_presets_config.txt"
+echo "Syncing clone from git branch..."
+git -C "${CLONE}" fetch "${GIT_REMOTE}" "${BRANCH}:refs/remotes/${GIT_REMOTE}/${BRANCH}"
+git -C "${CLONE}" switch --recurse-submodules -C "${BRANCH}" "${GIT_REMOTE}/${BRANCH}"
+git -C "${CLONE}" submodule update --init --recursive
+if [[ -n "$(git -C "${CLONE}" status --porcelain)" ]]; then
+    echo "ERROR: ${CLONE} is dirty after checking out ${GIT_REMOTE}/${BRANCH}" >&2
+    git -C "${CLONE}" status --short >&2
+    exit 1
+fi
 
 echo "Batch:       ${BATCH_NAME}"
 echo "Clone:       ${CLONE}"
+echo "Branch:      ${GIT_REMOTE}/${BRANCH}"
+echo "Commit:      $(git -C "${CLONE}" rev-parse --short HEAD)"
+CONFIG_DIR="${CLONE}/examples/hstu/training/benchmark/pipeline_configs/thread_map_presets"
+EXP_FILE="${CLONE}/examples/hstu/training/benchmark/experiments_thread_map_presets_config.txt"
 echo "Config dir:  ${CONFIG_DIR}"
 echo "Results:     ${RESULTS_BASE}/${BATCH_NAME}"
 echo "Experiment:  ${EXP_FILE}"
@@ -36,11 +49,6 @@ if [[ "${DRY_RUN}" = "1" ]]; then
 fi
 
 HSTU_BENCHMARK_BATCH_NAME="${BATCH_NAME}" \
-HSTU_THREAD_MAP_VARIANT="" \
-HSTU_LA_DEPTH="" \
-HSTU_SPLIT_RANKING_FORWARD=0 \
-HSTU_NONCRITICAL_GATE_DEFAULT="" \
-HSTU_NONCRITICAL_GATES="" \
     bash training/benchmark/scripts/submit_all_experiments_slurm.sh \
         --account="${ACCOUNT}" \
         --job-name="${JOBNAME_PREFIX}" \
@@ -56,6 +64,7 @@ HSTU_NONCRITICAL_GATES="" \
         --results-dir="${RESULTS_BASE}" \
         --exp-file="${EXP_FILE}" \
         --hstu-root="${CLONE}/examples/hstu" \
+        --branch="${BRANCH}" \
         "${extra_args[@]}" \
         -y
 

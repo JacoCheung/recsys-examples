@@ -117,7 +117,7 @@ def _split_forward_owner(state: PipelineState) -> Any:
                 break
             owner = next_owner
     raise RuntimeError(
-        "HSTU_SPLIT_RANKING_FORWARD=1 requires model_fwd or model to expose "
+        "split_ranking_forward requires model_fwd or model to expose "
         "forward_embeddings(batch) and forward_after_embeddings(batch, embeddings)."
     )
 
