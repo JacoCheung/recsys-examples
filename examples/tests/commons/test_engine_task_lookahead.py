@@ -4,7 +4,7 @@
 """Tests for the ``Task.lookahead`` public API."""
 
 import pytest
-from commons.pipeline.engine.task import DataSlot, Task
+from commons.pipeline.engine.task import DataSlot, SameProgressSyncSide, Task
 
 
 def test_task_default_lookahead_is_zero() -> None:
@@ -169,8 +169,24 @@ def test_same_progress_sync_bare_names_accepted() -> None:
     authoring form)."""
     t = Task("x", same_progress_sync=("a", "b"))
     assert t.same_progress_sync == ("a", "b")
+    assert t.same_progress_sync_sides == SameProgressSyncSide.BOTH
     assert t.depends_on == ()
     assert t.cross_iter_depends_on == ()
+
+
+def test_same_progress_sync_sides_accepts_intflag() -> None:
+    t = Task(
+        "x",
+        same_progress_sync=("a",),
+        same_progress_sync_sides=SameProgressSyncSide.CPU,
+    )
+
+    assert t.same_progress_sync_sides == SameProgressSyncSide.CPU
+
+
+def test_same_progress_sync_sides_rejects_unknown_bits() -> None:
+    with pytest.raises(ValueError, match="unknown bits"):
+        Task("x", same_progress_sync=("a",), same_progress_sync_sides=4)
 
 
 def test_same_progress_sync_tuple_form_rejected() -> None:
@@ -212,8 +228,10 @@ def test_from_fn_same_progress_sync_kw() -> None:
         "x",
         fn=lambda ctx: None,
         same_progress_sync=("X",),
+        same_progress_sync_sides=SameProgressSyncSide.GPU,
     )
     assert t.same_progress_sync == ("X",)
+    assert t.same_progress_sync_sides == SameProgressSyncSide.GPU
 
 
 # ---------------------------------------------------------------------
