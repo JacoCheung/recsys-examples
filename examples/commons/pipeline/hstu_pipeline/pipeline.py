@@ -39,7 +39,6 @@ from commons.pipeline.engine import (
 )
 
 from .config import (
-    HSTU_NONCRITICAL_TASKS,
     HSTU_PIPELINE_CONFIG_ENV,
     HSTUPipelineScheduleConfig,
     load_hstu_pipeline_schedule_config,
@@ -116,9 +115,9 @@ HSTU_DEFAULT_THREAD_MAP: dict = {
 }
 
 
-# Named thread-map presets used by benchmark sweeps. Production callers
+# Named thread-map presets used by benchmark configs. Production callers
 # normally use ``HSTU_DEFAULT_THREAD_MAP`` unless they explicitly pass a
-# preset name or set ``HSTU_THREAD_MAP_VARIANT``.
+# preset name or a schedule config selects one.
 HSTU_THREAD_MAP_PRESETS: dict = {
     "default": HSTU_DEFAULT_THREAD_MAP,
     "by_stream": "by_stream",
@@ -198,53 +197,6 @@ HSTU_THREAD_MAP_PRESETS: dict = {
 }
 
 
-def _parse_gate_names(raw: str) -> tuple:
-    value = raw.strip()
-    if not value or value.lower() in {"none", "off", "0", "-"}:
-        return ()
-    return tuple(part.strip() for part in value.split("+") if part.strip())
-
-
-def _resolve_noncritical_gates(default_gate: str = "forward") -> Dict[str, tuple]:
-    """Resolve per-task same-progress gates for HSTU lookahead work.
-
-    Benchmark sweeps can set:
-      HSTU_NONCRITICAL_GATE_DEFAULT=compute_output_dist
-      HSTU_NONCRITICAL_GATES=h2d=global_tokens_allreduce^prefetch_embeddings=forward
-
-    A value of ``none`` clears the gate for that task. Multiple producer
-    names can be joined with ``+`` when an experiment needs it. Both ``,``
-    and ``^`` are accepted between task entries; benchmark scripts use ``^``
-    because Slurm's ``--export`` also uses commas.
-    """
-
-    default = os.environ.get("HSTU_NONCRITICAL_GATE_DEFAULT", "").strip()
-    if not default:
-        default = default_gate
-    gates = {task: _parse_gate_names(default) for task in HSTU_NONCRITICAL_TASKS}
-
-    spec = os.environ.get("HSTU_NONCRITICAL_GATES", "").strip()
-    if not spec:
-        return gates
-
-    for item in spec.replace("^", ",").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise ValueError(
-                f"HSTU_NONCRITICAL_GATES entries must be task=gate, got {item!r}"
-            )
-        task_name, gate_value = (part.strip() for part in item.split("=", 1))
-        if task_name not in gates:
-            raise ValueError(
-                f"Unknown non-critical HSTU task {task_name!r} in "
-                f"HSTU_NONCRITICAL_GATES. Known: {sorted(gates)}"
-            )
-        gates[task_name] = _parse_gate_names(gate_value)
-    return gates
-
-
 def resolve_hstu_thread_map_variant(name: Optional[str]) -> Any:
     """Resolve a named variant from ``HSTU_THREAD_MAP_PRESETS``.
 
@@ -305,11 +257,7 @@ class HSTUPipeline:
             ):
                 thread_map = self._schedule_config.thread_map
             else:
-                env_variant = os.environ.get("HSTU_THREAD_MAP_VARIANT")
-                if env_variant:
-                    thread_map = resolve_hstu_thread_map_variant(env_variant)
-                else:
-                    thread_map = HSTU_DEFAULT_THREAD_MAP
+                thread_map = HSTU_DEFAULT_THREAD_MAP
         if threaded and isinstance(thread_map, str):
             if thread_map in HSTU_THREAD_MAP_PRESETS:
                 thread_map = resolve_hstu_thread_map_variant(thread_map)
@@ -336,9 +284,7 @@ class HSTUPipeline:
         ):
             self._split_ranking_forward = self._schedule_config.split_ranking_forward
         else:
-            self._split_ranking_forward = (
-                os.environ.get("HSTU_SPLIT_RANKING_FORWARD", "0") == "1"
-            )
+            self._split_ranking_forward = False
 
         # Default shuffler is identity (no-op).
         if batch_shuffler is None:
@@ -401,44 +347,12 @@ class HSTUPipeline:
         config = self._schedule_config
         config_has_lookahead = config is not None and bool(config.lookahead)
 
-        # Benchmark sweeps may override the public depth knob with a
-        # named lookahead profile. A config file has priority over the
-        # legacy HSTU_LA_DEPTH env knob.
-        _depth_env = (
-            "" if config_has_lookahead else os.environ.get("HSTU_LA_DEPTH", "").strip()
-        )
-        if not _depth_env:
-            h2d_lookahead = self._prefetch_depth + 1
-            start_shuffle_lookahead = self._prefetch_depth + 1
-            finish_shuffle_lookahead = self._prefetch_depth + 1
-            start_input_dist_lookahead = self._prefetch_depth
-            wait_input_dist_lookahead = self._prefetch_depth
-            prefetch_lookahead = 1 if self._prefetch else None
-        else:
-            try:
-                _depth = int(_depth_env)
-            except ValueError as e:
-                raise ValueError(
-                    f"HSTU_LA_DEPTH={_depth_env!r} not supported; expected 3 or 6"
-                ) from e
-            if _depth == 3:
-                h2d_lookahead = 2
-                start_shuffle_lookahead = 2
-                finish_shuffle_lookahead = 2
-                start_input_dist_lookahead = 1
-                wait_input_dist_lookahead = 1
-                prefetch_lookahead = 1 if self._prefetch else None
-            elif _depth == 6:
-                h2d_lookahead = 5
-                start_shuffle_lookahead = 4
-                finish_shuffle_lookahead = 3
-                start_input_dist_lookahead = 3
-                wait_input_dist_lookahead = 2
-                prefetch_lookahead = 1 if self._prefetch else None
-            else:
-                raise ValueError(
-                    f"HSTU_LA_DEPTH={_depth} not supported; expected 3 or 6"
-                )
+        h2d_lookahead = self._prefetch_depth + 1
+        start_shuffle_lookahead = self._prefetch_depth + 1
+        finish_shuffle_lookahead = self._prefetch_depth + 1
+        start_input_dist_lookahead = self._prefetch_depth
+        wait_input_dist_lookahead = self._prefetch_depth
+        prefetch_lookahead = 1 if self._prefetch else None
 
         # Apply auto-scheduler / explicit overrides to off-default work.
         if la_overrides:
@@ -479,56 +393,53 @@ class HSTUPipeline:
                     "prefetch_embeddings", prefetch_lookahead
                 )
 
-        # Default gate keeps lookahead work behind the dense forward
-        # tail. Benchmark sweeps may override per non-critical task.
-        if config is None:
-            gates = _resolve_noncritical_gates(default_gate="forward")
-            sync_sides = {
-                task: SameProgressSyncSide.BOTH for task in HSTU_NONCRITICAL_TASKS
-            }
-        else:
-            gates = {
-                task: config.same_progress_for(
-                    task,
-                    ("forward",),
-                    noncritical_tasks=HSTU_NONCRITICAL_TASKS,
-                )
-                for task in HSTU_NONCRITICAL_TASKS
-            }
-            sync_sides = {
-                task: config.same_progress_side_for(task)
-                for task in HSTU_NONCRITICAL_TASKS
-            }
+        # Default gate keeps lookahead work behind the dense forward tail.
+        # Schedule configs may override the same-progress edge per task.
+        def same_progress_for(task_name: str) -> tuple:
+            default = ("forward",)
+            return (
+                config.same_progress_for(task_name, default)
+                if config is not None
+                else default
+            )
+
+        def same_progress_side_for(task_name: str) -> SameProgressSyncSide:
+            return (
+                config.same_progress_side_for(task_name)
+                if config is not None
+                else SameProgressSyncSide.BOTH
+            )
+
         tasks = [
             make_h2d_task(
                 self._state,
                 lookahead=h2d_lookahead,
-                same_progress_sync=gates["h2d"],
-                same_progress_sync_sides=sync_sides["h2d"],
+                same_progress_sync=same_progress_for("h2d"),
+                same_progress_sync_sides=same_progress_side_for("h2d"),
             ),
             make_start_shuffle_task(
                 self._state,
                 lookahead=start_shuffle_lookahead,
-                same_progress_sync=gates["start_shuffle"],
-                same_progress_sync_sides=sync_sides["start_shuffle"],
+                same_progress_sync=same_progress_for("start_shuffle"),
+                same_progress_sync_sides=same_progress_side_for("start_shuffle"),
             ),
             make_finish_shuffle_task(
                 self._state,
                 lookahead=finish_shuffle_lookahead,
-                same_progress_sync=gates["finish_shuffle"],
-                same_progress_sync_sides=sync_sides["finish_shuffle"],
+                same_progress_sync=same_progress_for("finish_shuffle"),
+                same_progress_sync_sides=same_progress_side_for("finish_shuffle"),
             ),
             make_start_input_dist_task(
                 self._state,
                 lookahead=start_input_dist_lookahead,
-                same_progress_sync=gates["start_input_dist"],
-                same_progress_sync_sides=sync_sides["start_input_dist"],
+                same_progress_sync=same_progress_for("start_input_dist"),
+                same_progress_sync_sides=same_progress_side_for("start_input_dist"),
             ),
             make_wait_input_dist_task(
                 self._state,
                 lookahead=wait_input_dist_lookahead,
-                same_progress_sync=gates["wait_input_dist"],
-                same_progress_sync_sides=sync_sides["wait_input_dist"],
+                same_progress_sync=same_progress_for("wait_input_dist"),
+                same_progress_sync_sides=same_progress_side_for("wait_input_dist"),
             ),
         ]
         # Keep prefetch after forward in declaration order: forward
@@ -546,8 +457,10 @@ class HSTUPipeline:
                 make_prefetch_task(
                     self._state,
                     lookahead=prefetch_lookahead,
-                    same_progress_sync=gates["prefetch_embeddings"],
-                    same_progress_sync_sides=sync_sides["prefetch_embeddings"],
+                    same_progress_sync=same_progress_for("prefetch_embeddings"),
+                    same_progress_sync_sides=same_progress_side_for(
+                        "prefetch_embeddings"
+                    ),
                 )
             )
         # compute_output_dist produces awaitables consumed by forward.
