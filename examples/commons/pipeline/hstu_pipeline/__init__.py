@@ -20,11 +20,13 @@ from .pipeline import (
     HSTU_DEFAULT_THREAD_MAP,
     HSTU_THREAD_MAP_PRESETS,
     HSTUPipeline,
+    HSTUPipelineScheduleConfig,
     resolve_hstu_thread_map_variant,
 )
 
 __all__ = [
     "HSTUPipeline",
+    "HSTUPipelineScheduleConfig",
     "HSTUPipelineFactory",
     "HSTU_DEFAULT_THREAD_MAP",
     "HSTU_THREAD_MAP_PRESETS",
