@@ -18,6 +18,10 @@
 import pytest
 
 
+def _same_progress_edges(task):
+    return [(edge.task, edge.sides.name.lower()) for edge in task.same_progress_sync]
+
+
 def test_import_hstu_pipeline() -> None:
     from commons.pipeline.hstu_pipeline import HSTUPipeline, HSTUPipelineFactory
 
@@ -237,27 +241,14 @@ def test_schedule_config_controls_same_progress_per_task() -> None:
         schedule_config={
             "split_ranking_forward": True,
             "same_progress_sync": {
-                "h2d": {
-                    "wait_for": ["global_tokens_allreduce"],
-                    "sides": "both",
-                },
-                "start_shuffle": {
-                    "wait_for": ["compute_output_dist"],
-                    "sides": "both",
-                },
-                "finish_shuffle": {
-                    "wait_for": ["compute_output_dist"],
-                    "sides": "both",
-                },
-                "start_input_dist": {"wait_for": [], "sides": "both"},
-                "wait_input_dist": {
-                    "wait_for": ["compute_output_dist"],
-                    "sides": "both",
-                },
-                "prefetch_embeddings": {
-                    "wait_for": ["ranking_embedding_forward"],
-                    "sides": "both",
-                },
+                "h2d": [{"task": "global_tokens_allreduce", "sides": "both"}],
+                "start_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
+                "finish_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
+                "start_input_dist": [],
+                "wait_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
+                "prefetch_embeddings": [
+                    {"task": "ranking_embedding_forward", "sides": "both"}
+                ],
             },
         },
     )
@@ -266,14 +257,20 @@ def test_schedule_config_controls_same_progress_per_task() -> None:
 
     validate(schedule, pool)
     tasks = {t.name: t for stage in schedule.stages for t in stage.tasks}
-    assert tasks["h2d"].same_progress_sync == ("global_tokens_allreduce",)
-    assert tasks["start_shuffle"].same_progress_sync == ("compute_output_dist",)
-    assert tasks["finish_shuffle"].same_progress_sync == ("compute_output_dist",)
+    assert _same_progress_edges(tasks["h2d"]) == [("global_tokens_allreduce", "both")]
+    assert _same_progress_edges(tasks["start_shuffle"]) == [
+        ("compute_output_dist", "both")
+    ]
+    assert _same_progress_edges(tasks["finish_shuffle"]) == [
+        ("compute_output_dist", "both")
+    ]
     assert tasks["start_input_dist"].same_progress_sync == ()
-    assert tasks["wait_input_dist"].same_progress_sync == ("compute_output_dist",)
-    assert tasks["prefetch_embeddings"].same_progress_sync == (
-        "ranking_embedding_forward",
-    )
+    assert _same_progress_edges(tasks["wait_input_dist"]) == [
+        ("compute_output_dist", "both")
+    ]
+    assert _same_progress_edges(tasks["prefetch_embeddings"]) == [
+        ("ranking_embedding_forward", "both")
+    ]
 
 
 def test_hstu_schedule_config_file_controls_runtime_knobs(
@@ -281,7 +278,6 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
 ) -> None:
     import json
 
-    from commons.pipeline.engine import SameProgressSyncSide
     from commons.pipeline.hstu_pipeline.pipeline import HSTU_THREAD_MAP_PRESETS
 
     config_path = tmp_path / "hstu_pipeline_schedule.json"
@@ -300,31 +296,21 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
                     "prefetch_embeddings": 1,
                 },
                 "same_progress_sync": {
-                    "h2d": {
-                        "wait_for": ["global_tokens_allreduce"],
-                        "sides": "gpu",
-                    },
-                    "start_shuffle": {
-                        "wait_for": ["ranking_embedding_forward"],
-                        "sides": "gpu",
-                    },
-                    "finish_shuffle": {
-                        "wait_for": ["ranking_embedding_forward"],
-                        "sides": "gpu",
-                    },
-                    "start_input_dist": {"wait_for": [], "sides": "cpu"},
-                    "wait_input_dist": {
-                        "wait_for": ["ranking_embedding_forward"],
-                        "sides": "gpu",
-                    },
-                    "prefetch_embeddings": {
-                        "wait_for": ["ranking_embedding_forward"],
-                        "sides": "gpu",
-                    },
-                    "backward": {
-                        "wait_for": ["prefetch_embeddings"],
-                        "sides": "both",
-                    },
+                    "h2d": [{"task": "global_tokens_allreduce", "sides": "gpu"}],
+                    "start_shuffle": [
+                        {"task": "ranking_embedding_forward", "sides": "gpu"}
+                    ],
+                    "finish_shuffle": [
+                        {"task": "ranking_embedding_forward", "sides": "gpu"}
+                    ],
+                    "start_input_dist": [],
+                    "wait_input_dist": [
+                        {"task": "ranking_embedding_forward", "sides": "gpu"}
+                    ],
+                    "prefetch_embeddings": [
+                        {"task": "ranking_embedding_forward", "sides": "gpu"}
+                    ],
+                    "backward": [{"task": "prefetch_embeddings", "sides": "both"}],
                 },
             }
         )
@@ -341,16 +327,12 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
     validate(schedule, pool)
     tasks = {t.name: t for stage in schedule.stages for t in stage.tasks}
     assert schedule.in_flight_batches == 3
-    assert tasks["h2d"].same_progress_sync == ("global_tokens_allreduce",)
-    assert tasks["h2d"].same_progress_sync_sides == SameProgressSyncSide.GPU
-    assert tasks["start_shuffle"].same_progress_sync == ("ranking_embedding_forward",)
-    assert tasks["start_shuffle"].same_progress_sync_sides == SameProgressSyncSide.GPU
+    assert _same_progress_edges(tasks["h2d"]) == [("global_tokens_allreduce", "gpu")]
+    assert _same_progress_edges(tasks["start_shuffle"]) == [
+        ("ranking_embedding_forward", "gpu")
+    ]
     assert tasks["start_input_dist"].same_progress_sync == ()
-    assert tasks["start_input_dist"].same_progress_sync_sides == (
-        SameProgressSyncSide.CPU
-    )
-    assert tasks["backward"].same_progress_sync == ("prefetch_embeddings",)
-    assert tasks["backward"].same_progress_sync_sides == SameProgressSyncSide.BOTH
+    assert _same_progress_edges(tasks["backward"]) == [("prefetch_embeddings", "both")]
 
 
 def test_hstu_schedule_config_rejects_unknown_task() -> None:
@@ -412,7 +394,9 @@ def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
         assert "same_progress_sync_sides" not in data, path.name
         assert "noncritical_default" not in json.dumps(data), path.name
         for task_name, spec in data["same_progress_sync"].items():
-            assert set(spec) == {"wait_for", "sides"}, (path.name, task_name)
+            assert isinstance(spec, list), (path.name, task_name)
+            for edge in spec:
+                assert set(edge) == {"task", "sides"}, (path.name, task_name)
 
 
 def test_no_v0_context_references_in_hstu_pipeline() -> None:

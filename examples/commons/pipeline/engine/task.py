@@ -15,10 +15,15 @@
 
 """Task and DataSlot: the primitive units of the pipeline engine."""
 
+from dataclasses import dataclass
 from enum import IntFlag
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, Mapping, Optional, Tuple, Union
 
-__all__ = ["DataSlot", "SameProgressSyncSide", "Task"]
+__all__ = [
+    "DataSlot",
+    "SameProgressSyncSide",
+    "Task",
+]
 
 
 # A read or write entry can be authored as a bare slot name (string)
@@ -62,13 +67,12 @@ def _normalize_slot_refs(
 #       ``("name", -1)``; tuple form waits for an older batch by N
 #       iterations. Zero or positive offsets are rejected.
 #
-#   ``same_progress_sync=("X", ...)``
+#   ``same_progress_sync=("X", ("Y", SameProgressSyncSide.GPU), ...)``
 #       Current-progress dependency. The consumer waits for X's work in
 #       this exact ``progress()`` call, independent of the two tasks'
 #       lookahead values. Use it for stream coherency on shared state
-#       that is not represented by ``reads`` / ``writes``. The
-#       ``same_progress_sync_sides`` IntFlag selects CPU ordering,
-#       GPU stream/event ordering, or both.
+#       that is not represented by ``reads`` / ``writes``. Each edge can
+#       specify whether it is enforced on CPU, GPU, or both.
 
 
 class SameProgressSyncSide(IntFlag):
@@ -85,12 +89,39 @@ class SameProgressSyncSide(IntFlag):
     BOTH = CPU | GPU
 
 
+@dataclass(frozen=True)
+class _SameProgressSync:
+    """One ``same_progress_sync`` edge.
+
+    Bare task names are accepted by ``Task`` and normalized to this
+    shape with ``sides=BOTH``.
+    """
+
+    task: str
+    sides: SameProgressSyncSide = SameProgressSyncSide.BOTH
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task, str):
+            raise TypeError(
+                "same_progress_sync task name must be a string; "
+                f"got {type(self.task).__name__}: {self.task!r}"
+            )
+        if not self.task:
+            raise ValueError("same_progress_sync task name must be non-empty")
+        object.__setattr__(
+            self,
+            "sides",
+            _normalize_same_progress_sync_side(
+                self.sides, field_name=f"same_progress_sync.{self.task}.sides"
+            ),
+        )
+
+
 def _validate_bare_name_refs(
     refs: Optional[Iterable[str]],
     field_name: str,
 ) -> Tuple[str, ...]:
-    """Validate a tuple-of-bare-task-names field (``depends_on`` /
-    ``same_progress_sync``)."""
+    """Validate a tuple-of-bare-task-names field (``depends_on``)."""
     if refs is None:
         return ()
     out: list = []
@@ -103,6 +134,14 @@ def _validate_bare_name_refs(
                 f"got {type(r).__name__}: {r!r}."
             )
     return tuple(out)
+
+
+_SameProgressSyncRef = Union[
+    str,
+    _SameProgressSync,
+    Tuple[str, Union[SameProgressSyncSide, int]],
+    Mapping[str, Any],
+]
 
 
 def _validate_cross_iter_depends_on(
@@ -150,34 +189,111 @@ def _validate_cross_iter_depends_on(
     return tuple(out)
 
 
-def _normalize_same_progress_sync_sides(value) -> SameProgressSyncSide:
+def _normalize_same_progress_sync_side(
+    value: Any,
+    *,
+    field_name: str,
+) -> SameProgressSyncSide:
     if value is None:
         return SameProgressSyncSide.BOTH
+    if isinstance(value, int) and not isinstance(value, bool) and value < 0:
+        raise ValueError(f"{field_name}={value} contains unknown bits")
     try:
         sides = SameProgressSyncSide(value)
     except (TypeError, ValueError) as e:
         raise TypeError(
-            "same_progress_sync_sides must be a SameProgressSyncSide IntFlag "
-            f"or compatible int, got {type(value).__name__}: {value!r}"
+            f"{field_name} must be a SameProgressSyncSide IntFlag or "
+            f"compatible int, got {type(value).__name__}: {value!r}"
         ) from e
     valid_mask = int(SameProgressSyncSide.BOTH)
     if int(sides) & ~valid_mask:
         raise ValueError(
-            f"same_progress_sync_sides={int(sides)} contains unknown bits; "
+            f"{field_name}={int(sides)} contains unknown bits; "
             f"valid bits are CPU={int(SameProgressSyncSide.CPU)} and "
             f"GPU={int(SameProgressSyncSide.GPU)}."
         )
     return sides
 
 
-def same_progress_sync_uses_cpu(task) -> bool:
-    sides = getattr(task, "same_progress_sync_sides", SameProgressSyncSide.BOTH)
-    return bool(sides & SameProgressSyncSide.CPU)
+def _normalize_same_progress_sync_ref(
+    ref: _SameProgressSyncRef,
+    *,
+    field_name: str,
+) -> _SameProgressSync:
+    if isinstance(ref, _SameProgressSync):
+        return ref
+    if isinstance(ref, str):
+        return _SameProgressSync(ref)
+    if isinstance(ref, tuple) and len(ref) == 2:
+        name, sides = ref
+        if not isinstance(name, str):
+            raise TypeError(
+                f"{field_name} tuple entries must be (str, side), got "
+                f"({type(name).__name__}, {type(sides).__name__}): {ref!r}"
+            )
+        return _SameProgressSync(
+            name,
+            _normalize_same_progress_sync_side(
+                sides, field_name=f"{field_name}.{name}.sides"
+            ),
+        )
+    if isinstance(ref, Mapping):
+        unknown = set(ref) - {"task", "name", "sides"}
+        if unknown:
+            raise ValueError(f"Unknown {field_name} field(s): {sorted(unknown)}")
+        has_task = "task" in ref
+        has_name = "name" in ref
+        if has_task == has_name:
+            raise ValueError(
+                f"{field_name} object must contain exactly one of task/name"
+            )
+        name = ref["task"] if has_task else ref["name"]
+        if not isinstance(name, str):
+            raise TypeError(
+                f"{field_name}.task must be a string, got "
+                f"{type(name).__name__}: {name!r}"
+            )
+        return _SameProgressSync(
+            name,
+            _normalize_same_progress_sync_side(
+                ref.get("sides", SameProgressSyncSide.BOTH),
+                field_name=f"{field_name}.{name}.sides",
+            ),
+        )
+    raise TypeError(
+        f"{field_name} entries must be task names or (task, side) edges; "
+        f"got {type(ref).__name__}: {ref!r}."
+    )
 
 
-def same_progress_sync_uses_gpu(task) -> bool:
-    sides = getattr(task, "same_progress_sync_sides", SameProgressSyncSide.BOTH)
-    return bool(sides & SameProgressSyncSide.GPU)
+def _validate_same_progress_sync_refs(
+    refs: Optional[Iterable[_SameProgressSyncRef]],
+    field_name: str,
+) -> Tuple[_SameProgressSync, ...]:
+    if refs is None or refs is False:
+        return ()
+    if isinstance(refs, (str, _SameProgressSync, Mapping)):
+        return (_normalize_same_progress_sync_ref(refs, field_name=field_name),)
+
+    out: list = []
+    for ref in refs:
+        out.append(_normalize_same_progress_sync_ref(ref, field_name=field_name))
+    return tuple(out)
+
+
+def _same_progress_sync_edges(
+    task,
+    *,
+    side: Optional[SameProgressSyncSide] = None,
+) -> Tuple[_SameProgressSync, ...]:
+    edges = getattr(task, "same_progress_sync", ())
+    if side is None:
+        return tuple(edges)
+    return tuple(edge for edge in edges if edge.sides & side)
+
+
+def _same_progress_sync_names(task) -> Tuple[str, ...]:
+    return tuple(edge.task for edge in _same_progress_sync_edges(task))
 
 
 class DataSlot:
@@ -235,8 +351,7 @@ class Task:
     writes: Tuple[DataSlot, ...] = ()
     depends_on: Tuple[str, ...] = ()
     cross_iter_depends_on: Tuple[Tuple[str, int], ...] = ()
-    same_progress_sync: Tuple[str, ...] = ()
-    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH
+    same_progress_sync: Tuple[_SameProgressSync, ...] = ()
     nvtx_tag: Optional[str] = None
     nccl: bool = False
 
@@ -250,8 +365,7 @@ class Task:
         writes: Optional[Iterable[SlotRef]] = None,
         depends_on: Optional[Iterable[str]] = None,
         cross_iter_depends_on: Optional[Iterable[Union[str, Tuple[str, int]]]] = None,
-        same_progress_sync: Optional[Iterable[str]] = None,
-        same_progress_sync_sides: Optional[SameProgressSyncSide] = None,
+        same_progress_sync: Optional[Iterable[_SameProgressSyncRef]] = None,
         nvtx_tag: Optional[str] = None,
         nccl: Optional[bool] = None,
     ) -> None:
@@ -281,11 +395,6 @@ class Task:
             if same_progress_sync is not None
             else self.same_progress_sync
         )
-        raw_same_progress_sync_sides = (
-            same_progress_sync_sides
-            if same_progress_sync_sides is not None
-            else self.same_progress_sync_sides
-        )
 
         # Normalize unconditionally: covers both constructor kwargs
         # and subclass class attributes. Without this, a subclass that
@@ -299,11 +408,8 @@ class Task:
         self.cross_iter_depends_on = _validate_cross_iter_depends_on(
             raw_cross_iter_depends_on
         )
-        self.same_progress_sync = _validate_bare_name_refs(
+        self.same_progress_sync = _validate_same_progress_sync_refs(
             raw_same_progress_sync, "same_progress_sync"
-        )
-        self.same_progress_sync_sides = _normalize_same_progress_sync_sides(
-            raw_same_progress_sync_sides
         )
 
         # Sanity: a single producer name appearing in multiple of
@@ -311,7 +417,7 @@ class Task:
         # authoring mistake — they express different semantics.
         within_names = set(self.depends_on)
         cross_names = {n for (n, _) in self.cross_iter_depends_on}
-        sync_names = set(self.same_progress_sync)
+        sync_names = set(_same_progress_sync_names(self))
         for a_name, a_set, b_name, b_set in [
             ("depends_on", within_names, "cross_iter_depends_on", cross_names),
             ("depends_on", within_names, "same_progress_sync", sync_names),
@@ -379,8 +485,7 @@ class Task:
         writes: Iterable[SlotRef] = (),
         depends_on: Iterable[str] = (),
         cross_iter_depends_on: Iterable[Union[str, Tuple[str, int]]] = (),
-        same_progress_sync: Iterable[str] = (),
-        same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
+        same_progress_sync: Iterable[_SameProgressSyncRef] = (),
         nvtx_tag: Optional[str] = None,
         nccl: bool = False,
     ) -> "Task":
@@ -404,7 +509,6 @@ class Task:
             depends_on=depends_on,
             cross_iter_depends_on=cross_iter_depends_on,
             same_progress_sync=same_progress_sync,
-            same_progress_sync_sides=same_progress_sync_sides,
             nvtx_tag=nvtx_tag,
             nccl=nccl,
         )
