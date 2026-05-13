@@ -26,7 +26,7 @@ from .executor import SequentialExecutor, ThreadedExecutor
 from .pipeline import Pipeline, SchedulablePipeline
 from .schedule import Schedule, Stage
 from .streams import StreamPool
-from .task import DataSlot, Task
+from .task import DataSlot, SameProgressSyncSide, Task
 
 __all__ = [
     "DataSlot",
@@ -35,6 +35,7 @@ __all__ = [
     "SchedulablePipeline",
     "ScheduleValidationError",
     "SequentialExecutor",
+    "SameProgressSyncSide",
     "Stage",
     "StreamPool",
     "Task",
