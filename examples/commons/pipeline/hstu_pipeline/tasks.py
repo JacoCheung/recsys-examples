@@ -39,7 +39,7 @@ from typing import Any, Callable, List, Optional
 
 import nvtx
 import torch
-from commons.pipeline.engine import Task
+from commons.pipeline.engine import SameProgressSyncSide, Task
 
 RANKING_EMBEDDINGS_SLOT = "ranking_embeddings"
 
@@ -133,6 +133,7 @@ def make_h2d_task(
     lookahead: int,
     stream: str = "memcpy",
     same_progress_sync: tuple = (),
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
 ) -> Task:
     """Copies engine-populated ``batch_cpu`` to GPU and stamps a fresh
     ``torchrec_ctx`` into the same slot store."""
@@ -173,6 +174,7 @@ def make_h2d_task(
             "torchrec_ctx",
         ),
         same_progress_sync=same_progress_sync,
+        same_progress_sync_sides=same_progress_sync_sides,
     )
 
 
@@ -234,6 +236,7 @@ def make_start_shuffle_task(
     *,
     lookahead: int,
     same_progress_sync: tuple = (),
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
 ) -> Task:
     """Phase 1 of 2-phase KK shuffler. Runs on memcpy stream.
 
@@ -272,6 +275,7 @@ def make_start_shuffle_task(
         writes=("shuffle_handle",),
         nccl=not state.is_identity_shuffler,
         same_progress_sync=same_progress_sync,
+        same_progress_sync_sides=same_progress_sync_sides,
     )
 
 
@@ -285,6 +289,7 @@ def make_finish_shuffle_task(
     *,
     lookahead: int,
     same_progress_sync: tuple = (),
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
 ) -> Task:
     from megatron.core import parallel_state
 
@@ -321,6 +326,7 @@ def make_finish_shuffle_task(
         # NCCL only for non-identity shuffler (identity is a no-op).
         nccl=not state.is_identity_shuffler,
         same_progress_sync=same_progress_sync,
+        same_progress_sync_sides=same_progress_sync_sides,
     )
 
 
@@ -334,6 +340,7 @@ def make_start_input_dist_task(
     *,
     lookahead: int,
     same_progress_sync: tuple = (),
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
 ) -> Task:
     """Calls torchrec's start_sparse_data_dist. Mutates torchrec_ctx in place."""
 
@@ -372,6 +379,7 @@ def make_start_input_dist_task(
         # applies to the slot itself, not mutation).
         nccl=True,
         same_progress_sync=same_progress_sync,
+        same_progress_sync_sides=same_progress_sync_sides,
     )
 
 
@@ -385,6 +393,7 @@ def make_wait_input_dist_task(
     *,
     lookahead: int,
     same_progress_sync: tuple = (),
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
 ) -> Task:
     def _fn(ctx):
         torchrec_ctx = ctx.slots.get("torchrec_ctx", None)
@@ -408,6 +417,7 @@ def make_wait_input_dist_task(
         # must participate in the declaration-order NCCL chain.
         nccl=True,
         same_progress_sync=same_progress_sync,
+        same_progress_sync_sides=same_progress_sync_sides,
     )
 
 
@@ -421,6 +431,7 @@ def make_prefetch_task(
     *,
     lookahead: int,
     same_progress_sync: tuple = (),
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
 ) -> Task:
     """Calls ShardedModule.prefetch on the prefetch stream and stores
     the result into the context's ``module_input_post_prefetch`` /
@@ -465,6 +476,7 @@ def make_prefetch_task(
         reads=("shuffled_batch", "torchrec_ctx"),
         depends_on=("wait_input_dist",),
         same_progress_sync=same_progress_sync,
+        same_progress_sync_sides=same_progress_sync_sides,
     )
 
 
@@ -646,6 +658,7 @@ def make_backward_task(
     *,
     depends_on: tuple = (),
     same_progress_sync: tuple = (),
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
 ) -> Task:
     """Build the backward task.
 
@@ -683,6 +696,7 @@ def make_backward_task(
         writes=("local_loss_sum",),
         depends_on=depends_on,
         same_progress_sync=same_progress_sync,
+        same_progress_sync_sides=same_progress_sync_sides,
         # DDP backward AllReduce fires inside .backward() — mark NCCL.
         nccl=True,
     )

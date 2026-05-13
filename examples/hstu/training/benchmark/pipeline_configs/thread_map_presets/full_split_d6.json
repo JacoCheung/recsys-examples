@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "thread_map": "io_data_dist_prefetch_compute",
+  "split_ranking_forward": false,
+  "lookahead": {
+    "h2d": 5,
+    "start_shuffle": 4,
+    "finish_shuffle": 3,
+    "start_input_dist": 3,
+    "wait_input_dist": 2,
+    "prefetch_embeddings": 1
+  },
+  "same_progress_sync": {
+    "noncritical_default": [],
+    "tasks": {
+      "backward": ["prefetch_embeddings"]
+    }
+  },
+  "same_progress_sync_sides": {
+    "default": "both"
+  }
+}
