@@ -1,6 +1,22 @@
 {
   "version": 1,
-  "thread_map": "default",
+  "thread_map": {
+    "h2d": "io",
+    "start_shuffle": "io",
+    "finish_shuffle": "io",
+    "start_input_dist": "compute",
+    "wait_input_dist": "compute",
+    "prefetch_embeddings": "compute",
+    "zero_grad": "compute",
+    "global_tokens_allreduce": "compute",
+    "compute_output_dist": "compute",
+    "ranking_embedding_forward": "compute",
+    "forward": "compute",
+    "backward": "compute",
+    "finalize_model_grads": "compute",
+    "optimizer_step": "compute",
+    "watchdog_step": "compute"
+  },
   "split_ranking_forward": false,
   "lookahead": {
     "h2d": 5,
@@ -8,15 +24,32 @@
     "finish_shuffle": 3,
     "start_input_dist": 3,
     "wait_input_dist": 2,
-    "prefetch_embeddings": 1
+    "prefetch_embeddings": 1,
+    "zero_grad": 0,
+    "global_tokens_allreduce": 0,
+    "compute_output_dist": 0,
+    "ranking_embedding_forward": 0,
+    "forward": 0,
+    "backward": 0,
+    "finalize_model_grads": 0,
+    "optimizer_step": 0,
+    "watchdog_step": 0
   },
   "same_progress_sync": {
-    "noncritical_default": [],
-    "tasks": {
-      "backward": ["prefetch_embeddings"]
-    }
-  },
-  "same_progress_sync_sides": {
-    "default": "both"
+    "h2d": {"wait_for": ["forward"], "sides": "both"},
+    "start_shuffle": {"wait_for": ["forward"], "sides": "both"},
+    "finish_shuffle": {"wait_for": ["forward"], "sides": "both"},
+    "start_input_dist": {"wait_for": ["forward"], "sides": "both"},
+    "wait_input_dist": {"wait_for": ["forward"], "sides": "both"},
+    "prefetch_embeddings": {"wait_for": ["forward"], "sides": "both"},
+    "zero_grad": {"wait_for": [], "sides": "both"},
+    "global_tokens_allreduce": {"wait_for": [], "sides": "both"},
+    "compute_output_dist": {"wait_for": [], "sides": "both"},
+    "ranking_embedding_forward": {"wait_for": [], "sides": "both"},
+    "forward": {"wait_for": [], "sides": "both"},
+    "backward": {"wait_for": ["prefetch_embeddings"], "sides": "both"},
+    "finalize_model_grads": {"wait_for": [], "sides": "both"},
+    "optimizer_step": {"wait_for": [], "sides": "both"},
+    "watchdog_step": {"wait_for": [], "sides": "both"}
   }
 }
