@@ -1,6 +1,22 @@
 {
   "version": 1,
-  "thread_map": "per_task",
+  "thread_map": {
+    "h2d": "h2d",
+    "start_shuffle": "start_shuffle",
+    "finish_shuffle": "finish_shuffle",
+    "start_input_dist": "start_input_dist",
+    "wait_input_dist": "wait_input_dist",
+    "prefetch_embeddings": "prefetch_embeddings",
+    "zero_grad": "zero_grad",
+    "global_tokens_allreduce": "global_tokens_allreduce",
+    "compute_output_dist": "compute_output_dist",
+    "ranking_embedding_forward": "ranking_embedding_forward",
+    "forward": "forward",
+    "backward": "backward",
+    "finalize_model_grads": "finalize_model_grads",
+    "optimizer_step": "optimizer_step",
+    "watchdog_step": "watchdog_step"
+  },
   "split_ranking_forward": false,
   "lookahead": {
     "h2d": 2,
@@ -8,15 +24,32 @@
     "finish_shuffle": 2,
     "start_input_dist": 1,
     "wait_input_dist": 1,
-    "prefetch_embeddings": 1
+    "prefetch_embeddings": 1,
+    "zero_grad": 0,
+    "global_tokens_allreduce": 0,
+    "compute_output_dist": 0,
+    "ranking_embedding_forward": 0,
+    "forward": 0,
+    "backward": 0,
+    "finalize_model_grads": 0,
+    "optimizer_step": 0,
+    "watchdog_step": 0
   },
   "same_progress_sync": {
-    "noncritical_default": [],
-    "tasks": {
-      "backward": ["prefetch_embeddings"]
-    }
-  },
-  "same_progress_sync_sides": {
-    "default": "both"
+    "h2d": {"wait_for": ["forward"], "sides": "both"},
+    "start_shuffle": {"wait_for": ["forward"], "sides": "both"},
+    "finish_shuffle": {"wait_for": ["forward"], "sides": "both"},
+    "start_input_dist": {"wait_for": ["forward"], "sides": "both"},
+    "wait_input_dist": {"wait_for": ["forward"], "sides": "both"},
+    "prefetch_embeddings": {"wait_for": ["forward"], "sides": "both"},
+    "zero_grad": {"wait_for": [], "sides": "both"},
+    "global_tokens_allreduce": {"wait_for": [], "sides": "both"},
+    "compute_output_dist": {"wait_for": [], "sides": "both"},
+    "ranking_embedding_forward": {"wait_for": [], "sides": "both"},
+    "forward": {"wait_for": [], "sides": "both"},
+    "backward": {"wait_for": ["prefetch_embeddings"], "sides": "both"},
+    "finalize_model_grads": {"wait_for": [], "sides": "both"},
+    "optimizer_step": {"wait_for": [], "sides": "both"},
+    "watchdog_step": {"wait_for": [], "sides": "both"}
   }
 }
