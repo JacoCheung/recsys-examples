@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from commons.pipeline.engine import SameProgressSyncSide
+from commons.pipeline.engine.task import _SameProgressSync
 
 HSTU_PIPELINE_CONFIG_ENV = "HSTU_PIPELINE_CONFIG"
 
@@ -45,8 +46,9 @@ class HSTUPipelineScheduleConfig:
 
     thread_map: Any = None
     lookahead: Dict[str, int] = field(default_factory=dict)
-    same_progress_sync: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
-    same_progress_sides: Dict[str, SameProgressSyncSide] = field(default_factory=dict)
+    same_progress_sync: Dict[str, Tuple[_SameProgressSync, ...]] = field(
+        default_factory=dict
+    )
     split_ranking_forward: Optional[bool] = None
     source: Optional[str] = None
 
@@ -72,9 +74,7 @@ class HSTUPipelineScheduleConfig:
         if version != 1:
             raise ValueError(f"Unsupported HSTU pipeline config version: {version!r}")
 
-        same_progress, side_tasks = _parse_same_progress_sync(
-            raw.get("same_progress_sync")
-        )
+        same_progress = _parse_same_progress_sync(raw.get("same_progress_sync"))
         split = (
             None
             if "split_ranking_forward" not in raw
@@ -88,7 +88,6 @@ class HSTUPipelineScheduleConfig:
             thread_map=thread_map,
             lookahead=_parse_lookahead(raw.get("lookahead")),
             same_progress_sync=same_progress,
-            same_progress_sides=side_tasks,
             split_ranking_forward=split,
             source=source,
         )
@@ -99,12 +98,9 @@ class HSTUPipelineScheduleConfig:
     def same_progress_for(
         self,
         task_name: str,
-        default: Tuple[str, ...],
-    ) -> Tuple[str, ...]:
+        default: Tuple[Any, ...],
+    ) -> Tuple[Any, ...]:
         return self.same_progress_sync.get(task_name, default)
-
-    def same_progress_side_for(self, task_name: str) -> SameProgressSyncSide:
-        return self.same_progress_sides.get(task_name, SameProgressSyncSide.BOTH)
 
 
 def load_hstu_pipeline_schedule_config(
@@ -195,74 +191,80 @@ def _parse_lookahead(value: Any) -> Dict[str, int]:
     return parsed
 
 
-def _parse_name_tuple(value: Any, *, field_name: str) -> Tuple[str, ...]:
-    if value is None or value is False:
-        return ()
-    if isinstance(value, int) and not isinstance(value, bool):
-        if value == 0:
-            return ()
-        raise TypeError(f"{field_name} must be a task name list, got {value!r}")
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped or stripped.lower() in {"none", "off", "0", "-"}:
-            return ()
-        names = tuple(part.strip() for part in stripped.split("+") if part.strip())
-    elif isinstance(value, (list, tuple)):
-        names = tuple(value)
-    else:
-        raise TypeError(
-            f"{field_name} must be a task name string/list, got {type(value).__name__}"
-        )
-
-    for name in names:
-        if not isinstance(name, str):
-            raise TypeError(f"{field_name} entries must be strings, got {name!r}")
-        _validate_task_name(name, field_name=field_name)
-    return names
-
-
 def _parse_same_progress_sync(
     value: Any,
-) -> Tuple[Dict[str, Tuple[str, ...]], Dict[str, SameProgressSyncSide]]:
+) -> Dict[str, Tuple[_SameProgressSync, ...]]:
     if value is None:
-        return {}, {}
+        return {}
     if not isinstance(value, Mapping):
         raise TypeError(
             f"same_progress_sync must be an object, got {type(value).__name__}"
         )
 
-    task_specs: Dict[str, Tuple[str, ...]] = {}
-    task_sides: Dict[str, SameProgressSyncSide] = {}
+    task_specs: Dict[str, Tuple[_SameProgressSync, ...]] = {}
 
     for task_name, raw_sync in value.items():
         if not isinstance(task_name, str):
             raise TypeError("same_progress_sync task names must be strings")
         _validate_task_name(task_name, field_name="same_progress_sync")
-        wait_for, sides = _parse_same_progress_sync_task(
+        task_specs[task_name] = _parse_same_progress_sync_task(
             raw_sync, field_name=f"same_progress_sync.{task_name}"
         )
-        task_specs[task_name] = wait_for
-        task_sides[task_name] = sides
-    return task_specs, task_sides
+    return task_specs
 
 
 def _parse_same_progress_sync_task(
     value: Any,
     *,
     field_name: str,
-) -> Tuple[Tuple[str, ...], SameProgressSyncSide]:
-    if not isinstance(value, Mapping):
-        return (
-            _parse_name_tuple(value, field_name=field_name),
-            SameProgressSyncSide.BOTH,
+) -> Tuple[_SameProgressSync, ...]:
+    if value is None or value is False:
+        return ()
+    if isinstance(value, str):
+        return (_parse_same_progress_sync_edge(value, field_name=field_name),)
+    if isinstance(value, Mapping):
+        return (_parse_same_progress_sync_edge(value, field_name=field_name),)
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _parse_same_progress_sync_edge(
+                raw_edge, field_name=f"{field_name}[{index}]"
+            )
+            for index, raw_edge in enumerate(value)
         )
+    raise TypeError(
+        f"{field_name} must be a task name, edge object, or edge list, "
+        f"got {type(value).__name__}"
+    )
 
-    unknown = set(value) - {"wait_for", "sides"}
-    if unknown:
-        raise ValueError(f"Unknown {field_name} field(s): {sorted(unknown)}")
-    wait_for = _parse_name_tuple(value.get("wait_for", ()), field_name=field_name)
-    sides = _parse_side(value.get("sides", "both"), field_name=f"{field_name}.sides")
-    return wait_for, sides
+
+def _parse_same_progress_sync_edge(value: Any, *, field_name: str) -> _SameProgressSync:
+    if isinstance(value, str):
+        dep_name = value
+        side = SameProgressSyncSide.BOTH
+    elif isinstance(value, Mapping):
+        unknown = set(value) - {"task", "name", "sides"}
+        if unknown:
+            raise ValueError(f"Unknown {field_name} field(s): {sorted(unknown)}")
+        has_task = "task" in value
+        has_name = "name" in value
+        if has_task == has_name:
+            raise ValueError(f"{field_name} must contain exactly one of task/name")
+        dep_name = value["task"] if has_task else value["name"]
+        side = _parse_side(value.get("sides", "both"), field_name=f"{field_name}.sides")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        dep_name, raw_side = value
+        side = _parse_side(raw_side, field_name=f"{field_name}.sides")
+    else:
+        raise TypeError(
+            f"{field_name} entries must be task names or (task, side) edges; "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    if not isinstance(dep_name, str):
+        raise TypeError(
+            f"{field_name}.task must be a string, got {type(dep_name).__name__}"
+        )
+    _validate_task_name(dep_name, field_name=field_name)
+    return _SameProgressSync(dep_name, side)
 
 
 def _parse_side(value: Any, *, field_name: str) -> SameProgressSyncSide:
@@ -271,6 +273,8 @@ def _parse_side(value: Any, *, field_name: str) -> SameProgressSyncSide:
         _validate_side_bits(side, field_name=field_name)
         return side
     if isinstance(value, int) and not isinstance(value, bool):
+        if value < 0:
+            raise ValueError(f"{field_name}={value} contains unknown bits")
         side = SameProgressSyncSide(value)
         _validate_side_bits(side, field_name=field_name)
         return side

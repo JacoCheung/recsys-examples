@@ -30,7 +30,6 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 from commons.pipeline.engine import (
-    SameProgressSyncSide,
     SchedulablePipeline,
     Schedule,
     Stage,
@@ -403,43 +402,31 @@ class HSTUPipeline:
                 else default
             )
 
-        def same_progress_side_for(task_name: str) -> SameProgressSyncSide:
-            return (
-                config.same_progress_side_for(task_name)
-                if config is not None
-                else SameProgressSyncSide.BOTH
-            )
-
         tasks = [
             make_h2d_task(
                 self._state,
                 lookahead=h2d_lookahead,
                 same_progress_sync=same_progress_for("h2d"),
-                same_progress_sync_sides=same_progress_side_for("h2d"),
             ),
             make_start_shuffle_task(
                 self._state,
                 lookahead=start_shuffle_lookahead,
                 same_progress_sync=same_progress_for("start_shuffle"),
-                same_progress_sync_sides=same_progress_side_for("start_shuffle"),
             ),
             make_finish_shuffle_task(
                 self._state,
                 lookahead=finish_shuffle_lookahead,
                 same_progress_sync=same_progress_for("finish_shuffle"),
-                same_progress_sync_sides=same_progress_side_for("finish_shuffle"),
             ),
             make_start_input_dist_task(
                 self._state,
                 lookahead=start_input_dist_lookahead,
                 same_progress_sync=same_progress_for("start_input_dist"),
-                same_progress_sync_sides=same_progress_side_for("start_input_dist"),
             ),
             make_wait_input_dist_task(
                 self._state,
                 lookahead=wait_input_dist_lookahead,
                 same_progress_sync=same_progress_for("wait_input_dist"),
-                same_progress_sync_sides=same_progress_side_for("wait_input_dist"),
             ),
         ]
         # Keep prefetch after forward in declaration order: forward
@@ -458,9 +445,6 @@ class HSTUPipeline:
                     self._state,
                     lookahead=prefetch_lookahead,
                     same_progress_sync=same_progress_for("prefetch_embeddings"),
-                    same_progress_sync_sides=same_progress_side_for(
-                        "prefetch_embeddings"
-                    ),
                 )
             )
         # compute_output_dist produces awaitables consumed by forward.
@@ -487,15 +471,11 @@ class HSTUPipeline:
         # same-progress GPU coherency edge for DynamicEmb cache state.
         backward_deps = ("zero_grad",)
         backward_same_progress_sync: tuple = ()
-        backward_same_progress_sync_sides = SameProgressSyncSide.BOTH
         if self._prefetch:
             backward_same_progress_sync = ("prefetch_embeddings",)
         if config is not None:
             backward_same_progress_sync = config.same_progress_for(
                 "backward", backward_same_progress_sync
-            )
-            backward_same_progress_sync_sides = config.same_progress_side_for(
-                "backward"
             )
         tasks.extend(
             [
@@ -503,7 +483,6 @@ class HSTUPipeline:
                     self._state,
                     depends_on=backward_deps,
                     same_progress_sync=backward_same_progress_sync,
-                    same_progress_sync_sides=backward_same_progress_sync_sides,
                 ),
                 make_finalize_grads_task(self._state),
                 make_optimizer_step_task(self._state),

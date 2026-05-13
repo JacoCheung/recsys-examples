@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Set
 from ..deps import _same_progress_dependency_predecessors, infer_cross_stream_waits
 from ..schedule import Schedule
 from ..streams import StreamPool
-from ..task import DataSlot, Task
+from ..task import DataSlot, Task, _same_progress_sync_names
 
 __all__ = ["ScheduleValidationError", "validate"]
 
@@ -258,7 +258,7 @@ def validate(schedule: Schedule, stream_pool: Optional[StreamPool] = None) -> No
                     f"references {dep_name!r} which is not a task name "
                     f"in the schedule."
                 )
-        for dep_name in getattr(task, "same_progress_sync", ()):
+        for dep_name in _same_progress_sync_names(task):
             if dep_name not in name_to_task:
                 raise ScheduleValidationError(
                     f"[dependency] Task {task.name!r}.same_progress_sync "

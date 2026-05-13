@@ -245,8 +245,7 @@ def test_gpu_only_same_progress_sync_does_not_create_cpu_dep() -> None:
         "consumer",
         fn=lambda ctx: None,
         stream="stream_b",
-        same_progress_sync=("producer",),
-        same_progress_sync_sides=SameProgressSyncSide.GPU,
+        same_progress_sync=(("producer", SameProgressSyncSide.GPU),),
     )
     completion = {"producer": threading.Event(), "consumer": threading.Event()}
 
