@@ -136,7 +136,7 @@ def test_identity_shuffler_skips_shuffle_nccl() -> None:
 # ----------------------------------------------------------------------
 
 
-def _make_noop_pipeline(prefetch: bool, prefetch_depth: int = 1):
+def _make_noop_pipeline(prefetch: bool, prefetch_depth: int = 1, **kwargs):
     """Construct HSTUPipeline without calling _rewrite_model."""
     import torch
     from commons.pipeline.hstu_pipeline import HSTUPipeline
@@ -147,6 +147,7 @@ def _make_noop_pipeline(prefetch: bool, prefetch_depth: int = 1):
         device=torch.device("cpu"),
         prefetch=prefetch,
         prefetch_depth=prefetch_depth,
+        **kwargs,
     )
     return pipe
 
@@ -248,6 +249,83 @@ def test_noncritical_gate_env_unknown_task_rejected(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="Unknown non-critical HSTU task"):
         pipe._build_schedule()
+
+
+def test_hstu_schedule_config_file_controls_runtime_knobs(
+    monkeypatch, tmp_path
+) -> None:
+    import json
+
+    from commons.pipeline.engine import SameProgressSyncSide
+    from commons.pipeline.hstu_pipeline.pipeline import HSTU_THREAD_MAP_PRESETS
+
+    monkeypatch.setenv("HSTU_LA_DEPTH", "6")
+    monkeypatch.setenv("HSTU_THREAD_MAP_VARIANT", "per_task")
+    monkeypatch.setenv("HSTU_SPLIT_RANKING_FORWARD", "0")
+    monkeypatch.setenv("HSTU_NONCRITICAL_GATE_DEFAULT", "compute_output_dist")
+
+    config_path = tmp_path / "hstu_pipeline_schedule.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "thread_map": "io_data_dist_prefetch_compute",
+                "split_ranking_forward": True,
+                "lookahead": {
+                    "h2d": 2,
+                    "start_shuffle": 2,
+                    "finish_shuffle": 2,
+                    "start_input_dist": 1,
+                    "wait_input_dist": 1,
+                    "prefetch_embeddings": 1,
+                },
+                "same_progress_sync": {
+                    "noncritical_default": ["ranking_embedding_forward"],
+                    "tasks": {
+                        "h2d": ["global_tokens_allreduce"],
+                        "start_input_dist": [],
+                        "backward": ["prefetch_embeddings"],
+                    },
+                },
+                "same_progress_sync_sides": {
+                    "default": "gpu",
+                    "tasks": {
+                        "start_input_dist": "cpu",
+                        "backward": "both",
+                    },
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("HSTU_PIPELINE_CONFIG", str(config_path))
+
+    pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
+    assert pipe._thread_map == HSTU_THREAD_MAP_PRESETS["io_data_dist_prefetch_compute"]
+    assert pipe._split_ranking_forward is True
+
+    schedule, pool = pipe._build_schedule()
+    from commons.pipeline.engine.autosched.validator import validate
+
+    validate(schedule, pool)
+    tasks = {t.name: t for stage in schedule.stages for t in stage.tasks}
+    assert schedule.in_flight_batches == 3
+    assert tasks["h2d"].same_progress_sync == ("global_tokens_allreduce",)
+    assert tasks["h2d"].same_progress_sync_sides == SameProgressSyncSide.GPU
+    assert tasks["start_shuffle"].same_progress_sync == ("ranking_embedding_forward",)
+    assert tasks["start_shuffle"].same_progress_sync_sides == SameProgressSyncSide.GPU
+    assert tasks["start_input_dist"].same_progress_sync == ()
+    assert tasks["start_input_dist"].same_progress_sync_sides == (
+        SameProgressSyncSide.CPU
+    )
+    assert tasks["backward"].same_progress_sync == ("prefetch_embeddings",)
+    assert tasks["backward"].same_progress_sync_sides == SameProgressSyncSide.BOTH
+
+
+def test_hstu_schedule_config_rejects_unknown_task() -> None:
+    from commons.pipeline.hstu_pipeline import HSTUPipelineScheduleConfig
+
+    with pytest.raises(ValueError, match="Unknown HSTU task"):
+        HSTUPipelineScheduleConfig.from_mapping({"lookahead": {"typo": 1}})
 
 
 def test_no_v0_context_references_in_hstu_pipeline() -> None:
