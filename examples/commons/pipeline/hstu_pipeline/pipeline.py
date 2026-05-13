@@ -467,7 +467,12 @@ class HSTUPipeline:
         else:
             tasks.append(make_forward_task(self._state, prefetch=self._prefetch))
         backward_deps = ("zero_grad",)
-        backward_same_progress_sync = same_progress_for("backward")
+        backward_sync_default = ("prefetch_embeddings",) if self._prefetch else ()
+        backward_same_progress_sync = (
+            config.same_progress_for("backward", backward_sync_default)
+            if config is not None
+            else backward_sync_default
+        )
         tasks.extend(
             [
                 make_backward_task(

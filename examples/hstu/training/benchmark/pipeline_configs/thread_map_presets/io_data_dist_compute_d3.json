@@ -47,7 +47,12 @@
     "compute_output_dist": [],
     "ranking_embedding_forward": [],
     "forward": [],
-    "backward": [],
+    "backward": [
+      {
+        "task": "prefetch_embeddings",
+        "sides": "both"
+      }
+    ],
     "finalize_model_grads": [],
     "optimizer_step": [],
     "watchdog_step": []
