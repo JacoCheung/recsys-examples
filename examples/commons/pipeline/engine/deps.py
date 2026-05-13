@@ -27,12 +27,7 @@ types only. No torch import.
 from typing import Dict, List, Set, Tuple
 
 from .schedule import Schedule
-from .task import (
-    DataSlot,
-    Task,
-    same_progress_sync_uses_cpu,
-    same_progress_sync_uses_gpu,
-)
+from .task import DataSlot, SameProgressSyncSide, Task, _same_progress_sync_edges
 
 __all__ = [
     "infer_cross_stream_waits",
@@ -88,9 +83,8 @@ def _build_same_progress_dag_edges(
     # regardless of lookahead, since by definition both tasks are in the
     # current progress. This edge drives topo/ticket/host ordering.
     for task in tasks:
-        if not same_progress_sync_uses_cpu(task):
-            continue
-        for dep_name in getattr(task, "same_progress_sync", ()):
+        for edge in _same_progress_sync_edges(task, side=SameProgressSyncSide.CPU):
+            dep_name = edge.task
             producer = name_to_task.get(dep_name)
             if producer is None or producer.name == task.name:
                 continue
@@ -256,13 +250,12 @@ def infer_cross_stream_waits(
             if producer.stream != consumer.stream:
                 producer_streams.add(producer.stream)
 
-        if same_progress_sync_uses_gpu(consumer):
-            for dep_name in getattr(consumer, "same_progress_sync", ()):
-                producer = name_to_task.get(dep_name)
-                if producer is None:
-                    continue
-                if producer.stream != consumer.stream:
-                    producer_streams.add(producer.stream)
+        for edge in _same_progress_sync_edges(consumer, side=SameProgressSyncSide.GPU):
+            producer = name_to_task.get(edge.task)
+            if producer is None:
+                continue
+            if producer.stream != consumer.stream:
+                producer_streams.add(producer.stream)
 
         if producer_streams:
             waits[consumer.name] = tuple(sorted(producer_streams))
@@ -403,16 +396,15 @@ def infer_cross_stream_event_deps(
 
         # ``same_progress_sync=("X", ...)``: optional same-progress GPU
         # coherency wait.
-        if same_progress_sync_uses_gpu(consumer):
-            for dep_name in getattr(consumer, "same_progress_sync", ()):
-                producer = name_to_task.get(dep_name)
-                if producer is None:
-                    continue
-                if producer.stream == consumer.stream:
-                    # Same-stream FIFO already serializes — no explicit
-                    # wait_event needed.
-                    continue
-                add_triple(producer, producer.batch_offset)
+        for edge in _same_progress_sync_edges(consumer, side=SameProgressSyncSide.GPU):
+            producer = name_to_task.get(edge.task)
+            if producer is None:
+                continue
+            if producer.stream == consumer.stream:
+                # Same-stream FIFO already serializes — no explicit
+                # wait_event needed.
+                continue
+            add_triple(producer, producer.batch_offset)
 
         if triples:
             # Stable order for reproducibility / deterministic logs.

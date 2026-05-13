@@ -92,3 +92,11 @@ def test_no_forbidden_imports(path: pathlib.Path) -> None:
                     f"'{prefix}'. Engine must stay framework-agnostic "
                     f"at the core package boundary."
                 )
+
+
+def test_engine_public_api_does_not_export_same_progress_edge() -> None:
+    import commons.pipeline.engine as engine
+
+    assert "SameProgressSync" not in engine.__all__
+    assert not hasattr(engine, "SameProgressSync")
+    assert hasattr(engine, "SameProgressSyncSide")
