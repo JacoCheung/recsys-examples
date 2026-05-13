@@ -15,9 +15,10 @@
 
 """Task and DataSlot: the primitive units of the pipeline engine."""
 
+from enum import IntFlag
 from typing import Callable, Iterable, Optional, Tuple, Union
 
-__all__ = ["DataSlot", "Task"]
+__all__ = ["DataSlot", "SameProgressSyncSide", "Task"]
 
 
 # A read or write entry can be authored as a bare slot name (string)
@@ -65,7 +66,23 @@ def _normalize_slot_refs(
 #       Current-progress dependency. The consumer waits for X's work in
 #       this exact ``progress()`` call, independent of the two tasks'
 #       lookahead values. Use it for stream coherency on shared state
-#       that is not represented by ``reads`` / ``writes``.
+#       that is not represented by ``reads`` / ``writes``. The
+#       ``same_progress_sync_sides`` IntFlag selects CPU ordering,
+#       GPU stream/event ordering, or both.
+
+
+class SameProgressSyncSide(IntFlag):
+    """Where a ``same_progress_sync`` edge is enforced.
+
+    ``CPU`` drives topo/ticket/thread ordering. ``GPU`` inserts
+    cross-stream waits; without ``CPU``, the producer must be host-
+    ordered by another path before the consumer enqueues the wait.
+    """
+
+    NONE = 0
+    CPU = 1
+    GPU = 2
+    BOTH = CPU | GPU
 
 
 def _validate_bare_name_refs(
@@ -133,6 +150,36 @@ def _validate_cross_iter_depends_on(
     return tuple(out)
 
 
+def _normalize_same_progress_sync_sides(value) -> SameProgressSyncSide:
+    if value is None:
+        return SameProgressSyncSide.BOTH
+    try:
+        sides = SameProgressSyncSide(value)
+    except (TypeError, ValueError) as e:
+        raise TypeError(
+            "same_progress_sync_sides must be a SameProgressSyncSide IntFlag "
+            f"or compatible int, got {type(value).__name__}: {value!r}"
+        ) from e
+    valid_mask = int(SameProgressSyncSide.BOTH)
+    if int(sides) & ~valid_mask:
+        raise ValueError(
+            f"same_progress_sync_sides={int(sides)} contains unknown bits; "
+            f"valid bits are CPU={int(SameProgressSyncSide.CPU)} and "
+            f"GPU={int(SameProgressSyncSide.GPU)}."
+        )
+    return sides
+
+
+def same_progress_sync_uses_cpu(task) -> bool:
+    sides = getattr(task, "same_progress_sync_sides", SameProgressSyncSide.BOTH)
+    return bool(sides & SameProgressSyncSide.CPU)
+
+
+def same_progress_sync_uses_gpu(task) -> bool:
+    sides = getattr(task, "same_progress_sync_sides", SameProgressSyncSide.BOTH)
+    return bool(sides & SameProgressSyncSide.GPU)
+
+
 class DataSlot:
     """Opaque named handle for inter-task data flow.
 
@@ -189,6 +236,7 @@ class Task:
     depends_on: Tuple[str, ...] = ()
     cross_iter_depends_on: Tuple[Tuple[str, int], ...] = ()
     same_progress_sync: Tuple[str, ...] = ()
+    same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH
     nvtx_tag: Optional[str] = None
     nccl: bool = False
 
@@ -203,6 +251,7 @@ class Task:
         depends_on: Optional[Iterable[str]] = None,
         cross_iter_depends_on: Optional[Iterable[Union[str, Tuple[str, int]]]] = None,
         same_progress_sync: Optional[Iterable[str]] = None,
+        same_progress_sync_sides: Optional[SameProgressSyncSide] = None,
         nvtx_tag: Optional[str] = None,
         nccl: Optional[bool] = None,
     ) -> None:
@@ -232,6 +281,11 @@ class Task:
             if same_progress_sync is not None
             else self.same_progress_sync
         )
+        raw_same_progress_sync_sides = (
+            same_progress_sync_sides
+            if same_progress_sync_sides is not None
+            else self.same_progress_sync_sides
+        )
 
         # Normalize unconditionally: covers both constructor kwargs
         # and subclass class attributes. Without this, a subclass that
@@ -247,6 +301,9 @@ class Task:
         )
         self.same_progress_sync = _validate_bare_name_refs(
             raw_same_progress_sync, "same_progress_sync"
+        )
+        self.same_progress_sync_sides = _normalize_same_progress_sync_sides(
+            raw_same_progress_sync_sides
         )
 
         # Sanity: a single producer name appearing in multiple of
@@ -323,6 +380,7 @@ class Task:
         depends_on: Iterable[str] = (),
         cross_iter_depends_on: Iterable[Union[str, Tuple[str, int]]] = (),
         same_progress_sync: Iterable[str] = (),
+        same_progress_sync_sides: SameProgressSyncSide = SameProgressSyncSide.BOTH,
         nvtx_tag: Optional[str] = None,
         nccl: bool = False,
     ) -> "Task":
@@ -346,6 +404,7 @@ class Task:
             depends_on=depends_on,
             cross_iter_depends_on=cross_iter_depends_on,
             same_progress_sync=same_progress_sync,
+            same_progress_sync_sides=same_progress_sync_sides,
             nvtx_tag=nvtx_tag,
             nccl=nccl,
         )

@@ -20,7 +20,13 @@ construction. This module exercises the sort directly:
 """
 
 import pytest
-from commons.pipeline.engine import DataSlot, Schedule, Stage, Task
+from commons.pipeline.engine import (
+    DataSlot,
+    SameProgressSyncSide,
+    Schedule,
+    Stage,
+    Task,
+)
 from commons.pipeline.engine.deps import topological_sort
 
 
@@ -96,6 +102,36 @@ def test_topo_cycle_via_same_progress_sync_raises() -> None:
     b = Task.from_fn(name="b", fn=_noop, same_progress_sync=("a",), stream="default")
     with pytest.raises(ValueError, match="Cyclic"):
         topological_sort(_schedule(a, b))
+
+
+def test_topo_uses_cpu_side_same_progress_sync_only() -> None:
+    consumer = Task.from_fn(
+        name="consumer",
+        fn=_noop,
+        same_progress_sync=("producer",),
+        same_progress_sync_sides=SameProgressSyncSide.CPU,
+    )
+    producer = Task.from_fn(name="producer", fn=_noop)
+
+    assert _names(topological_sort(_schedule(consumer, producer))) == [
+        "producer",
+        "consumer",
+    ]
+
+
+def test_topo_ignores_gpu_only_same_progress_sync() -> None:
+    consumer = Task.from_fn(
+        name="consumer",
+        fn=_noop,
+        same_progress_sync=("producer",),
+        same_progress_sync_sides=SameProgressSyncSide.GPU,
+    )
+    producer = Task.from_fn(name="producer", fn=_noop)
+
+    assert _names(topological_sort(_schedule(consumer, producer))) == [
+        "consumer",
+        "producer",
+    ]
 
 
 def test_topo_self_loop_via_depends_on() -> None:

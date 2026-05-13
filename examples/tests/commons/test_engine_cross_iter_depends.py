@@ -3,7 +3,13 @@
 """Focused tests for cross-iteration dependency event inference."""
 
 import pytest
-from commons.pipeline.engine import DataSlot, Schedule, Stage, Task
+from commons.pipeline.engine import (
+    DataSlot,
+    SameProgressSyncSide,
+    Schedule,
+    Stage,
+    Task,
+)
 from commons.pipeline.engine.deps import infer_cross_stream_event_deps, topological_sort
 
 
@@ -98,6 +104,30 @@ def test_redundant_cross_iter_data_edge_is_rejected() -> None:
 def test_same_progress_sync_uses_producer_slot_offset() -> None:
     producer = _task("prefetch", stream="prefetch", lookahead=1)
     consumer = _task("backward", same_progress_sync=("prefetch",))
+
+    assert infer_cross_stream_event_deps(_schedule(producer, consumer)) == {
+        "backward": (("prefetch", "prefetch", 1),)
+    }
+
+
+def test_same_progress_sync_cpu_only_emits_no_event_triple() -> None:
+    producer = _task("prefetch", stream="prefetch", lookahead=1)
+    consumer = _task(
+        "backward",
+        same_progress_sync=("prefetch",),
+        same_progress_sync_sides=SameProgressSyncSide.CPU,
+    )
+
+    assert infer_cross_stream_event_deps(_schedule(producer, consumer)) == {}
+
+
+def test_same_progress_sync_gpu_only_emits_event_triple() -> None:
+    producer = _task("prefetch", stream="prefetch", lookahead=1)
+    consumer = _task(
+        "backward",
+        same_progress_sync=("prefetch",),
+        same_progress_sync_sides=SameProgressSyncSide.GPU,
+    )
 
     assert infer_cross_stream_event_deps(_schedule(producer, consumer)) == {
         "backward": (("prefetch", "prefetch", 1),)
