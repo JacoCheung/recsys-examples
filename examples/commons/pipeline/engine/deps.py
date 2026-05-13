@@ -27,7 +27,12 @@ types only. No torch import.
 from typing import Dict, List, Set, Tuple
 
 from .schedule import Schedule
-from .task import DataSlot, Task
+from .task import (
+    DataSlot,
+    Task,
+    same_progress_sync_uses_cpu,
+    same_progress_sync_uses_gpu,
+)
 
 __all__ = [
     "infer_cross_stream_waits",
@@ -48,7 +53,8 @@ def _build_same_progress_dag_edges(
     """Build consumer -> producer edges for one ``progress()`` call.
 
     Edges come from exact-slot reads, same-offset ``depends_on``,
-    ``same_progress_sync``, and delta-zero ``cross_iter_depends_on``.
+    CPU-side ``same_progress_sync``, and delta-zero
+    ``cross_iter_depends_on``.
     Different-offset data deps are handled by BatchRing rotation, so
     they do not constrain current-progress submission order.
     """
@@ -78,10 +84,12 @@ def _build_same_progress_dag_edges(
             if producer.batch_offset == task.batch_offset:
                 incoming[task.name].add(producer.name)
 
-    # ``same_progress_sync`` (current-iter GPU coherency) — always
-    # emits a current-progress edge regardless of lookahead, since by
-    # definition both tasks are in the current progress.
+    # CPU-side ``same_progress_sync`` — emits a current-progress edge
+    # regardless of lookahead, since by definition both tasks are in the
+    # current progress. This edge drives topo/ticket/host ordering.
     for task in tasks:
+        if not same_progress_sync_uses_cpu(task):
+            continue
         for dep_name in getattr(task, "same_progress_sync", ()):
             producer = name_to_task.get(dep_name)
             if producer is None or producer.name == task.name:
@@ -248,12 +256,13 @@ def infer_cross_stream_waits(
             if producer.stream != consumer.stream:
                 producer_streams.add(producer.stream)
 
-        for dep_name in getattr(consumer, "same_progress_sync", ()):
-            producer = name_to_task.get(dep_name)
-            if producer is None:
-                continue
-            if producer.stream != consumer.stream:
-                producer_streams.add(producer.stream)
+        if same_progress_sync_uses_gpu(consumer):
+            for dep_name in getattr(consumer, "same_progress_sync", ()):
+                producer = name_to_task.get(dep_name)
+                if producer is None:
+                    continue
+                if producer.stream != consumer.stream:
+                    producer_streams.add(producer.stream)
 
         if producer_streams:
             waits[consumer.name] = tuple(sorted(producer_streams))
@@ -336,7 +345,8 @@ def infer_cross_stream_event_deps(
                     implicit_n = writer.batch_offset - read_slot.batch_offset
                     if implicit_n == -neg_offset:
                         raise ValueError(
-                            f"Task {consumer.name!r} declares "
+                            f"Task {consumer.name!r} declares a cross-iter "
+                            f"dependency that duplicates an implicit data edge: "
                             f"cross_iter_depends_on=({dep_name!r}, "
                             f"{neg_offset}) but the same edge is already "
                             f"inferred from reads/writes: slot "
@@ -391,16 +401,18 @@ def infer_cross_stream_event_deps(
                 )
             add_triple(producer, slot_offset)
 
-        # ``same_progress_sync=("X", ...)``: same-progress GPU coherency wait.
-        for dep_name in getattr(consumer, "same_progress_sync", ()):
-            producer = name_to_task.get(dep_name)
-            if producer is None:
-                continue
-            if producer.stream == consumer.stream:
-                # Same-stream FIFO already serializes — no explicit
-                # wait_event needed.
-                continue
-            add_triple(producer, producer.batch_offset)
+        # ``same_progress_sync=("X", ...)``: optional same-progress GPU
+        # coherency wait.
+        if same_progress_sync_uses_gpu(consumer):
+            for dep_name in getattr(consumer, "same_progress_sync", ()):
+                producer = name_to_task.get(dep_name)
+                if producer is None:
+                    continue
+                if producer.stream == consumer.stream:
+                    # Same-stream FIFO already serializes — no explicit
+                    # wait_event needed.
+                    continue
+                add_triple(producer, producer.batch_offset)
 
         if triples:
             # Stable order for reproducibility / deterministic logs.

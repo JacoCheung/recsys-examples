@@ -104,12 +104,10 @@ class SchedulablePipeline(Generic[In, Out]):
     ) -> None:
         # Re-order tasks by within-progress DAG topological sort so
         # execution order is driven by reads/writes/depends_on/
-        # same_progress_sync edges, NOT by author declaration order.
+        # CPU-side same_progress_sync edges, NOT by author declaration order.
         # Declaration order is reduced to a tie-breaker for tasks the
         # DAG leaves unconstrained. This eliminates silent-bug risk
-        # where author-declared order conflicts with the DAG (e.g. a
-        # ``same_progress_sync`` consumer accidentally declared before
-        # its producer).
+        # where author-declared order conflicts with the CPU-side DAG.
         from .deps import topological_sort
 
         if len(schedule.stages) <= 1:
@@ -119,8 +117,8 @@ class SchedulablePipeline(Generic[In, Out]):
                 stream_slots=schedule.stream_slots,
             )
         # Multi-stage schedules keep their stage barriers. The validator
-        # rejects any same-progress dependency that would require moving
-        # a producer across those barriers.
+        # rejects any CPU-side same-progress dependency that would require
+        # moving a producer across those barriers.
 
         self._schedule = schedule
         self._stream_pool = stream_pool

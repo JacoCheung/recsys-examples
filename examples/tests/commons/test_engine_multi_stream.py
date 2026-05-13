@@ -3,7 +3,13 @@
 """Focused tests for cross-stream wait inference."""
 
 import pytest
-from commons.pipeline.engine import DataSlot, Schedule, Stage, Task
+from commons.pipeline.engine import (
+    DataSlot,
+    SameProgressSyncSide,
+    Schedule,
+    Stage,
+    Task,
+)
 from commons.pipeline.engine.deps import infer_cross_stream_waits
 
 
@@ -43,6 +49,25 @@ def test_cross_stream_slot_and_depends_on_edges_emit_waits() -> None:
 
     assert infer_cross_stream_waits(_schedule(h2d, allreduce, forward)) == {
         "forward": ("comm", "memcpy")
+    }
+
+
+def test_same_progress_sync_gpu_side_controls_stream_waits() -> None:
+    producer = _task("producer", stream="comm")
+    cpu_only = _task(
+        "cpu_only",
+        same_progress_sync=("producer",),
+        same_progress_sync_sides=SameProgressSyncSide.CPU,
+    )
+    gpu_only = _task(
+        "gpu_only",
+        same_progress_sync=("producer",),
+        same_progress_sync_sides=SameProgressSyncSide.GPU,
+    )
+
+    assert infer_cross_stream_waits(_schedule(producer, cpu_only)) == {}
+    assert infer_cross_stream_waits(_schedule(producer, gpu_only)) == {
+        "gpu_only": ("comm",)
     }
 
 

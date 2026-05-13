@@ -8,6 +8,7 @@ import time
 import pytest
 from commons.pipeline.engine import (
     DataSlot,
+    SameProgressSyncSide,
     SchedulablePipeline,
     Schedule,
     SequentialExecutor,
@@ -236,3 +237,23 @@ def test_cross_lookahead_depends_on_does_not_create_cpu_cycle() -> None:
 
     assert completion["T1"] in cpu_deps.get("T2", [])
     assert completion["T2"] not in cpu_deps.get("T1", [])
+
+
+def test_gpu_only_same_progress_sync_does_not_create_cpu_dep() -> None:
+    producer = Task.from_fn("producer", fn=lambda ctx: None, stream="stream_a")
+    consumer = Task.from_fn(
+        "consumer",
+        fn=lambda ctx: None,
+        stream="stream_b",
+        same_progress_sync=("producer",),
+        same_progress_sync_sides=SameProgressSyncSide.GPU,
+    )
+    completion = {"producer": threading.Event(), "consumer": threading.Event()}
+
+    cpu_deps = _compute_cpu_deps(
+        [producer, consumer],
+        {"producer": "stream_a", "consumer": "stream_b"},
+        completion,
+    )
+
+    assert completion["producer"] not in cpu_deps.get("consumer", [])

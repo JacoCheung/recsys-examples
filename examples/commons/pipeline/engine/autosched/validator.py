@@ -23,8 +23,8 @@ authors do not need to memorize a numbered checklist:
   * resource: every referenced stream is declared and available.
   * data: slot writes are unique and reads can resolve.
   * dependency: named deps exist, are acyclic, and fit the schedule order.
-    Multi-stage schedules keep stage barriers, so same-progress deps
-    must already point forward in declaration order.
+    Multi-stage schedules keep stage barriers, so CPU-side same-progress
+    deps must already point forward in declaration order.
 """
 
 from typing import Dict, List, Optional, Set
@@ -217,7 +217,7 @@ def validate(schedule: Schedule, stream_pool: Optional[StreamPool] = None) -> No
     #
     #   ``depends_on``                 — same-batch logical dep
     #   ``cross_iter_depends_on``      — different-batch logical dep
-    #   ``same_progress_sync``         — same-progress GPU coherency
+    #   ``same_progress_sync``         — current-progress sync
     #
     # Without this check, a misspelled producer name silently drops the
     # edge (deps.py uses ``name_to_task.get(name)`` which returns None

@@ -32,7 +32,7 @@ import torch
 from .context import TaskContext
 from .schedule import Stage
 from .streams import StreamPool
-from .task import DataSlot, Task
+from .task import DataSlot, Task, same_progress_sync_uses_cpu
 
 # NVTX is optional — used only for profiler annotation. The engine
 # stays framework-agnostic w.r.t. nvtx by treating its absence as a
@@ -204,16 +204,14 @@ def _compute_cpu_deps(
                 continue  # cross-la — handled by ring rotation, no CPU edge
             dep_names.add(dep_name)
 
-        # ``same_progress_sync`` (same-progress GPU coherency) edges —
-        # consumer waits for the producer's current-iter completion
-        # event, regardless of which batch each is processing. Same
-        # CPU-side mechanism as ``depends_on``: cross-thread emits a
-        # threading.Event wait so the producer's host enqueue +
-        # event.record() happen before the consumer's wait_event is
-        # enqueued.
-        for dep_name in getattr(task, "same_progress_sync", ()):
-            if dep_name in active_names:
-                dep_names.add(dep_name)
+        # CPU-side ``same_progress_sync`` edges. When enabled, the
+        # consumer waits for the producer's current-progress host
+        # enqueue + completion-event record before continuing. GPU-side
+        # waits are inferred separately in deps.py.
+        if same_progress_sync_uses_cpu(task):
+            for dep_name in getattr(task, "same_progress_sync", ()):
+                if dep_name in active_names:
+                    dep_names.add(dep_name)
 
         # ``cross_iter_depends_on`` with Δ=0 has the same mechanical
         # contract as ``same_progress_sync``: the producer ran in the

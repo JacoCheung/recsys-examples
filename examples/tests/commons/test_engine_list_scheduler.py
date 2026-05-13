@@ -90,7 +90,10 @@ def test_scheduler_output_passes_validator_for_prefetch_shape() -> None:
 
     validate(schedule)
     names = _names(schedule)
-    assert names.index("h2d") < names.index("forward") < names.index("backward")
+    # h2d@1 -> forward@0 is a cross-iter prefetch edge, not a
+    # same-progress ordering constraint.
+    assert set(names) == {"h2d", "forward", "backward"}
+    assert names.index("forward") < names.index("backward")
 
 
 def test_scheduled_schedule_executes_end_to_end() -> None:
