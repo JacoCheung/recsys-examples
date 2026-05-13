@@ -108,8 +108,7 @@ def test_topo_uses_cpu_side_same_progress_sync_only() -> None:
     consumer = Task.from_fn(
         name="consumer",
         fn=_noop,
-        same_progress_sync=("producer",),
-        same_progress_sync_sides=SameProgressSyncSide.CPU,
+        same_progress_sync=(("producer", SameProgressSyncSide.CPU),),
     )
     producer = Task.from_fn(name="producer", fn=_noop)
 
@@ -123,8 +122,7 @@ def test_topo_ignores_gpu_only_same_progress_sync() -> None:
     consumer = Task.from_fn(
         name="consumer",
         fn=_noop,
-        same_progress_sync=("producer",),
-        same_progress_sync_sides=SameProgressSyncSide.GPU,
+        same_progress_sync=(("producer", SameProgressSyncSide.GPU),),
     )
     producer = Task.from_fn(name="producer", fn=_noop)
 

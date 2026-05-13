@@ -56,13 +56,11 @@ def test_same_progress_sync_gpu_side_controls_stream_waits() -> None:
     producer = _task("producer", stream="comm")
     cpu_only = _task(
         "cpu_only",
-        same_progress_sync=("producer",),
-        same_progress_sync_sides=SameProgressSyncSide.CPU,
+        same_progress_sync=(("producer", SameProgressSyncSide.CPU),),
     )
     gpu_only = _task(
         "gpu_only",
-        same_progress_sync=("producer",),
-        same_progress_sync_sides=SameProgressSyncSide.GPU,
+        same_progress_sync=(("producer", SameProgressSyncSide.GPU),),
     )
 
     assert infer_cross_stream_waits(_schedule(producer, cpu_only)) == {}

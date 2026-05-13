@@ -114,8 +114,7 @@ def test_same_progress_sync_cpu_only_emits_no_event_triple() -> None:
     producer = _task("prefetch", stream="prefetch", lookahead=1)
     consumer = _task(
         "backward",
-        same_progress_sync=("prefetch",),
-        same_progress_sync_sides=SameProgressSyncSide.CPU,
+        same_progress_sync=(("prefetch", SameProgressSyncSide.CPU),),
     )
 
     assert infer_cross_stream_event_deps(_schedule(producer, consumer)) == {}
@@ -125,8 +124,7 @@ def test_same_progress_sync_gpu_only_emits_event_triple() -> None:
     producer = _task("prefetch", stream="prefetch", lookahead=1)
     consumer = _task(
         "backward",
-        same_progress_sync=("prefetch",),
-        same_progress_sync_sides=SameProgressSyncSide.GPU,
+        same_progress_sync=(("prefetch", SameProgressSyncSide.GPU),),
     )
 
     assert infer_cross_stream_event_deps(_schedule(producer, consumer)) == {

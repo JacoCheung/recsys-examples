@@ -159,40 +159,40 @@ def test_same_name_in_both_fields_rejected() -> None:
 # ---------------------------------------------------------------------
 #
 # ``same_progress_sync=("X",)`` is the third dependency field — a
-# bare-name-only same-progress GPU/stream coherency wait, NOT a logical
-# data-flow edge. Validation mirrors ``depends_on`` (bare names only)
-# but the engine treats it differently downstream.
+# same-progress GPU/stream coherency wait, NOT a logical data-flow edge.
+# Bare names default to CPU+GPU; explicit edges can narrow the side.
 
 
 def test_same_progress_sync_bare_names_accepted() -> None:
-    """``same_progress_sync`` accepts bare task names (the only valid
-    authoring form)."""
+    """Bare names default to CPU+GPU enforcement."""
     t = Task("x", same_progress_sync=("a", "b"))
-    assert t.same_progress_sync == ("a", "b")
-    assert t.same_progress_sync_sides == SameProgressSyncSide.BOTH
+    assert [(edge.task, edge.sides) for edge in t.same_progress_sync] == [
+        ("a", SameProgressSyncSide.BOTH),
+        ("b", SameProgressSyncSide.BOTH),
+    ]
     assert t.depends_on == ()
     assert t.cross_iter_depends_on == ()
 
 
-def test_same_progress_sync_sides_accepts_intflag() -> None:
+def test_same_progress_sync_edge_accepts_intflag() -> None:
     t = Task(
         "x",
-        same_progress_sync=("a",),
-        same_progress_sync_sides=SameProgressSyncSide.CPU,
+        same_progress_sync=(("a", SameProgressSyncSide.CPU),),
     )
 
-    assert t.same_progress_sync_sides == SameProgressSyncSide.CPU
+    assert [(edge.task, edge.sides) for edge in t.same_progress_sync] == [
+        ("a", SameProgressSyncSide.CPU)
+    ]
 
 
-def test_same_progress_sync_sides_rejects_unknown_bits() -> None:
+def test_same_progress_sync_edge_rejects_unknown_bits() -> None:
     with pytest.raises(ValueError, match="unknown bits"):
-        Task("x", same_progress_sync=("a",), same_progress_sync_sides=4)
+        Task("x", same_progress_sync=(("a", 4),))
 
 
-def test_same_progress_sync_tuple_form_rejected() -> None:
-    """``same_progress_sync`` is bare-names-only — ``("X", -1)``
-    tuples (the cross_iter_depends_on form) are not accepted."""
-    with pytest.raises(TypeError, match="same_progress_sync entries"):
+def test_same_progress_sync_cross_iter_tuple_form_rejected() -> None:
+    """``("X", -1)`` remains invalid here; use ``cross_iter_depends_on``."""
+    with pytest.raises(ValueError, match="unknown bits"):
         Task("x", same_progress_sync=(("X", -1),))  # type: ignore[arg-type]
 
 
@@ -227,11 +227,11 @@ def test_from_fn_same_progress_sync_kw() -> None:
     t = Task.from_fn(
         "x",
         fn=lambda ctx: None,
-        same_progress_sync=("X",),
-        same_progress_sync_sides=SameProgressSyncSide.GPU,
+        same_progress_sync=(("X", SameProgressSyncSide.GPU),),
     )
-    assert t.same_progress_sync == ("X",)
-    assert t.same_progress_sync_sides == SameProgressSyncSide.GPU
+    assert [(edge.task, edge.sides) for edge in t.same_progress_sync] == [
+        ("X", SameProgressSyncSide.GPU)
+    ]
 
 
 # ---------------------------------------------------------------------
