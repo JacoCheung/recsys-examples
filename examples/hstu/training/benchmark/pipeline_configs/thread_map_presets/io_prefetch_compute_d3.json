@@ -12,7 +12,8 @@
     "compute_output_dist": "compute",
     "ranking_embedding_forward": "compute",
     "dense_forward": "compute",
-    "backward": "compute",
+    "dense_backward": "compute",
+    "embedding_backward": "compute",
     "finalize_model_grads": "compute",
     "optimizer_step": "compute",
     "watchdog_step": "compute"
@@ -29,7 +30,8 @@
     "compute_output_dist": 0,
     "ranking_embedding_forward": 0,
     "dense_forward": 0,
-    "backward": 0,
+    "dense_backward": 0,
+    "embedding_backward": 0,
     "finalize_model_grads": 0,
     "optimizer_step": 0,
     "watchdog_step": 0
@@ -41,6 +43,6 @@
     "start_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
     "wait_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
     "prefetch_embeddings": [{"task": "compute_output_dist", "sides": "both"}],
-    "backward": [{"task": "prefetch_embeddings", "sides": "both"}]
+    "embedding_backward": [{"task": "prefetch_embeddings", "sides": "both"}]
   }
 }
