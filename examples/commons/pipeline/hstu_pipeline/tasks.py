@@ -28,8 +28,8 @@ Slot conventions:
   ``global_tokens``   scalar AllReduce result (offset=0)
   ``shuffle_handle``  ShuffleHandle from ``start_shuffle_async`` (optional)
   ``ranking_embeddings`` dense embedding output before the ranking tail
-  ``losses``          forward losses tensor (offset=0)
-  ``output``          forward secondary output (offset=0)
+  ``losses``          dense-forward losses tensor (offset=0)
+  ``output``          dense-forward secondary output (offset=0)
   ``step_result``     final return tuple (offset=0)
 """
 
@@ -562,7 +562,7 @@ def make_ranking_embedding_task(
     )
 
 
-def make_ranking_forward_tail_task(state: PipelineState) -> Task:
+def make_dense_forward_task(state: PipelineState) -> Task:
     def _fn(ctx):
         batch_gpu = ctx.slots.get("batch_gpu", None)
         embeddings = ctx.slots.get(RANKING_EMBEDDINGS_SLOT, None)
@@ -572,13 +572,13 @@ def make_ranking_forward_tail_task(state: PipelineState) -> Task:
             return
         shuffled = ctx.slots.get("shuffled_batch", batch_gpu)
         owner = _split_forward_owner(state)
-        with nvtx.annotate("## ranking_forward_tail ##"):
+        with nvtx.annotate("## dense_forward ##"):
             losses, output = owner.forward_after_embeddings(shuffled, embeddings)
         ctx.slots.set("losses", losses)
         ctx.slots.set("output", output)
 
     return Task.from_fn(
-        "forward",
+        "dense_forward",
         _fn,
         stream="default",
         lookahead=0,
