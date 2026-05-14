@@ -642,7 +642,7 @@ def test_threaded_stress_random_task_delays():
 
 def test_threaded_custom_bad_thread_map_rejected():
     """A user-supplied thread_map that splits start_input_dist and
-    forward across threads must be rejected at construction time,
+    dense_forward across threads must be rejected at construction time,
     not let silent corruption reach training."""
     init.initialize_distributed()
     init.initialize_model_parallel(1)
@@ -666,7 +666,7 @@ def test_threaded_custom_bad_thread_map_rejected():
     )
     bad_map = {
         "start_input_dist": "alpha",
-        "forward": "beta",  # different from alpha → race
+        "dense_forward": "beta",  # different from alpha -> race
     }
     hstu = HSTUPipeline(
         pipelined_model,

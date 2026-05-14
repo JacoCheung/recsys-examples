@@ -208,7 +208,7 @@ def _tasks(config, args):
                 deps=("compute_output_dist", "prefetch_embeddings"),
             ),
             t(
-                "forward",
+                "dense_forward",
                 "default",
                 0,
                 reads=("batch_gpu", "shuffled_batch", "ranking_embeddings"),

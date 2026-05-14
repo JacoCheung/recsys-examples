@@ -46,6 +46,7 @@ from .tasks import (
     PipelineState,
     make_backward_task,
     make_compute_output_dist_task,
+    make_dense_forward_task,
     make_finalize_grads_task,
     make_finish_shuffle_task,
     make_global_tokens_task,
@@ -53,7 +54,6 @@ from .tasks import (
     make_optimizer_step_task,
     make_prefetch_task,
     make_ranking_embedding_task,
-    make_ranking_forward_tail_task,
     make_start_input_dist_task,
     make_start_shuffle_task,
     make_wait_input_dist_task,
@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 #               These touch only their own slot's tensor + the batch
 #               shuffler.
 #   "compute" — everything else: start_input_dist, wait_input_dist,
-#               prefetch, zero_grad, global_tokens, forward,
+#               prefetch, zero_grad, global_tokens, dense_forward,
 #               backward, finalize, optimizer.
 #
 # This overlaps H2D/shuffle with NCCL/compute without per-task thread
@@ -102,7 +102,7 @@ HSTU_DEFAULT_THREAD_MAP: dict = {
     "global_tokens_allreduce": "compute",
     "compute_output_dist": "compute",
     "ranking_embedding_forward": "compute",
-    "forward": "compute",
+    "dense_forward": "compute",
     "backward": "compute",
     "finalize_model_grads": "compute",
     "optimizer_step": "compute",
@@ -134,7 +134,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
-        "forward": "compute",
+        "dense_forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
@@ -151,7 +151,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
-        "forward": "compute",
+        "dense_forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
@@ -168,7 +168,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
-        "forward": "compute",
+        "dense_forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
@@ -186,7 +186,7 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "global_tokens_allreduce": "compute",
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
-        "forward": "compute",
+        "dense_forward": "compute",
         "backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
@@ -386,7 +386,7 @@ class HSTUPipeline:
         # Default gate keeps lookahead work behind the dense forward tail.
         # Schedule configs may override the same-progress edge per task.
         def same_progress_for(task_name: str) -> tuple:
-            default = ("forward",)
+            default = ("dense_forward",)
             if config is not None:
                 return config.same_progress_for(task_name, ())
             return default
@@ -418,7 +418,7 @@ class HSTUPipeline:
                 same_progress_sync=same_progress_for("wait_input_dist"),
             ),
         ]
-        # Keep prefetch after forward in declaration order: forward
+        # Keep prefetch after dense_forward in declaration order: dense_forward
         # consumes the prior batch's prefetched data before the next
         # prefetch adds keys, limiting DynamicEmb cache pressure.
         tasks.extend(
@@ -437,7 +437,7 @@ class HSTUPipeline:
                 )
             )
         # compute_output_dist produces awaitables consumed by the ranking
-        # embedding subtask; the dense tail remains named "forward".
+        # embedding subtask; dense_forward consumes its dense embedding output.
         tasks.append(
             make_compute_output_dist_task(
                 self._state,
@@ -450,7 +450,7 @@ class HSTUPipeline:
                     self._state,
                     prefetch=self._prefetch,
                 ),
-                make_ranking_forward_tail_task(self._state),
+                make_dense_forward_task(self._state),
             ]
         )
         # zero_grad is model-state ordering; prefetch sync is a

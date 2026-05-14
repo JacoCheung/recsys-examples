@@ -27,7 +27,7 @@ HSTU_PIPELINE_TASKS = frozenset(
         "global_tokens_allreduce",
         "compute_output_dist",
         "ranking_embedding_forward",
-        "forward",
+        "dense_forward",
         "backward",
         "finalize_model_grads",
         "optimizer_step",

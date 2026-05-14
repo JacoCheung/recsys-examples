@@ -15,7 +15,7 @@
 
 """HSTU embedding-output distribution helpers.
 
-The engine runs ``compute_and_output_dist`` as a task before forward.
+The engine runs ``compute_and_output_dist`` as a task before dense_forward.
 Forward wrappers in this module then consume the pre-populated awaitable
 from the per-batch TorchRec context.
 """
@@ -44,7 +44,7 @@ class HSTUTrainPipelineContext(PrefetchTrainPipelineContext):
     PrefetchTrainPipelineContext provides (``input_dist_*_requests``,
     ``module_contexts``, ``module_input_post_prefetch``, ...) and adds
     ``embedding_a2a_requests`` so the new ``compute_output_dist`` task
-    can stash the output a2a awaitable for the forward task to pick
+    can stash the output a2a awaitable for the dense_forward task to pick
     up.
 
     Used by both prefetch and non-prefetch HSTU paths — non-prefetch
