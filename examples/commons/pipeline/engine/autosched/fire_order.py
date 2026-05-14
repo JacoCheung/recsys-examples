@@ -94,6 +94,8 @@ DEFAULT_BIT_EXACT_TASKS: FrozenSet[str] = frozenset(
         "optimizer_step",
         "finalize_model_grads",
         "backward",
+        "dense_backward",
+        "embedding_backward",
         "dense_forward",
         "forward",
     }

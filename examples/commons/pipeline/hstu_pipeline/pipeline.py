@@ -44,9 +44,10 @@ from .config import (
 )
 from .tasks import (
     PipelineState,
-    make_backward_task,
     make_compute_output_dist_task,
+    make_dense_backward_task,
     make_dense_forward_task,
+    make_embedding_backward_task,
     make_finalize_grads_task,
     make_finish_shuffle_task,
     make_global_tokens_task,
@@ -103,7 +104,8 @@ HSTU_DEFAULT_THREAD_MAP: dict = {
     "compute_output_dist": "compute",
     "ranking_embedding_forward": "compute",
     "dense_forward": "compute",
-    "backward": "compute",
+    "dense_backward": "compute",
+    "embedding_backward": "compute",
     "finalize_model_grads": "compute",
     "optimizer_step": "compute",
     # Optional diagnostic task: absent unless CUDA_MEM_WATCHDOG=1.
@@ -135,7 +137,8 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
         "dense_forward": "compute",
-        "backward": "compute",
+        "dense_backward": "compute",
+        "embedding_backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
         "watchdog_step": "compute",
@@ -152,7 +155,8 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
         "dense_forward": "compute",
-        "backward": "compute",
+        "dense_backward": "compute",
+        "embedding_backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
         "watchdog_step": "compute",
@@ -169,7 +173,8 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
         "dense_forward": "compute",
-        "backward": "compute",
+        "dense_backward": "compute",
+        "embedding_backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
         "watchdog_step": "compute",
@@ -187,7 +192,8 @@ HSTU_THREAD_MAP_PRESETS: dict = {
         "compute_output_dist": "compute",
         "ranking_embedding_forward": "compute",
         "dense_forward": "compute",
-        "backward": "compute",
+        "dense_backward": "compute",
+        "embedding_backward": "compute",
         "finalize_model_grads": "compute",
         "optimizer_step": "compute",
         "watchdog_step": "compute",
@@ -453,20 +459,24 @@ class HSTUPipeline:
                 make_dense_forward_task(self._state),
             ]
         )
-        # zero_grad is model-state ordering; prefetch sync is a
-        # same-progress GPU coherency edge for DynamicEmb cache state.
-        backward_deps = ("zero_grad",)
-        backward_same_progress_sync: tuple = ()
+        # zero_grad is model-state ordering; prefetch sync stays on
+        # embedding_backward, the phase that touches embedding/cache state.
+        dense_backward_deps = ("zero_grad",)
+        embedding_backward_same_progress_sync: tuple = ()
         if self._prefetch:
-            backward_same_progress_sync = ("prefetch_embeddings",)
+            embedding_backward_same_progress_sync = ("prefetch_embeddings",)
         if config is not None:
-            backward_same_progress_sync = config.same_progress_for("backward", ())
+            embedding_backward_same_progress_sync = config.same_progress_for(
+                "embedding_backward", ()
+            )
         tasks.extend(
             [
-                make_backward_task(
+                make_dense_backward_task(
                     self._state,
-                    depends_on=backward_deps,
-                    same_progress_sync=backward_same_progress_sync,
+                    depends_on=dense_backward_deps,
+                ),
+                make_embedding_backward_task(
+                    same_progress_sync=embedding_backward_same_progress_sync,
                 ),
                 make_finalize_grads_task(self._state),
                 make_optimizer_step_task(self._state),

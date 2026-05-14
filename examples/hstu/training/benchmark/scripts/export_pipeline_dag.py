@@ -212,7 +212,7 @@ def _tasks(config, args):
                 "default",
                 0,
                 reads=("batch_gpu", "shuffled_batch", "ranking_embeddings"),
-                writes=("losses", "output"),
+                writes=("losses", "output", "embedding_backward_inputs"),
                 deps=("ranking_embedding_forward",),
             ),
         ]
@@ -221,15 +221,28 @@ def _tasks(config, args):
     tasks.extend(
         [
             t(
-                "backward",
+                "dense_backward",
                 "default",
                 0,
-                reads=("losses", "global_tokens"),
-                writes=("local_loss_sum",),
+                reads=("losses", "global_tokens", "embedding_backward_inputs"),
+                writes=("local_loss_sum", "embedding_grads"),
                 deps=("zero_grad",),
+            ),
+            t(
+                "embedding_backward",
+                "default",
+                0,
+                reads=("embedding_grads",),
+                deps=("dense_backward",),
                 nccl=True,
             ),
-            t("finalize_model_grads", "default", 0, deps=("backward",), nccl=True),
+            t(
+                "finalize_model_grads",
+                "default",
+                0,
+                deps=("embedding_backward",),
+                nccl=True,
+            ),
             t(
                 "optimizer_step",
                 "default",

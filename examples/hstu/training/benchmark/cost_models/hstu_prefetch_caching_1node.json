@@ -9,7 +9,8 @@
   "global_tokens_allreduce":   {"cpu_us": 0.0, "gpu_us":   120.0},
   "nccl_safety_barrier":       {"cpu_us": 0.0, "gpu_us":    20.0},
   "dense_forward":             {"cpu_us": 0.0, "gpu_us": 28850.0},
-  "backward":                  {"cpu_us": 0.0, "gpu_us": 12320.0},
+  "dense_backward":            {"cpu_us": 0.0, "gpu_us": 12320.0},
+  "embedding_backward":        {"cpu_us": 0.0, "gpu_us":     0.0},
   "finalize_model_grads":      {"cpu_us": 0.0, "gpu_us":   290.0},
   "optimizer_step":            {"cpu_us": 0.0, "gpu_us": 66610.0},
   "watchdog_step":             {"cpu_us": 0.0, "gpu_us":    80.0}
