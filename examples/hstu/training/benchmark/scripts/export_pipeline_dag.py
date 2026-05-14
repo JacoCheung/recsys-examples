@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Export HSTU schedulable-pipeline DAG + NCCL tickets for a benchmark run.
+"""Export HSTU schedulable-pipeline DAG JSON for a benchmark run.
 
 Stdlib-only by design: this runs before the training container, where torch,
 nvtx, and repo imports may be unavailable.
 """
 
 import argparse
-import html
 import json
 import os
 from pathlib import Path
@@ -317,15 +316,6 @@ def _topo(tasks, edges):
     return order
 
 
-def _levels(order, edges):
-    level = {name: 0 for name in order}
-    for name in order:
-        for edge in edges:
-            if edge["producer"] == name and edge["consumer"] in level:
-                level[edge["consumer"]] = max(level[edge["consumer"]], level[name] + 1)
-    return level
-
-
 def _data(args):
     backend = args.backend or os.environ.get("RECSYS_PIPELINE_BACKEND", "legacy")
     config, source = _load_config(
@@ -374,120 +364,6 @@ def _data(args):
     }
 
 
-def _render(data):
-    esc = html.escape
-    title = "Pipeline DAG - {}".format(data.get("experiment") or "benchmark")
-    if not data["tasks"]:
-        return '<!doctype html><meta charset="utf-8"><title>{}</title><body style="font-family:system-ui;background:#0d1117;color:#e6edf3;padding:24px"><h1>{}</h1><p>{}</p><p><a href="dag.json" style="color:#58a6ff">dag.json</a></p></body>'.format(
-            esc(title), esc(title), esc(data.get("note", ""))
-        )
-
-    tasks = {task["name"]: task for task in data["tasks"]}
-    levels = _levels(data["topo_order"], data["edges"])
-    groups = {}
-    for name in data["topo_order"]:
-        groups.setdefault(levels[name], []).append(name)
-    width = max(980, max(len(v) for v in groups.values()) * 190 + 80)
-    height = (max(groups) + 1) * 92 + 80
-    xy = {}
-    for level, names in groups.items():
-        start = (width - len(names) * 190) / 2
-        for i, name in enumerate(names):
-            xy[name] = (start + i * 190, 44 + level * 92)
-
-    stream_color = {
-        "default": "#58a6ff",
-        "memcpy": "#d29922",
-        "data_dist": "#bc8cff",
-        "prefetch": "#3fb950",
-    }
-    edge_color = {
-        "slot": "#8b949e",
-        "depends_on": "#58a6ff",
-        "same_progress_sync": "#d29922",
-    }
-    ticket = {entry["task"]: entry["ticket"] for entry in data["tickets"]}
-    svg = [
-        '<svg viewBox="0 0 {0} {1}" width="100%" height="{1}"><defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#8b949e"/></marker></defs>'.format(
-            width, height
-        )
-    ]
-    for edge in data["edges"]:
-        if edge["producer"] not in xy or edge["consumer"] not in xy:
-            continue
-        x1, y1 = xy[edge["producer"]]
-        x2, y2 = xy[edge["consumer"]]
-        dash = ' stroke-dasharray="5 4"' if edge["kind"] == "same_progress_sync" else ""
-        svg.append(
-            '<path d="M{:.1f},{:.1f} C{:.1f},{:.1f} {:.1f},{:.1f} {:.1f},{:.1f}" fill="none" stroke="{}"{} marker-end="url(#a)"><title>{}</title></path>'.format(
-                x1 + 72,
-                y1 + 54,
-                x1 + 72,
-                (y1 + y2) / 2,
-                x2 + 72,
-                (y1 + y2) / 2,
-                x2 + 72,
-                y2,
-                edge_color.get(edge["kind"], "#8b949e"),
-                dash,
-                esc(
-                    "{} -> {} ({})".format(
-                        edge["producer"], edge["consumer"], edge["kind"]
-                    )
-                ),
-            )
-        )
-    for name in data["topo_order"]:
-        task, (x, y) = tasks[name], xy[name]
-        tlabel = "" if name not in ticket else "T{}".format(ticket[name])
-        svg.append(
-            '<rect x="{:.1f}" y="{:.1f}" width="145" height="54" rx="7" fill="#161b22" stroke="{}" stroke-width="2"/>'.format(
-                x, y, stream_color.get(task["stream"], "#8b949e")
-            )
-        )
-        svg.append(
-            '<text x="{:.1f}" y="{:.1f}" fill="#e6edf3" font-size="12" font-weight="700">{}</text>'.format(
-                x + 8, y + 20, esc(name)
-            )
-        )
-        svg.append(
-            '<text x="{:.1f}" y="{:.1f}" fill="#8b949e" font-size="10">la={} {}</text>'.format(
-                x + 8, y + 38, task["lookahead"], esc(task["stream"])
-            )
-        )
-        if tlabel:
-            svg.append(
-                '<text x="{:.1f}" y="{:.1f}" fill="#f85149" font-size="11" font-weight="700">{}</text>'.format(
-                    x + 112, y + 20, tlabel
-                )
-            )
-    svg.append("</svg>")
-
-    rows = "\n".join(
-        "<tr><td>{ticket}</td><td>{task}</td><td>{stream}</td><td>{thread}</td></tr>".format(
-            ticket=e["ticket"],
-            task=esc(e["task"]),
-            stream=esc(tasks[e["task"]]["stream"]),
-            thread=esc(tasks[e["task"]]["thread"]),
-        )
-        for e in data["tickets"]
-    )
-    return """<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
-<style>body{{margin:0;padding:24px;background:#0d1117;color:#e6edf3;font-family:system-ui,sans-serif}}a{{color:#58a6ff}}.panel{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;margin:14px 0;overflow:auto}}table{{border-collapse:collapse}}td,th{{border-bottom:1px solid #30363d;padding:6px 10px;font-size:12px;text-align:left}}th,.muted{{color:#8b949e}}code{{color:#bc8cff}}</style></head>
-<body><h1>{title}</h1><div class="muted">backend=<code>{backend}</code> config=<code>{config}</code> - <a href="dag.json">dag.json</a></div>
-<div class="panel"><span class="muted">gray=slot, blue=depends_on, orange dashed=same_progress_sync CPU, red T#=NCCL ticket</span>{svg}</div>
-<div class="panel"><b>Topo order</b><br><code>{topo}</code></div>
-<div class="panel"><b>NCCL tickets</b><table><thead><tr><th>ticket</th><th>task</th><th>stream</th><th>thread</th></tr></thead><tbody>{rows}</tbody></table></div>
-</body></html>""".format(
-        title=esc(title),
-        backend=esc(data.get("backend", "")),
-        config=esc((data.get("config") or {}).get("source") or ""),
-        svg="\n".join(svg),
-        topo=esc(" -> ".join(data["topo_order"])),
-        rows=rows or '<tr><td colspan="4">none</td></tr>',
-    )
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -506,8 +382,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     data = _data(args)
     (out / "dag.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    (out / "dag.html").write_text(_render(data))
-    print("DAG artifacts saved: {} {}".format(out / "dag.json", out / "dag.html"))
+    print("DAG artifact saved: {}".format(out / "dag.json"))
 
 
 if __name__ == "__main__":
