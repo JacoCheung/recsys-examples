@@ -112,7 +112,7 @@ def test_nccl_tasks_declaration_order() -> None:
         "wait_input_dist",
         "global_tokens_allreduce",
         "compute_output_dist",
-        "backward",
+        "embedding_backward",
         "finalize_model_grads",
     ]
     assert nccl_order == expected, (
@@ -307,7 +307,9 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
                     "prefetch_embeddings": [
                         {"task": "ranking_embedding_forward", "sides": "gpu"}
                     ],
-                    "backward": [{"task": "prefetch_embeddings", "sides": "both"}],
+                    "embedding_backward": [
+                        {"task": "prefetch_embeddings", "sides": "both"}
+                    ],
                 },
             }
         )
@@ -328,7 +330,9 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
         ("ranking_embedding_forward", "gpu")
     ]
     assert tasks["start_input_dist"].same_progress_sync == ()
-    assert _same_progress_edges(tasks["backward"]) == [("prefetch_embeddings", "both")]
+    assert _same_progress_edges(tasks["embedding_backward"]) == [
+        ("prefetch_embeddings", "both")
+    ]
 
 
 def test_hstu_schedule_config_rejects_unknown_task() -> None:
@@ -402,7 +406,7 @@ def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
         assert set(data["thread_map"]) == expected, path.name
         assert set(data["lookahead"]) == expected, path.name
         sync = data["same_progress_sync"]
-        assert set(sync) == gated_to_output_dist | {"backward"}, path.name
+        assert set(sync) == gated_to_output_dist | {"embedding_backward"}, path.name
         assert "split_ranking_forward" not in data, path.name
         assert "same_progress_sync_sides" not in data, path.name
         assert "noncritical_default" not in json.dumps(data), path.name

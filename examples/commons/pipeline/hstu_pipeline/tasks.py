@@ -28,6 +28,8 @@ Slot conventions:
   ``global_tokens``   scalar AllReduce result (offset=0)
   ``shuffle_handle``  ShuffleHandle from ``start_shuffle_async`` (optional)
   ``ranking_embeddings`` dense embedding output before the ranking tail
+  ``embedding_backward_inputs`` original/detached embedding value pairs
+  ``embedding_grads`` gradients for original embedding values
   ``losses``          dense-forward losses tensor (offset=0)
   ``output``          dense-forward secondary output (offset=0)
   ``step_result``     final return tuple (offset=0)
@@ -35,14 +37,17 @@ Slot conventions:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 import nvtx
 import torch
 from commons.pipeline.engine import Task
 
 RANKING_EMBEDDINGS_SLOT = "ranking_embeddings"
+EMBEDDING_BACKWARD_INPUTS_SLOT = "embedding_backward_inputs"
+EMBEDDING_GRADS_SLOT = "embedding_grads"
 
 
 @dataclass
@@ -121,6 +126,24 @@ def _split_forward_owner(state: PipelineState) -> Any:
         "ranking_embedding_forward requires model_fwd or model to expose "
         "forward_embeddings(batch) and forward_after_embeddings(batch, embeddings)."
     )
+
+
+def _detach_embeddings_for_dense_backward(
+    embeddings,
+) -> Tuple[dict, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
+    """Detach embedding values so dense backward stops at embedding outputs."""
+    dense_embeddings = {}
+    backward_inputs = []
+    for key, jt in embeddings.items():
+        original_values = jt.values()
+        dense_values = original_values.detach()
+        if original_values.requires_grad:
+            dense_values.requires_grad_(True)
+            backward_inputs.append((original_values, dense_values))
+        dense_jt = copy.copy(jt)
+        dense_jt._values = dense_values
+        dense_embeddings[key] = dense_jt
+    return dense_embeddings, tuple(backward_inputs)
 
 
 # ----------------------------------------------------------------------
@@ -569,13 +592,18 @@ def make_dense_forward_task(state: PipelineState) -> Task:
         if batch_gpu is None or embeddings is None:
             ctx.slots.set("losses", None)
             ctx.slots.set("output", None)
+            ctx.slots.set(EMBEDDING_BACKWARD_INPUTS_SLOT, ())
             return
         shuffled = ctx.slots.get("shuffled_batch", batch_gpu)
         owner = _split_forward_owner(state)
+        dense_embeddings, backward_inputs = _detach_embeddings_for_dense_backward(
+            embeddings
+        )
         with nvtx.annotate("## dense_forward ##"):
-            losses, output = owner.forward_after_embeddings(shuffled, embeddings)
+            losses, output = owner.forward_after_embeddings(shuffled, dense_embeddings)
         ctx.slots.set("losses", losses)
         ctx.slots.set("output", output)
+        ctx.slots.set(EMBEDDING_BACKWARD_INPUTS_SLOT, backward_inputs)
 
     return Task.from_fn(
         "dense_forward",
@@ -583,36 +611,31 @@ def make_dense_forward_task(state: PipelineState) -> Task:
         stream="default",
         lookahead=0,
         reads=("batch_gpu", "shuffled_batch", RANKING_EMBEDDINGS_SLOT),
-        writes=("losses", "output"),
+        writes=("losses", "output", EMBEDDING_BACKWARD_INPUTS_SLOT),
         depends_on=("ranking_embedding_forward",),
     )
 
 
 # ----------------------------------------------------------------------
-# 11. backward — (loss * dp_size / global_tokens).backward()
+# 11. dense_backward — stop at detached embedding outputs
 # ----------------------------------------------------------------------
 
 
-def make_backward_task(
+def make_dense_backward_task(
     state: PipelineState,
     *,
     depends_on: tuple = (),
-    same_progress_sync: tuple = (),
 ) -> Task:
-    """Build the backward task.
-
-    ``depends_on`` carries same-batch model-state ordering.
-    ``same_progress_sync`` carries same-progress GPU coherency edges,
-    such as prefetch-to-backward cache ordering.
-    """
     from megatron.core import parallel_state
 
     def _fn(ctx):
         losses = ctx.slots.get("losses", None)
         global_tokens = ctx.slots.get("global_tokens", None)
         if losses is None or global_tokens is None:
+            ctx.slots.set(EMBEDDING_GRADS_SLOT, ())
             return
         if not state.model.training:
+            ctx.slots.set(EMBEDDING_GRADS_SLOT, ())
             return
         with nvtx.annotate("## loss postprocess ##"):
             if state.assert_nan_loss:
@@ -621,27 +644,61 @@ def make_backward_task(
                 collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_loss_sum = torch.sum(losses)
         dp_size = parallel_state.get_data_parallel_world_size()
-        with nvtx.annotate("## backward ##"):
+        with nvtx.annotate("## dense_backward ##"):
             (local_loss_sum * dp_size / global_tokens).backward()
-        # Cache the detached local_loss_sum for step_result
+
+        embedding_grads = []
+        for original_values, dense_values in ctx.slots.get(
+            EMBEDDING_BACKWARD_INPUTS_SLOT, ()
+        ):
+            grad = dense_values.grad
+            if grad is not None and original_values.requires_grad:
+                embedding_grads.append((original_values, grad.detach()))
         ctx.slots.set("local_loss_sum", local_loss_sum.detach())
+        ctx.slots.set(EMBEDDING_GRADS_SLOT, tuple(embedding_grads))
 
     return Task.from_fn(
-        "backward",
+        "dense_backward",
         _fn,
         stream="default",
         lookahead=0,
-        reads=("losses", "global_tokens"),
-        writes=("local_loss_sum",),
+        reads=("losses", "global_tokens", EMBEDDING_BACKWARD_INPUTS_SLOT),
+        writes=("local_loss_sum", EMBEDDING_GRADS_SLOT),
         depends_on=depends_on,
+    )
+
+
+# ----------------------------------------------------------------------
+# 12. embedding_backward — propagate dense grads into ShardedEmbedding
+# ----------------------------------------------------------------------
+
+
+def make_embedding_backward_task(
+    *,
+    same_progress_sync: tuple = (),
+) -> Task:
+    def _fn(ctx):
+        grad_pairs = ctx.slots.get(EMBEDDING_GRADS_SLOT, ())
+        if not grad_pairs:
+            return
+        values, grads = zip(*grad_pairs)
+        with nvtx.annotate("## embedding_backward ##"):
+            torch.autograd.backward(values, grad_tensors=grads)
+
+    return Task.from_fn(
+        "embedding_backward",
+        _fn,
+        stream="default",
+        lookahead=0,
+        reads=(EMBEDDING_GRADS_SLOT,),
+        depends_on=("dense_backward",),
         same_progress_sync=same_progress_sync,
-        # DDP backward AllReduce fires inside .backward() — mark NCCL.
         nccl=True,
     )
 
 
 # ----------------------------------------------------------------------
-# 12. finalize_model_grads (Megatron TP)
+# 13. finalize_model_grads (Megatron TP)
 # ----------------------------------------------------------------------
 
 
@@ -661,13 +718,13 @@ def make_finalize_grads_task(state: PipelineState) -> Task:
         _fn,
         stream="default",
         lookahead=0,
-        depends_on=("backward",),
+        depends_on=("embedding_backward",),
         nccl=True,
     )
 
 
 # ----------------------------------------------------------------------
-# 13. optimizer_step — writes step_result
+# 14. optimizer_step — writes step_result
 # ----------------------------------------------------------------------
 
 
@@ -692,7 +749,7 @@ def make_optimizer_step_task(state: PipelineState) -> Task:
 
 
 # ----------------------------------------------------------------------
-# 14. watchdog_step (optional diagnostic)
+# 15. watchdog_step (optional diagnostic)
 # ----------------------------------------------------------------------
 
 
