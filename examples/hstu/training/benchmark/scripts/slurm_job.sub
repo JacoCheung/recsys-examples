@@ -18,7 +18,8 @@
 #   {EXP_OUTPUT_DIR}/
 #   ├── {exp_name}_{jobid}_{timestamp}.log
 #   ├── {exp_name}_{jobid}_{timestamp}.gin    (e2e only — generated config)
-#   └── {exp_name}_*_job{jobid}_*.nsys-rep    (if nsys enabled, e2e only)
+#   ├── dag.json / dag.html                   (pipeline DAG + NCCL tickets)
+#   └── {exp_name}_*_job{jobid}_*.nsys-rep    (if nsys enabled)
 # ============================================================================
 
 #SBATCH --job-name=hstu_benchmark
@@ -162,6 +163,25 @@ export HSTU_PIPELINE_CONFIG=${HSTU_PIPELINE_CONFIG:-}
 # default-stream tasks frozen). Empty = disabled.
 export HSTU_AUTOSCHED_COST_FILE=${HSTU_AUTOSCHED_COST_FILE:-}
 export HSTU_AUTOSCHED_MAX_IN_FLIGHT=${HSTU_AUTOSCHED_MAX_IN_FLIGHT:-5}
+
+# Export a small static schedule artifact before the container run.  The
+# exporter is stdlib-only so missing training dependencies on the Slurm host do
+# not block benchmarks; failures are logged but do not fail the experiment.
+DAG_EXPORTER="${HSTU_ROOT}/training/benchmark/scripts/export_pipeline_dag.py"
+if [ -f "${DAG_EXPORTER}" ]; then
+    echo "Exporting pipeline DAG artifacts..."
+    python "${DAG_EXPORTER}" \
+        --backend "${RECSYS_PIPELINE_BACKEND}" \
+        --config "${HSTU_PIPELINE_CONFIG}" \
+        --hstu-root "${HSTU_ROOT}" \
+        --output-dir "${EXP_OUTPUT_DIR}" \
+        --exp-name "${EXP_NAME}" \
+        --gin-options="${GIN_OPTIONS}" \
+        --gin-config "${CONFIG_FILE}" \
+        --watchdog "${CUDA_MEM_WATCHDOG}" \
+        || echo "Warning: pipeline DAG export failed"
+    echo ""
+fi
 
 # Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
 LAUNCH_BLOCKING_ENV=""
@@ -391,7 +411,8 @@ fi
 echo "⏰ Finished at: $(date)"
 echo "📝 Log saved to: ${LOG_FILE}"
 [ -n "${CONFIG_FILE}" ] && echo "📄 Config file: ${CONFIG_FILE}"
-if [ ${ENABLE_NSYS} -eq 1 ] && [ "${BENCHMARK_TYPE}" = "e2e" ]; then
+echo "📄 DAG artifacts: ${EXP_OUTPUT_DIR}/dag.json ${EXP_OUTPUT_DIR}/dag.html"
+if [ ${ENABLE_NSYS} -eq 1 ]; then
     echo "📊 nsys profiles: ${EXP_OUTPUT_DIR}/${EXP_NAME}_*_job${SLURM_JOB_ID}_*.nsys-rep"
 fi
 echo "=========================================="
