@@ -9,7 +9,7 @@
 #   {EXP_OUTPUT_DIR}/
 #   ├── {exp_name}_{jobid}_{timestamp}.log
 #   ├── {exp_name}_{jobid}_{timestamp}.gin    (generated config)
-#   ├── dag.json / dag.html                   (pipeline DAG + NCCL tickets)
+#   ├── dag.json                              (pipeline DAG + NCCL tickets)
 #   └── {exp_name}_*_job{jobid}_*.nsys-rep  (if nsys enabled)
 # ============================================================================
 
@@ -330,7 +330,7 @@ fi
 echo "⏰ Finished at: $(date)"
 echo "📝 Log saved to: ${LOG_FILE}"
 echo "📄 Config file: ${CONFIG_FILE}"
-echo "📄 DAG artifacts: ${EXP_OUTPUT_DIR}/dag.json ${EXP_OUTPUT_DIR}/dag.html"
+echo "📄 DAG artifact: ${EXP_OUTPUT_DIR}/dag.json"
 if [ ${ENABLE_NSYS} -eq 1 ]; then
     echo "📊 nsys profiles: ${EXP_OUTPUT_DIR}/${EXP_NAME}_*_job${SLURM_JOB_ID}_*.nsys-rep"
 fi
