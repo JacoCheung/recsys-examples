@@ -218,11 +218,10 @@ def test_cuda_mem_watchdog_task_is_env_gated(monkeypatch) -> None:
     assert "watchdog_step" in names
 
 
-def test_schedule_config_split_ranking_forward_adds_embedding_task() -> None:
+def test_schedule_always_includes_ranking_embedding_task() -> None:
     pipe = _make_noop_pipeline(
         prefetch=True,
         prefetch_depth=1,
-        schedule_config={"split_ranking_forward": True},
     )
     schedule, pool = pipe._build_schedule()
     from commons.pipeline.engine.autosched.validator import validate
@@ -239,12 +238,10 @@ def test_schedule_config_controls_same_progress_per_task() -> None:
         prefetch=True,
         prefetch_depth=1,
         schedule_config={
-            "split_ranking_forward": True,
             "same_progress_sync": {
                 "h2d": [{"task": "global_tokens_allreduce", "sides": "both"}],
                 "start_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
                 "finish_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
-                "start_input_dist": [],
                 "wait_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
                 "prefetch_embeddings": [
                     {"task": "ranking_embedding_forward", "sides": "both"}
@@ -286,7 +283,6 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
             {
                 "version": 1,
                 "thread_map": "io_data_dist_prefetch_compute",
-                "split_ranking_forward": True,
                 "lookahead": {
                     "h2d": 2,
                     "start_shuffle": 2,
@@ -303,7 +299,6 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
                     "finish_shuffle": [
                         {"task": "ranking_embedding_forward", "sides": "gpu"}
                     ],
-                    "start_input_dist": [],
                     "wait_input_dist": [
                         {"task": "ranking_embedding_forward", "sides": "gpu"}
                     ],
@@ -319,7 +314,6 @@ def test_hstu_schedule_config_file_controls_runtime_knobs(
 
     pipe = _make_noop_pipeline(prefetch=True, prefetch_depth=1)
     assert pipe._thread_map == HSTU_THREAD_MAP_PRESETS["io_data_dist_prefetch_compute"]
-    assert pipe._split_ranking_forward is True
 
     schedule, pool = pipe._build_schedule()
     from commons.pipeline.engine.autosched.validator import validate
@@ -368,6 +362,13 @@ def test_hstu_schedule_config_rejects_legacy_same_progress_sides() -> None:
         )
 
 
+def test_hstu_schedule_config_rejects_legacy_split_ranking_forward() -> None:
+    from commons.pipeline.hstu_pipeline import HSTUPipelineScheduleConfig
+
+    with pytest.raises(ValueError, match="Unknown HSTU pipeline config field"):
+        HSTUPipelineScheduleConfig.from_mapping({"split_ranking_forward": True})
+
+
 def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
     import json
     import pathlib
@@ -385,18 +386,41 @@ def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
         / "thread_map_presets"
     )
     expected = set(HSTU_PIPELINE_TASKS)
+    gated_to_output_dist = {
+        "h2d",
+        "start_shuffle",
+        "finish_shuffle",
+        "start_input_dist",
+        "wait_input_dist",
+        "prefetch_embeddings",
+    }
 
     for path in sorted(config_dir.glob("*.json")):
         data = json.loads(path.read_text())
         assert set(data["thread_map"]) == expected, path.name
         assert set(data["lookahead"]) == expected, path.name
-        assert set(data["same_progress_sync"]) == expected, path.name
+        sync = data["same_progress_sync"]
+        assert set(sync) == gated_to_output_dist | {"backward"}, path.name
+        assert "split_ranking_forward" not in data, path.name
         assert "same_progress_sync_sides" not in data, path.name
         assert "noncritical_default" not in json.dumps(data), path.name
-        for task_name, spec in data["same_progress_sync"].items():
+        for task_name, spec in sync.items():
             assert isinstance(spec, list), (path.name, task_name)
+            assert spec, (path.name, task_name)
             for edge in spec:
                 assert set(edge) == {"task", "sides"}, (path.name, task_name)
+                assert edge["task"] in expected, (path.name, task_name)
+                assert edge["task"] != "forward", (path.name, task_name)
+            if task_name in gated_to_output_dist:
+                assert spec == [{"task": "compute_output_dist", "sides": "both"}], (
+                    path.name,
+                    task_name,
+                )
+            else:
+                assert spec == [{"task": "prefetch_embeddings", "sides": "both"}], (
+                    path.name,
+                    task_name,
+                )
 
 
 def test_no_v0_context_references_in_hstu_pipeline() -> None:
@@ -458,7 +482,7 @@ def test_default_thread_map_covers_every_task_name() -> None:
         f"Add them to the map in hstu_pipeline/pipeline.py."
     )
 
-    optional = {"ranking_embedding_forward", "watchdog_step"}
+    optional = {"watchdog_step"}
     extra = set(HSTU_DEFAULT_THREAD_MAP) - task_names
     assert extra <= optional, (
         "HSTU_DEFAULT_THREAD_MAP has unexpected entries for tasks not "

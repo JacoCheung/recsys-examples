@@ -48,7 +48,6 @@ from .tasks import (
     make_compute_output_dist_task,
     make_finalize_grads_task,
     make_finish_shuffle_task,
-    make_forward_task,
     make_global_tokens_task,
     make_h2d_task,
     make_optimizer_step_task,
@@ -277,14 +276,6 @@ class HSTUPipeline:
         self._autosched_max_in_flight: int = int(
             os.environ.get("HSTU_AUTOSCHED_MAX_IN_FLIGHT", "5")
         )
-        if (
-            self._schedule_config is not None
-            and self._schedule_config.split_ranking_forward is not None
-        ):
-            self._split_ranking_forward = self._schedule_config.split_ranking_forward
-        else:
-            self._split_ranking_forward = False
-
         # Default shuffler is identity (no-op).
         if batch_shuffler is None:
             from commons.distributed.batch_shuffler import IdentityBalancedBatchShuffler
@@ -396,11 +387,9 @@ class HSTUPipeline:
         # Schedule configs may override the same-progress edge per task.
         def same_progress_for(task_name: str) -> tuple:
             default = ("forward",)
-            return (
-                config.same_progress_for(task_name, default)
-                if config is not None
-                else default
-            )
+            if config is not None:
+                return config.same_progress_for(task_name, ())
+            return default
 
         tasks = [
             make_h2d_task(
@@ -447,26 +436,23 @@ class HSTUPipeline:
                     same_progress_sync=same_progress_for("prefetch_embeddings"),
                 )
             )
-        # compute_output_dist produces awaitables consumed by forward.
-        # The memcpy safety wait is folded into forward's body.
+        # compute_output_dist produces awaitables consumed by the ranking
+        # embedding subtask; the dense tail remains named "forward".
         tasks.append(
             make_compute_output_dist_task(
                 self._state,
                 prefetch=self._prefetch,
             )
         )
-        if self._split_ranking_forward:
-            tasks.extend(
-                [
-                    make_ranking_embedding_task(
-                        self._state,
-                        prefetch=self._prefetch,
-                    ),
-                    make_ranking_forward_tail_task(self._state),
-                ]
-            )
-        else:
-            tasks.append(make_forward_task(self._state, prefetch=self._prefetch))
+        tasks.extend(
+            [
+                make_ranking_embedding_task(
+                    self._state,
+                    prefetch=self._prefetch,
+                ),
+                make_ranking_forward_tail_task(self._state),
+            ]
+        )
         # zero_grad is model-state ordering; prefetch sync is a
         # same-progress GPU coherency edge for DynamicEmb cache state.
         backward_deps = ("zero_grad",)
@@ -474,9 +460,7 @@ class HSTUPipeline:
         if self._prefetch:
             backward_same_progress_sync = ("prefetch_embeddings",)
         if config is not None:
-            backward_same_progress_sync = config.same_progress_for(
-                "backward", backward_same_progress_sync
-            )
+            backward_same_progress_sync = config.same_progress_for("backward", ())
         tasks.extend(
             [
                 make_backward_task(

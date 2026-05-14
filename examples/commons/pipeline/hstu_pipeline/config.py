@@ -49,7 +49,6 @@ class HSTUPipelineScheduleConfig:
     same_progress_sync: Dict[str, Tuple[_SameProgressSync, ...]] = field(
         default_factory=dict
     )
-    split_ranking_forward: Optional[bool] = None
     source: Optional[str] = None
 
     @classmethod
@@ -64,7 +63,6 @@ class HSTUPipelineScheduleConfig:
             "thread_map",
             "lookahead",
             "same_progress_sync",
-            "split_ranking_forward",
         }
         if unknown:
             raise ValueError(
@@ -75,20 +73,12 @@ class HSTUPipelineScheduleConfig:
             raise ValueError(f"Unsupported HSTU pipeline config version: {version!r}")
 
         same_progress = _parse_same_progress_sync(raw.get("same_progress_sync"))
-        split = (
-            None
-            if "split_ranking_forward" not in raw
-            else _parse_bool(
-                raw["split_ranking_forward"], field_name="split_ranking_forward"
-            )
-        )
         thread_map = raw.get("thread_map")
         _validate_thread_map_config(thread_map)
         return cls(
             thread_map=thread_map,
             lookahead=_parse_lookahead(raw.get("lookahead")),
             same_progress_sync=same_progress,
-            split_ranking_forward=split,
             source=source,
         )
 
@@ -150,21 +140,6 @@ def _validate_thread_map_config(value: Any) -> None:
         if not isinstance(task_name, str) or not isinstance(thread_name, str):
             raise TypeError("thread_map object entries must be string:string")
         _validate_task_name(task_name, field_name="thread_map")
-
-
-def _parse_bool(value: Any, *, field_name: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
-        if value in (0, 1):
-            return bool(value)
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-    raise TypeError(f"{field_name} must be a boolean, got {value!r}")
 
 
 def _parse_lookahead(value: Any) -> Dict[str, int]:

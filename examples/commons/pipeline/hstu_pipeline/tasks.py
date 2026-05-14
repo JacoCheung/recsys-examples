@@ -27,6 +27,7 @@ Slot conventions:
   ``torchrec_ctx``    per-batch ``TrainPipelineContext`` (travels with slot)
   ``global_tokens``   scalar AllReduce result (offset=0)
   ``shuffle_handle``  ShuffleHandle from ``start_shuffle_async`` (optional)
+  ``ranking_embeddings`` dense embedding output before the ranking tail
   ``losses``          forward losses tensor (offset=0)
   ``output``          forward secondary output (offset=0)
   ``step_result``     final return tuple (offset=0)
@@ -117,7 +118,7 @@ def _split_forward_owner(state: PipelineState) -> Any:
                 break
             owner = next_owner
     raise RuntimeError(
-        "split_ranking_forward requires model_fwd or model to expose "
+        "ranking_embedding_forward requires model_fwd or model to expose "
         "forward_embeddings(batch) and forward_after_embeddings(batch, embeddings)."
     )
 
@@ -521,52 +522,8 @@ def make_compute_output_dist_task(
 
 
 # ----------------------------------------------------------------------
-# 10. forward
+# 10. ranking forward — embedding subtask + dense tail
 # ----------------------------------------------------------------------
-
-
-def make_forward_task(state: PipelineState, *, prefetch: bool = False) -> Task:
-    """Sets module context, runs model(batch), writes losses + output.
-
-    In prefetch mode, the dependency on ``prefetch_embeddings`` lets the
-    engine derive the cross-iteration wait.
-    """
-
-    def _fn(ctx):
-        batch_gpu = ctx.slots.get("batch_gpu", None)
-        torchrec_ctx = ctx.slots.get("torchrec_ctx", None)
-        if batch_gpu is None or torchrec_ctx is None:
-            ctx.slots.set("losses", None)
-            ctx.slots.set("output", None)
-            return
-        # Keep GPU execution order aligned with host NCCL ticket order.
-        if not state.is_identity_shuffler:
-            memcpy = ctx.stream_pool.get("memcpy")
-            if memcpy is not None:
-                torch.cuda.current_stream().wait_stream(memcpy)
-        shuffled = ctx.slots.get("shuffled_batch", batch_gpu)
-        state.set_module_context(torchrec_ctx)
-        with nvtx.annotate("## forward ##"):
-            losses, output = state.model_fwd(shuffled)
-        ctx.slots.set("losses", losses)
-        ctx.slots.set("output", output)
-
-    # compute_output_dist is the same-lookahead hard edge; input_dist /
-    # prefetch edges are cross-lookahead and resolved by ring rotation.
-    depends_on: tuple = ("compute_output_dist", "wait_input_dist")
-    if prefetch:
-        depends_on = ("compute_output_dist", "prefetch_embeddings")
-
-    return Task.from_fn(
-        "forward",
-        _fn,
-        stream="default",
-        lookahead=0,
-        reads=("batch_gpu", "torchrec_ctx", "shuffled_batch"),
-        writes=("losses", "output"),
-        depends_on=depends_on,
-        # forward does NOT AllReduce; DDP hooks fire during backward.
-    )
 
 
 def make_ranking_embedding_task(
@@ -629,11 +586,6 @@ def make_ranking_forward_tail_task(state: PipelineState) -> Task:
         writes=("losses", "output"),
         depends_on=("ranking_embedding_forward",),
     )
-
-
-# ----------------------------------------------------------------------
-# The NCCL safety barrier lives in forward.
-# ----------------------------------------------------------------------
 
 
 # ----------------------------------------------------------------------
