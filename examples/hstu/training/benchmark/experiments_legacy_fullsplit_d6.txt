@@ -1,0 +1,4 @@
+# Two-variant benchmark list for the backward split follow-up.
+# Format: exp_name,generate_gin_config_options,ENV=VALUE;ENV2=VALUE2
+legacy_none,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --caching --evict lfu --ratio 0.1 --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05,RECSYS_PIPELINE_BACKEND=legacy;HSTU_PIPELINE_CONFIG=
+full_split_d6,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --caching --evict lfu --ratio 0.1 --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05,RECSYS_PIPELINE_BACKEND=new;HSTU_PIPELINE_CONFIG=training/benchmark/pipeline_configs/thread_map_presets/full_split_d6.json

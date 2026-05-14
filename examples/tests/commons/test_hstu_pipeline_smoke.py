@@ -416,14 +416,29 @@ def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
             for edge in spec:
                 assert set(edge) == {"task", "sides"}, (path.name, task_name)
                 assert edge["task"] in expected, (path.name, task_name)
-                assert edge["task"] != "dense_forward", (path.name, task_name)
             if task_name in gated_to_output_dist:
+                if path.name == "full_split_d6.json":
+                    expected_task = (
+                        "ranking_embedding_forward"
+                        if task_name == "prefetch_embeddings"
+                        else "dense_forward"
+                    )
+                    assert spec == [{"task": expected_task, "sides": "both"}], (
+                        path.name,
+                        task_name,
+                    )
+                    continue
                 assert spec == [{"task": "compute_output_dist", "sides": "both"}], (
                     path.name,
                     task_name,
                 )
             else:
-                assert spec == [{"task": "prefetch_embeddings", "sides": "both"}], (
+                expected_task = (
+                    "dense_forward"
+                    if path.name == "full_split_d6.json"
+                    else "prefetch_embeddings"
+                )
+                assert spec == [{"task": expected_task, "sides": "both"}], (
                     path.name,
                     task_name,
                 )
