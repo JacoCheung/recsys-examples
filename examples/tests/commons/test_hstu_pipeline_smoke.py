@@ -229,8 +229,10 @@ def test_schedule_always_includes_ranking_embedding_task() -> None:
     validate(schedule, pool)
     names = [t.name for stage in schedule.stages for t in stage.tasks]
     assert "ranking_embedding_forward" in names
+    assert "dense_forward" in names
+    assert "forward" not in names
     assert names.index("compute_output_dist") < names.index("ranking_embedding_forward")
-    assert names.index("ranking_embedding_forward") < names.index("forward")
+    assert names.index("ranking_embedding_forward") < names.index("dense_forward")
 
 
 def test_schedule_config_controls_same_progress_per_task() -> None:
@@ -410,7 +412,7 @@ def test_thread_map_preset_configs_are_explicit_and_complete() -> None:
             for edge in spec:
                 assert set(edge) == {"task", "sides"}, (path.name, task_name)
                 assert edge["task"] in expected, (path.name, task_name)
-                assert edge["task"] != "forward", (path.name, task_name)
+                assert edge["task"] != "dense_forward", (path.name, task_name)
             if task_name in gated_to_output_dist:
                 assert spec == [{"task": "compute_output_dist", "sides": "both"}], (
                     path.name,
