@@ -198,38 +198,26 @@ def _tasks(config, args):
         ),
     ]
 
-    if _bool(config.get("split_ranking_forward", False)):
-        tasks.extend(
-            [
-                t(
-                    "ranking_embedding_forward",
-                    "default",
-                    0,
-                    reads=("batch_gpu", "torchrec_ctx", "shuffled_batch"),
-                    writes=("ranking_embeddings",),
-                    deps=("compute_output_dist", "prefetch_embeddings"),
-                ),
-                t(
-                    "forward",
-                    "default",
-                    0,
-                    reads=("batch_gpu", "shuffled_batch", "ranking_embeddings"),
-                    writes=("losses", "output"),
-                    deps=("ranking_embedding_forward",),
-                ),
-            ]
-        )
-    else:
-        tasks.append(
+    tasks.extend(
+        [
+            t(
+                "ranking_embedding_forward",
+                "default",
+                0,
+                reads=("batch_gpu", "torchrec_ctx", "shuffled_batch"),
+                writes=("ranking_embeddings",),
+                deps=("compute_output_dist", "prefetch_embeddings"),
+            ),
             t(
                 "forward",
                 "default",
                 0,
-                reads=("batch_gpu", "torchrec_ctx", "shuffled_batch"),
+                reads=("batch_gpu", "shuffled_batch", "ranking_embeddings"),
                 writes=("losses", "output"),
-                deps=("compute_output_dist", "prefetch_embeddings"),
-            )
-        )
+                deps=("ranking_embedding_forward",),
+            ),
+        ]
+    )
 
     tasks.extend(
         [
@@ -376,7 +364,6 @@ def _data(args):
             "thread_map": config.get("thread_map"),
             "lookahead": config.get("lookahead", {}),
             "same_progress_sync": config.get("same_progress_sync", {}),
-            "split_ranking_forward": _bool(config.get("split_ranking_forward", False)),
             "shuffle_nccl": _shuffle_nccl(args),
             "watchdog": _bool(args.watchdog),
         },

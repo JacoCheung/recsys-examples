@@ -17,7 +17,6 @@
     "optimizer_step": "compute",
     "watchdog_step": "compute"
   },
-  "split_ranking_forward": false,
   "lookahead": {
     "h2d": 5,
     "start_shuffle": 4,
@@ -36,20 +35,12 @@
     "watchdog_step": 0
   },
   "same_progress_sync": {
-    "h2d": [{"task": "forward", "sides": "both"}],
-    "start_shuffle": [{"task": "forward", "sides": "both"}],
-    "finish_shuffle": [{"task": "forward", "sides": "both"}],
-    "start_input_dist": [{"task": "forward", "sides": "both"}],
-    "wait_input_dist": [{"task": "forward", "sides": "both"}],
-    "prefetch_embeddings": [{"task": "forward", "sides": "both"}],
-    "zero_grad": [],
-    "global_tokens_allreduce": [],
-    "compute_output_dist": [],
-    "ranking_embedding_forward": [],
-    "forward": [],
-    "backward": [{"task": "prefetch_embeddings", "sides": "both"}],
-    "finalize_model_grads": [],
-    "optimizer_step": [],
-    "watchdog_step": []
+    "h2d": [{"task": "compute_output_dist", "sides": "both"}],
+    "start_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
+    "finish_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
+    "start_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
+    "wait_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
+    "prefetch_embeddings": [{"task": "compute_output_dist", "sides": "both"}],
+    "backward": [{"task": "prefetch_embeddings", "sides": "both"}]
   }
 }
