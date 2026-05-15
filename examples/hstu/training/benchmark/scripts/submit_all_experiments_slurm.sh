@@ -533,8 +533,11 @@ for i in "${!EXP_NAMES[@]}"; do
     SBATCH_ARGS+=(--mem=0)
     SBATCH_ARGS+=(--time="${TIME_LIMIT}")
     SBATCH_ARGS+=(--exclusive)
-    # cw-dfw batch_short partition rejects jobs without explicit GPU spec.
-    SBATCH_ARGS+=(--gpus-per-node="${RANKS_PER_NODE}")
+    # cw-dfw batch_short rejects jobs without an explicit GPU spec, while
+    # EOS batch rejects this GRES form. Keep the request cluster/partition aware.
+    if [[ "${PARTITION}" == "batch_short" || -n "${HSTU_SLURM_GPUS_PER_NODE:-}" ]]; then
+        SBATCH_ARGS+=(--gpus-per-node="${HSTU_SLURM_GPUS_PER_NODE:-${RANKS_PER_NODE}}")
+    fi
     SBATCH_ARGS+=(--network=sharp)
     
     # Sequential execution mode: add dependency
