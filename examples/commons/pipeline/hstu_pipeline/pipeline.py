@@ -43,6 +43,7 @@ from .config import (
     load_hstu_pipeline_schedule_config,
 )
 from .tasks import (
+    CRITICAL_STREAM,
     PipelineState,
     make_compute_output_dist_task,
     make_dense_backward_task,
@@ -242,9 +243,23 @@ class HSTUPipeline:
         threaded: bool = True,
         thread_map: Any = None,
         schedule_config: Optional[Any] = None,
+        critical_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         if prefetch_depth < 1:
             raise ValueError(f"prefetch_depth must be >= 1, got {prefetch_depth}")
+        if critical_stream is not None:
+            if device.type != "cuda":
+                raise ValueError("critical_stream is only valid for CUDA devices")
+            expected_stream_device = device
+            if expected_stream_device.index is None:
+                expected_stream_device = torch.device(
+                    "cuda", torch.cuda.current_device()
+                )
+            if critical_stream.device != expected_stream_device:
+                raise ValueError(
+                    f"critical_stream is on {critical_stream.device}, "
+                    f"but HSTUPipeline device is {expected_stream_device}"
+                )
 
         config_source = (
             schedule_config
@@ -273,6 +288,7 @@ class HSTUPipeline:
         self._apply_jit = apply_jit
         self._threaded = threaded
         self._thread_map = thread_map
+        self._critical_stream = critical_stream
 
         # Optional auto-scheduler: a JSON cost model can override
         # off-default lookahead values within the in-flight budget.
@@ -485,7 +501,7 @@ class HSTUPipeline:
         if os.environ.get("CUDA_MEM_WATCHDOG", "0") == "1":
             tasks.append(make_watchdog_task())
 
-        stream_slots = ("default", "memcpy", "data_dist")
+        stream_slots = ("default", CRITICAL_STREAM, "memcpy", "data_dist")
         if self._prefetch:
             stream_slots = stream_slots + ("prefetch",)
 
@@ -494,10 +510,14 @@ class HSTUPipeline:
         )
 
         device = self._state.device
+        critical_stream = self._critical_stream
+        if device.type == "cuda" and critical_stream is None:
+            critical_stream = torch.cuda.Stream(device)
         pool_dict: dict = {
             "default": (
                 torch.cuda.default_stream(device) if device.type == "cuda" else None
             ),
+            CRITICAL_STREAM: critical_stream if device.type == "cuda" else None,
             "memcpy": (
                 torch.cuda.Stream(device, priority=-1)
                 if device.type == "cuda"
@@ -615,7 +635,7 @@ class HSTUPipeline:
 
         memcpy_stream = pool.get("memcpy")
         data_dist_stream = pool.get("data_dist")
-        default_stream = pool.get("default")
+        default_stream = pool.get(CRITICAL_STREAM)
 
         # H2D peek batch on the engine memcpy stream.
         from commons.pipeline.utils import _to_device
