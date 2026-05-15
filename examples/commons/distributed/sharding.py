@@ -14,7 +14,8 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Dict, Tuple, Union
+from contextlib import nullcontext
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -64,6 +65,7 @@ def apply_megatron_ddp(
     config: TransformerConfig,
     dense_optimizer_param: OptimizerParam,
     device: torch.device,
+    ddp_init_stream: Optional[Any] = None,
 ):
     """
     Apply megatron DDP to the model.
@@ -88,19 +90,26 @@ def apply_megatron_ddp(
         check_for_nan_in_grad=False,
         bucket_size=None,
     )
-    # MCORE DDP does not broadcast parameters implicitly
-    if isinstance(original_model, DistributedModelParallel):
-        original_model._dmp_wrapped_module = DDP(
-            config,
-            ddp_config,
-            model,
-        )
-    else:
-        original_model = DDP(
-            config,
-            ddp_config,
-            model,
-        )
+    stream_context = (
+        torch.cuda.stream(ddp_init_stream)
+        if ddp_init_stream is not None
+        else nullcontext()
+    )
+    # MCORE DDP registers AccumulateGrad hooks during construction. Keep
+    # those hooks on the same stream used by the pipeline critical path.
+    with stream_context:
+        if isinstance(original_model, DistributedModelParallel):
+            original_model._dmp_wrapped_module = DDP(
+                config,
+                ddp_config,
+                model,
+            )
+        else:
+            original_model = DDP(
+                config,
+                ddp_config,
+                model,
+            )
 
     # only broadcast parameters within DataParallel group, TP group weights are initialized with the same rng states!
     def broadcast_params_for_non_model_parallel_embedding_modules():
@@ -276,6 +285,7 @@ def make_optimizer_and_shard(
     pipeline_type: str = "native",
     device: torch.device = None,
     pg: torch.distributed.ProcessGroup = None,
+    ddp_init_stream: Optional[Any] = None,
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -291,7 +301,7 @@ def make_optimizer_and_shard(
         pipeline_type,
     )
     model, dense_optimizer = apply_megatron_ddp(
-        model, config, dense_optimizer_param, device
+        model, config, dense_optimizer_param, device, ddp_init_stream=ddp_init_stream
     )
 
     return model, dense_optimizer

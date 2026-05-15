@@ -48,6 +48,7 @@ from commons.pipeline.engine import Task
 RANKING_EMBEDDINGS_SLOT = "ranking_embeddings"
 EMBEDDING_BACKWARD_INPUTS_SLOT = "embedding_backward_inputs"
 EMBEDDING_GRADS_SLOT = "embedding_grads"
+CRITICAL_STREAM = "critical"
 
 
 @dataclass
@@ -215,7 +216,7 @@ def make_zero_grad_task(state: PipelineState) -> Task:
                 model_inner.zero_grad_buffer()
             state.optimizer.zero_grad()
 
-    return Task.from_fn("zero_grad", _fn, stream="default", lookahead=0)
+    return Task.from_fn("zero_grad", _fn, stream=CRITICAL_STREAM, lookahead=0)
 
 
 # ----------------------------------------------------------------------
@@ -240,7 +241,7 @@ def make_global_tokens_task(state: PipelineState) -> Task:
     return Task.from_fn(
         "global_tokens_allreduce",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         reads=("batch_gpu",),
         writes=("global_tokens",),
@@ -471,7 +472,7 @@ def make_prefetch_task(
                 device=state.device,
                 stream_context=torch.get_device_module(state.device).stream,
                 data_dist_stream=ctx.stream_pool.get("data_dist"),
-                default_stream=ctx.stream_pool.get("default"),
+                default_stream=ctx.stream_pool.get(CRITICAL_STREAM),
             )
             for sharded_module in state.pipelined_modules:
                 fwd = sharded_module.forward
@@ -506,7 +507,7 @@ def make_compute_output_dist_task(
     """Run sparse lookup + output distribution for each pipelined module.
 
     The returned awaitables are stored in the per-batch TorchRec context
-    for the forward wrapper to consume. The task runs on the default
+    for the forward wrapper to consume. The task runs on the critical
     stream and is marked ``nccl=True`` because it submits output a2a.
     """
     from commons.pipeline.hstu_pipeline.embedding_split import (
@@ -532,7 +533,7 @@ def make_compute_output_dist_task(
     return Task.from_fn(
         "compute_output_dist",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=lookahead,
         reads=("torchrec_ctx",),
         # depends_on documents the upstream input-dist path. These
@@ -577,7 +578,7 @@ def make_ranking_embedding_task(
     return Task.from_fn(
         "ranking_embedding_forward",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         reads=("batch_gpu", "torchrec_ctx", "shuffled_batch"),
         writes=(RANKING_EMBEDDINGS_SLOT,),
@@ -608,7 +609,7 @@ def make_dense_forward_task(state: PipelineState) -> Task:
     return Task.from_fn(
         "dense_forward",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         reads=("batch_gpu", "shuffled_batch", RANKING_EMBEDDINGS_SLOT),
         writes=("losses", "output", EMBEDDING_BACKWARD_INPUTS_SLOT),
@@ -660,7 +661,7 @@ def make_dense_backward_task(
     return Task.from_fn(
         "dense_backward",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         reads=("losses", "global_tokens", EMBEDDING_BACKWARD_INPUTS_SLOT),
         writes=("local_loss_sum", EMBEDDING_GRADS_SLOT),
@@ -688,7 +689,7 @@ def make_embedding_backward_task(
     return Task.from_fn(
         "embedding_backward",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         reads=(EMBEDDING_GRADS_SLOT,),
         depends_on=("dense_backward",),
@@ -716,7 +717,7 @@ def make_finalize_grads_task(state: PipelineState) -> Task:
     return Task.from_fn(
         "finalize_model_grads",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         depends_on=("embedding_backward",),
         nccl=True,
@@ -741,7 +742,7 @@ def make_optimizer_step_task(state: PipelineState) -> Task:
     return Task.from_fn(
         "optimizer_step",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         depends_on=("finalize_model_grads",),
         writes=("step_result",),
@@ -762,7 +763,7 @@ def make_watchdog_task() -> Task:
     return Task.from_fn(
         "watchdog_step",
         _fn,
-        stream="default",
+        stream=CRITICAL_STREAM,
         lookahead=0,
         depends_on=("optimizer_step",),
     )

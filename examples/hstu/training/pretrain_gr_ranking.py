@@ -117,6 +117,30 @@ def main():
     )
 
     optimizer_param = create_optimizer_params(optimizer_args)
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    # Pipeline backend: "legacy" (default) uses TrainPipelineFactory's
+    # JaggedMegatron* classes; "new" uses HSTUPipeline (schedulable
+    # engine). Switched via env var RECSYS_PIPELINE_BACKEND so the gin
+    # config + CLI surface stay unchanged.
+    pipeline_backend = os.environ.get("RECSYS_PIPELINE_BACKEND", "legacy").lower()
+    if pipeline_backend not in ("legacy", "new"):
+        raise ValueError(
+            f"RECSYS_PIPELINE_BACKEND must be 'legacy' or 'new', "
+            f"got {pipeline_backend!r}"
+        )
+
+    if pipeline_backend == "new" and trainer_args.pipeline_type == "none":
+        # The new HSTU adapter only wraps the sparse-dist variants.
+        # Fall back to legacy for the non-pipelined "none" type instead
+        # of silently changing semantics.
+        print_rank_0(
+            "RECSYS_PIPELINE_BACKEND=new but pipeline_type=none; "
+            "falling back to legacy non-pipelined path."
+        )
+        pipeline_backend = "legacy"
+
+    critical_stream = torch.cuda.Stream(device) if pipeline_backend == "new" else None
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
         config=hstu_config,
@@ -124,6 +148,8 @@ def main():
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
         pipeline_type=trainer_args.pipeline_type,
+        device=device,
+        ddp_init_stream=critical_stream,
     )
 
     stateful_metric_module = get_multi_event_metric_module(
@@ -171,27 +197,6 @@ def main():
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
-    # Pipeline backend: "legacy" (default) uses TrainPipelineFactory's
-    # JaggedMegatron* classes; "new" uses HSTUPipeline (schedulable
-    # engine). Switched via env var RECSYS_PIPELINE_BACKEND so the gin
-    # config + CLI surface stay unchanged.
-    pipeline_backend = os.environ.get("RECSYS_PIPELINE_BACKEND", "legacy").lower()
-    if pipeline_backend not in ("legacy", "new"):
-        raise ValueError(
-            f"RECSYS_PIPELINE_BACKEND must be 'legacy' or 'new', "
-            f"got {pipeline_backend!r}"
-        )
-
-    if pipeline_backend == "new" and trainer_args.pipeline_type == "none":
-        # The new HSTU adapter only wraps the sparse-dist variants.
-        # Fall back to legacy for the non-pipelined "none" type instead
-        # of silently changing semantics.
-        print_rank_0(
-            "RECSYS_PIPELINE_BACKEND=new but pipeline_type=none; "
-            "falling back to legacy non-pipelined path."
-        )
-        pipeline_backend = "legacy"
-
     if pipeline_backend == "legacy":
         pipeline_type_map = {
             "prefetch": "jagged_prefetch_sparse_dist",
@@ -203,7 +208,7 @@ def main():
             pipeline_name,
             model=model_train,
             optimizer=dense_optimizer,
-            device=torch.device("cuda", torch.cuda.current_device()),
+            device=device,
             batch_shuffler=batch_shuffler,
         )
     else:
@@ -218,8 +223,9 @@ def main():
             pipeline_name,
             model=model_train,
             optimizer=dense_optimizer,
-            device=torch.device("cuda", torch.cuda.current_device()),
+            device=device,
             batch_shuffler=batch_shuffler,
+            critical_stream=critical_stream,
         )
     print_rank_0(
         f"[pipeline] backend={pipeline_backend} "

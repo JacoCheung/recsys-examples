@@ -235,6 +235,31 @@ def test_schedule_always_includes_ranking_embedding_task() -> None:
     assert names.index("ranking_embedding_forward") < names.index("dense_forward")
 
 
+def test_critical_path_uses_critical_stream() -> None:
+    from commons.pipeline.hstu_pipeline.tasks import CRITICAL_STREAM
+
+    pipe = _make_noop_pipeline(
+        prefetch=True,
+        prefetch_depth=1,
+    )
+    schedule, pool = pipe._build_schedule()
+    tasks = {t.name: t for stage in schedule.stages for t in stage.tasks}
+    critical_tasks = {
+        "zero_grad",
+        "global_tokens_allreduce",
+        "compute_output_dist",
+        "ranking_embedding_forward",
+        "dense_forward",
+        "dense_backward",
+        "embedding_backward",
+        "finalize_model_grads",
+        "optimizer_step",
+    }
+    assert CRITICAL_STREAM in schedule.stream_slots
+    assert CRITICAL_STREAM in pool.names()
+    assert {tasks[name].stream for name in critical_tasks} == {CRITICAL_STREAM}
+
+
 def test_schedule_config_controls_same_progress_per_task() -> None:
     pipe = _make_noop_pipeline(
         prefetch=True,
