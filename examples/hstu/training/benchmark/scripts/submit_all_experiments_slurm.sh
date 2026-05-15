@@ -639,7 +639,7 @@ for i in "${!EXP_NAMES[@]}"; do
     SBATCH_ARGS+=(--time="${TIME_LIMIT}")
     SBATCH_ARGS+=(--exclusive)
     # cw-dfw batch_short rejects jobs without an explicit GPU spec, while
-    # some other clusters reject this GRES form. Keep the request
+    # EOS can reject this GRES form. Keep the request
     # cluster/partition aware.
     if [[ "${PARTITION}" == "batch_short" || -n "${HSTU_SLURM_GPUS_PER_NODE:-}" ]]; then
         SBATCH_ARGS+=(--gpus-per-node="${HSTU_SLURM_GPUS_PER_NODE:-${RANKS_PER_NODE}}")
