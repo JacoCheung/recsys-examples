@@ -37,12 +37,12 @@
     "watchdog_step": 0
   },
   "same_progress_sync": {
-    "h2d": [{"task": "compute_output_dist", "sides": "both"}],
-    "start_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
-    "finish_shuffle": [{"task": "compute_output_dist", "sides": "both"}],
-    "start_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
-    "wait_input_dist": [{"task": "compute_output_dist", "sides": "both"}],
-    "prefetch_embeddings": [{"task": "compute_output_dist", "sides": "both"}],
-    "embedding_backward": [{"task": "prefetch_embeddings", "sides": "both"}]
+    "h2d": [{"task": "dense_forward", "sides": "both"}],
+    "start_shuffle": [{"task": "ranking_embedding_forward", "sides": "both"}],
+    "finish_shuffle": [{"task": "dense_forward", "sides": "both"}],
+    "start_input_dist": [{"task": "dense_forward", "sides": "both"}],
+    "wait_input_dist": [{"task": "dense_forward", "sides": "both"}],
+    "prefetch_embeddings": [{"task": "dense_forward", "sides": "both"}],
+    "embedding_backward": [{"task": "dense_forward", "sides": "both"}]
   }
 }
