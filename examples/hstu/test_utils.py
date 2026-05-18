@@ -412,7 +412,9 @@ def create_model(
         assert kernel_backend == KernelBackend.PYTORCH, "only pytorch supports float32"
     hstu_config = configs.get_hstu_config(
         hidden_size=embdim,
-        kv_channels=32,
+        # 64 is the smallest head_dim the Blackwell HSTU kernel supports;
+        # sm80/sm90 kernels also accept 64, so this works across archs.
+        kv_channels=64,
         num_attention_heads=num_heads,
         num_layers=1,
         hidden_dropout=0.0,  # disable dropout
