@@ -95,7 +95,11 @@ RUN cd FlexKV && mkdir -p build && cd build && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 \
     CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
 
-# Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
+# Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
+# Branch junzhang/dev_with_export_and_patch (off upstream dev) keeps hstu_blackwell
+# on relative imports — works under both Path A (fbgemm_gpu.experimental.hstu.*)
+# and Path B (top-level hstu.*) — and drops the load_library gate so register_fake
+# can resolve fbgemm::hstu_varlen_fwd_{80,90} on Blackwell.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_86OR89=FALSE \
@@ -104,7 +108,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_RAB=TRUE \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
-    HSTU_ARCH_LIST="8.0 9.0" \
+    HSTU_ARCH_LIST="8.0 9.0 10.0" \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
