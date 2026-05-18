@@ -340,7 +340,7 @@ def create_hstu_attention(
     attn: HSTUAttention
     if kernel_backend == KernelBackend.CUTLASS:
         sm_major_version = torch.cuda.get_device_properties(0).major
-        if sm_major_version in (8, 9):
+        if sm_major_version in (8, 9, 10):
             attn = FusedHSTUAttention(
                 num_heads,
                 attention_dim,
@@ -349,7 +349,8 @@ def create_hstu_attention(
             )
         else:
             print(
-                "CUTLASS backend only support H100, H20 and A100/Ada series, fallback to PyTorch backend"
+                "CUTLASS backend only support H100, H20, A100/Ada and Blackwell, "
+                "fallback to PyTorch backend"
             )
             attn = TorchHSTUAttention(
                 num_heads,
