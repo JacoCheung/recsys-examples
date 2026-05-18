@@ -64,7 +64,7 @@ RUN pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutl
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
-    python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
+    python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
 
 # -- Layer 4: TorchRec ---
 RUN pip install --no-deps tensordict orjson && \
@@ -81,19 +81,26 @@ RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attenti
     python -c "from flash_attn.cute.interface import flash_attn_func"
 
 # -- Layer 6, 7: FlexKV and NVE : both inference dependency --
+# Skipped on arm64 (GB200): FlexKV's csrc and NVE's pynve (abseil C++17 issue)
+# don't build on aarch64 yet. Inference paths that `import pynve` will be
+# unavailable in the resulting arm64 image, but training / HSTU smoke still pass.
 COPY third_party/FlexKV /workspace/deps/FlexKV
-RUN cd FlexKV && mkdir -p build && cd build && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake .. && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake --build . -j8 && \
-    cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
-    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
-    cd /tmp && python3 -c "from flexkv.kvmanager import KVManager; print('flexkv import ok')" && \
-    cd /workspace/deps && \
-    git clone --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
-    cd nve && git submodule update --init --recursive && \
-    cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 \
-    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
+RUN if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
+      echo "[Dockerfile] arm64: skipping FlexKV + NVE build (inference-only deps)"; \
+    else \
+      cd FlexKV && mkdir -p build && cd build && \
+      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake .. && \
+      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake --build . -j8 && \
+      cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
+      MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
+      cd /tmp && python3 -c "from flexkv.kvmanager import KVManager; print('flexkv import ok')" && \
+      cd /workspace/deps && \
+      git clone --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
+      cd nve && git submodule update --init --recursive && \
+      cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
+      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 \
+      CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .; \
+    fi
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 # Branch junzhang/dev_with_export_and_patch (off upstream dev) keeps hstu_blackwell
@@ -119,16 +126,17 @@ WORKDIR /workspace/recsys-examples
 COPY . .
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
-    python setup.py install && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python setup.py install && \
     cd /workspace/deps && rm -rf nvcomp && \
-    wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
-    tar -xf nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
-    mv nvcomp-linux-x86_64-5.1.0.21_cuda12-archive nvcomp && \
-    rm nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
+    NVCOMP_ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "linux-sbsa" || echo "linux-x86_64") && \
+    wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/${NVCOMP_ARCH}/nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive.tar.xz && \
+    tar -xf nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive.tar.xz && \
+    mv nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive nvcomp && \
+    rm nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive.tar.xz && \
     cd /workspace/recsys-examples/examples/commons && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python3 setup.py install && \
     cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" pip3 install --no-build-isolation . && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" pip3 install --no-build-isolation . && \
     if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
       ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
