@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE} AS devel
@@ -43,22 +43,18 @@ RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash
 # ChainedOptimizer.step, which costs ~4 ms / step on HSTU bf16 even when the
 # stat is unused. Earliest tag containing the fix is core_v0.13.0; using 0.13.1
 # (latest 0.13.x patch) for stability.
-# nvidia-cutlass-dsl: --no-deps + --no-cache-dir + 3 explicit subpackages
-# avoids a poisoned base-image pip cache wheel; keep the re-pins on the
-# bundled install too.
-RUN pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13 || true && \
-    rm -rf /usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl* && \
-    pip install --no-cache-dir --no-deps \
-        'nvidia-cutlass-dsl==4.4.1' \
-        'nvidia-cutlass-dsl-libs-base==4.4.1' \
-        'nvidia-cutlass-dsl-libs-cu13==4.4.1' && \
-    python -c "from cutlass.cute.arch import ProxyKind, SharedSpace" && \
-    git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+# nvidia-cutlass-dsl 4.4.1 ships in the 26.04-py3 base — no uninstall+reinstall
+# needed (it was here while the base was 26.02-py3 + 4.3.x). Skip the
+# `python -c "from cutlass.cute.arch import ProxyKind"` verify that main's PR
+# #379 added: cutlass-dsl eagerly opens libcuda.so.1 at import time, which
+# docker build does not provide; the import gets exercised at runtime by
+# subsequent layers and by the hstu_blackwell tests.
+RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install --no-deps -e ./megatron-lm && \
     pip install --no-cache-dir torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
         cloudpickle triton==3.6.0 \
-        'nvidia-cutlass-dsl==4.4.1' 'nvidia-cutlass-dsl-libs-base==4.4.1' 'nvidia-cutlass-dsl-libs-cu13==4.4.1' \
-        'quack-kernels>=0.3.3' 'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit
+        'quack-kernels>=0.3.3' 'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
+        pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder
 
 # -- Layer 3: FBGEMM (long build, own layer for caching) ---
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
@@ -77,8 +73,10 @@ ARG FLASH_ATTN_ARBITRARY_MASK_COMMIT=b56db721d65afadd8cfe154cd12e83693bf0aba3
 RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
     cd flash-attention && \
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
-    pip install --no-deps --no-build-isolation -e ./flash_attn/cute && \
-    python -c "from flash_attn.cute.interface import flash_attn_func"
+    pip install --no-deps --no-build-isolation -e ./flash_attn/cute
+# main's PR #379 verified `python -c "from flash_attn.cute.interface import
+# flash_attn_func"` here; drop it — flash_attn.cute imports cutlass-dsl,
+# which eagerly opens libcuda.so.1 at import time (unavailable in docker build).
 
 # -- Layer 6, 7: FlexKV and NVE : both inference dependency --
 # Skipped on arm64 (GB200): FlexKV's csrc and NVE's pynve (abseil C++17 issue)
