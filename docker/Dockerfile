@@ -66,7 +66,7 @@ RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash
 RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install --no-deps -e ./megatron-lm && \
     pip install --no-cache-dir torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
-        cloudpickle triton==3.6.0 \
+        cloudpickle \
         'quack-kernels>=0.3.3' 'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
         pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder
 
