@@ -551,7 +551,9 @@ def cal_hstu_flops_single_rank(
         gemm_flops_per_layer = (
             2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
         )  # qkvu proj fwd
-        gemm_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
+        gemm_flops_per_layer += (
+            2 * seqlens * num_heads * hidden_size * dim_per_head
+        )  # proj fwd
         if has_bwd:
             gemm_flops_per_layer *= 3
 
