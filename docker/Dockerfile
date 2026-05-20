@@ -14,7 +14,7 @@ WORKDIR /workspace/deps
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
-    python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
+    python3 setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
 
 # Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
 RUN pip install --no-deps tensordict orjson && \
