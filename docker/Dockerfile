@@ -3,20 +3,27 @@ ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG DEVEL_IMAGE=devel
 
 # ============================================================================
-# Stage 1: base_fbgemm — FBGEMM Path A only.
+# Stage 1: base_fbgemm — FBGEMM Path A + TorchRec (version-coupled with FBGEMM).
 # Override BASE_FBGEMM_IMAGE to consume a pre-built image and skip the build.
 # ============================================================================
 FROM ${BASE_IMAGE} AS base_fbgemm
 
 WORKDIR /workspace/deps
 
+# Layer 0a: FBGEMM Path A (slow ~55min nvcc compile).
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
     python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
 
+# Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
+RUN pip install --no-deps tensordict orjson && \
+    git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec && \
+    cd torchrec && \
+    pip install --no-deps .
+
 # ============================================================================
-# Stage 2: devel — base_fbgemm + system setup + Megatron + pip + TorchRec
+# Stage 2: devel — base_fbgemm + system setup + Megatron + pip
 # + flash-attention + FlexKV/NVE + HSTU Path B.
 # ============================================================================
 FROM ${BASE_FBGEMM_IMAGE} AS devel
@@ -63,20 +70,14 @@ RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron
         'quack-kernels>=0.3.3' 'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
         pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder
 
-# -- Layer 3: TorchRec ---
-RUN pip install --no-deps tensordict orjson && \
-    git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec && \
-    cd torchrec && \
-    pip install --no-deps .
-
-# -- Layer 4: FlashAttention --
+# -- Layer 3: FlashAttention --
 ARG FLASH_ATTN_ARBITRARY_MASK_COMMIT=b56db721d65afadd8cfe154cd12e83693bf0aba3
 RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
     cd flash-attention && \
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
     pip install --no-deps --no-build-isolation -e ./flash_attn/cute
 
-# -- Layer 5, 6: FlexKV and NVE (inference dependency, skipped on arm64) ---
+# -- Layer 4, 5: FlexKV and NVE (inference dependency, skipped on arm64) ---
 COPY third_party/FlexKV /workspace/deps/FlexKV
 RUN if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
       echo "[Dockerfile] arm64: skipping FlexKV + NVE build (inference-only deps)"; \
