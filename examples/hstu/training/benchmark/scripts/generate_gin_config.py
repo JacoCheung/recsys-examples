@@ -113,6 +113,7 @@ item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50
 item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 item_embedding/DynamicEmbeddingArgs.evict_strategy = '{evict}'
 item_embedding/DynamicEmbeddingArgs.caching = {caching}
+item_embedding/DynamicEmbeddingArgs.dist_type = '{dist_type}'
 
 # Action embedding
 action_embedding/EmbeddingArgs.feature_names = ['action']
@@ -127,6 +128,7 @@ user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
 user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 user_id_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
 user_id_emb/DynamicEmbeddingArgs.caching = {caching}
+user_id_emb/DynamicEmbeddingArgs.dist_type = '{dist_type}'
 
 user_age_emb/EmbeddingArgs.feature_names = ['user_age']
 user_age_emb/EmbeddingArgs.table_name = 'user_age'
@@ -252,6 +254,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--dist_type",
+        type=str,
+        choices=["continuous", "roundrobin", "hash_roundrobin"],
+        default="roundrobin",
+        help="DynamicEmb input distribution policy for row-wise sharding (default: roundrobin)",
+    )
+
+    parser.add_argument(
         "--pipeline_type",
         type=str,
         choices=["none", "prefetch", "sw_serial"],
@@ -332,6 +342,7 @@ def generate_config(args):
         caching=str(args.caching),
         ratio=ratio,  # Use auto-corrected ratio
         evict=args.evict,
+        dist_type=args.dist_type,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
         value_dist_section=value_dist_section,
