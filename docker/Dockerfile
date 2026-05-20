@@ -1,7 +1,25 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
+ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG DEVEL_IMAGE=devel
 
-FROM ${BASE_IMAGE} AS devel
+# ============================================================================
+# Stage 1: base_fbgemm — FBGEMM Path A only.
+# Override BASE_FBGEMM_IMAGE to consume a pre-built image and skip the build.
+# ============================================================================
+FROM ${BASE_IMAGE} AS base_fbgemm
+
+WORKDIR /workspace/deps
+
+RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
+    git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
+    cd fbgemm/fbgemm_gpu && \
+    python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
+
+# ============================================================================
+# Stage 2: devel — base_fbgemm + system setup + Megatron + pip + TorchRec
+# + flash-attention + FlexKV/NVE + HSTU Path B.
+# ============================================================================
+FROM ${BASE_FBGEMM_IMAGE} AS devel
 ARG TARGETPLATFORM
 ARG TRITONSERVER_BUILD
 
@@ -36,19 +54,8 @@ RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash
     apt autoremove -y && apt clean && rm -rf /var/lib/apt/lists/*
 
 # -- Layer 2: pip dependencies + Megatron-LM ---
-# Bump from core_v0.12.1 -> core_v0.13.1 to pick up
-# d9608004f "Add an option to skip counting zeros in grad of ChainedOptimizer"
-# (gates ChainedOptimizer.count_zeros on log_num_zeros_in_grad). 0.12.x release
-# line still ships the unconditional count_zeros_fp32 call inside
-# ChainedOptimizer.step, which costs ~4 ms / step on HSTU bf16 even when the
-# stat is unused. Earliest tag containing the fix is core_v0.13.0; using 0.13.1
-# (latest 0.13.x patch) for stability.
-# nvidia-cutlass-dsl 4.4.1 ships in the 26.04-py3 base — no uninstall+reinstall
-# needed (it was here while the base was 26.02-py3 + 4.3.x). Skip the
-# `python -c "from cutlass.cute.arch import ProxyKind"` verify that main's PR
-# #379 added: cutlass-dsl eagerly opens libcuda.so.1 at import time, which
-# docker build does not provide; the import gets exercised at runtime by
-# subsequent layers and by the hstu_blackwell tests.
+# core_v0.13.1 picks up an optional skip for count_zeros_in_grad in
+# ChainedOptimizer.step (~4 ms / step under HSTU bf16 when the stat is unused).
 RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install --no-deps -e ./megatron-lm && \
     pip install --no-cache-dir torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
@@ -56,32 +63,20 @@ RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron
         'quack-kernels>=0.3.3' 'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
         pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder
 
-# -- Layer 3: FBGEMM (long build, own layer for caching) ---
-RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
-    git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
-    cd fbgemm/fbgemm_gpu && \
-    python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
-
-# -- Layer 4: TorchRec ---
+# -- Layer 3: TorchRec ---
 RUN pip install --no-deps tensordict orjson && \
     git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec && \
     cd torchrec && \
     pip install --no-deps .
 
-# -- Layer 5: FlashAttention --
+# -- Layer 4: FlashAttention --
 ARG FLASH_ATTN_ARBITRARY_MASK_COMMIT=b56db721d65afadd8cfe154cd12e83693bf0aba3
 RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
     cd flash-attention && \
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
     pip install --no-deps --no-build-isolation -e ./flash_attn/cute
-# main's PR #379 verified `python -c "from flash_attn.cute.interface import
-# flash_attn_func"` here; drop it — flash_attn.cute imports cutlass-dsl,
-# which eagerly opens libcuda.so.1 at import time (unavailable in docker build).
 
-# -- Layer 6, 7: FlexKV and NVE : both inference dependency --
-# Skipped on arm64 (GB200): FlexKV's csrc and NVE's pynve (abseil C++17 issue)
-# don't build on aarch64 yet. Inference paths that `import pynve` will be
-# unavailable in the resulting arm64 image, but training / HSTU smoke still pass.
+# -- Layer 5, 6: FlexKV and NVE (inference dependency, skipped on arm64) ---
 COPY third_party/FlexKV /workspace/deps/FlexKV
 RUN if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
       echo "[Dockerfile] arm64: skipping FlexKV + NVE build (inference-only deps)"; \
@@ -101,10 +96,6 @@ RUN if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
     fi
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
-# Branch junzhang/dev_with_export_and_patch (off upstream dev) keeps hstu_blackwell
-# on relative imports — works under both Path A (fbgemm_gpu.experimental.hstu.*)
-# and Path B (top-level hstu.*) — and drops the load_library gate so register_fake
-# can resolve fbgemm::hstu_varlen_fwd_{80,90} on Blackwell.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_86OR89=FALSE \
@@ -117,6 +108,10 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
+# ============================================================================
+# Stage 3: build — devel + recsys-examples in-tree builds (dynamicemb, commons,
+# kvcache_manager) and runtime libcuda link.
+# ============================================================================
 FROM ${DEVEL_IMAGE} AS build
 ARG TRITONSERVER_BUILD
 
