@@ -204,7 +204,7 @@ fi
 # Common env + log (shared by all benchmark types)
 # ============================================================================
 export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
 export FILL_DYNAMICEMB_TABLES=1
 # NOTE: Do NOT set CUDA_MODULE_LOADING=EAGER here. It causes NCCL
 # "invalid resource handle" errors because eager loading pre-initializes
