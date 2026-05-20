@@ -197,22 +197,12 @@ def test_fbgemm_hstu_fwd_bwd(
     assert_hstu_close(new_out, ref_out, ref_out_fp32, fwd=True)
     print(f"[FWD] sm{arch_sm} head_dim={head_dim} ctx={max_num_contextuals} PASS")
 
-    if major == 10:
-        # hstu_blackwell backward (hstu_varlen_bwd_100) currently raises
-        # "stride_order is not consistent with the layout" inside cutlass DSL
-        # for the contiguous (L, H, D) tensors this test produces. Until the
-        # upstream sm100 backward kernel handles this stride pattern, skip
-        # the backward comparison on Blackwell.
-        pass
-        # return
-
     dout = torch.rand_like(new_out)
     new_out.backward(dout)
-    # ref_out.backward(dout)
-    # ref_out_fp32.backward(dout.float())
-    # torch.cuda.synchronize()
-
-    # assert_hstu_close(nq.grad, ref_q.grad, ref_q_fp32.grad, fwd=False)
-    # assert_hstu_close(nk.grad, ref_k.grad, ref_k_fp32.grad, fwd=False)
-    # assert_hstu_close(nv.grad, ref_v.grad, ref_v_fp32.grad, fwd=False)
-    # print(f"[BWD] sm{arch_sm} head_dim={head_dim} ctx={max_num_contextuals} PASS")
+    ref_out.backward(dout)
+    ref_out_fp32.backward(dout.float())
+    torch.cuda.synchronize()
+    assert_hstu_close(nq.grad, ref_q.grad, ref_q_fp32.grad, fwd=False)
+    assert_hstu_close(nk.grad, ref_k.grad, ref_k_fp32.grad, fwd=False)
+    assert_hstu_close(nv.grad, ref_v.grad, ref_v_fp32.grad, fwd=False)
+    print(f"[BWD] sm{arch_sm} head_dim={head_dim} ctx={max_num_contextuals} PASS")
