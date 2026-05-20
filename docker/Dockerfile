@@ -7,8 +7,20 @@ ARG DEVEL_IMAGE=devel
 # Override BASE_FBGEMM_IMAGE to consume a pre-built image and skip the build.
 # ============================================================================
 FROM ${BASE_IMAGE} AS base_fbgemm
+ARG TRITONSERVER_BUILD
 
 WORKDIR /workspace/deps
+
+# Layer 0-pre: bootstrap when base is nvcr/tritonserver (no python alias,
+# no cmake/patchelf, no torch). pytorch base skips this branch.
+RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
+      ln /bin/python3 /bin/python && \
+      apt-get update -y --fix-missing && \
+      apt-get install -y cmake patchelf && \
+      pip3 install --no-cache-dir pandas rich cloudpickle psutil cython && \
+      pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 && \
+      apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Layer 0a: FBGEMM Path A (slow ~55min nvcc compile).
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
@@ -32,14 +44,8 @@ ARG TRITONSERVER_BUILD
 
 WORKDIR /workspace/deps
 
-# -- Layer 1: system setup, arch symlinks, tritonserver deps ---
+# -- Layer 1: system setup + arch symlinks.
 RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash-dev libssl-dev && \
-    if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
-      ln /bin/python3 /bin/python && \
-      apt-get install -y cmake patchelf && \
-      pip3 install pandas rich cloudpickle psutil cython && \
-      pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130; \
-    fi && \
     ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
     rm -rf /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1 && \
     if [ ${ARCH} = "aarch64" ]; then \
