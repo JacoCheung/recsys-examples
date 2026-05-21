@@ -12,13 +12,14 @@ ARG TRITONSERVER_BUILD
 WORKDIR /workspace/deps
 
 # Layer 0-pre: bootstrap when base is nvcr/tritonserver. pytorch base ships
-# all these (python alias, cmake/patchelf, torch, tabulate) — branch skips.
+# all these (python alias, cmake/patchelf, ninja, torch, tabulate) — branch skips.
 # tabulate is a FBGEMM v1.5.0 setup.py import; only missing on tritonserver.
+# ninja: without it torch BuildExtension serial-fallbacks → HSTU build ~3h vs ~10min.
 RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
       ln /bin/python3 /bin/python && \
       apt-get update -y --fix-missing && \
       apt-get install -y cmake patchelf && \
-      pip3 install --no-cache-dir pandas rich cloudpickle psutil cython tabulate && \
+      pip3 install --no-cache-dir pandas rich cloudpickle psutil cython tabulate ninja && \
       pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 && \
       apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*; \
     fi
