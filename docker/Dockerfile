@@ -11,21 +11,20 @@ ARG TRITONSERVER_BUILD
 
 WORKDIR /workspace/deps
 
-# Layer 0-pre: bootstrap when base is nvcr/tritonserver (no python alias,
-# no cmake/patchelf, no torch). pytorch base skips this branch.
+# Layer 0-pre: bootstrap when base is nvcr/tritonserver. pytorch base ships
+# all these (python alias, cmake/patchelf, torch, tabulate) — branch skips.
+# tabulate is a FBGEMM v1.5.0 setup.py import; only missing on tritonserver.
 RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
       ln /bin/python3 /bin/python && \
       apt-get update -y --fix-missing && \
       apt-get install -y cmake patchelf && \
-      pip3 install --no-cache-dir pandas rich cloudpickle psutil cython && \
+      pip3 install --no-cache-dir pandas rich cloudpickle psutil cython tabulate && \
       pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 && \
       apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*; \
     fi
 
 # Layer 0a: FBGEMM Path A (slow ~55min nvcc compile).
-# FBGEMM v1.5.0 setup.py imports: setuptools_git_versioning, scikit-build (skbuild),
-# tabulate; install all three up-front so the import block on line 24 succeeds.
-RUN pip install --no-cache-dir setuptools-git-versioning scikit-build tabulate && \
+RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
     python3 setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
