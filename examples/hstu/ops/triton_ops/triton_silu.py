@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
+
+# torch 26.04 circular-import workaround for wrap_triton — do not remove
+import torch._inductor.dependencies  # noqa: F401
 import triton
 import triton.language as tl
 
