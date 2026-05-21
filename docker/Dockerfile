@@ -84,24 +84,21 @@ RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attenti
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
     pip install --no-deps --no-build-isolation -e ./flash_attn/cute
 
-# -- Layer 4, 5: FlexKV and NVE (inference dependency, skipped on arm64) ---
+# -- Layer 4, 5: FlexKV and NVE. PYNVE_DISABLE_AVX512 only meaningful on x86;
+# leave it unset on arm64 (AVX512 doesn't exist there).
 COPY third_party/FlexKV /workspace/deps/FlexKV
-RUN if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
-      echo "[Dockerfile] arm64: skipping FlexKV + NVE build (inference-only deps)"; \
-    else \
-      cd FlexKV && mkdir -p build && cd build && \
-      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake .. && \
-      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake --build . -j8 && \
-      cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
-      MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
-      cd /tmp && python3 -c "from flexkv.kvmanager import KVManager; print('flexkv import ok')" && \
-      cd /workspace/deps && \
-      git clone --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
-      cd nve && git submodule update --init --recursive && \
-      cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
-      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 \
-      CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .; \
-    fi
+RUN cd FlexKV && mkdir -p build && cd build && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" cmake .. && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" cmake --build . -j8 && \
+    cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
+    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python3 setup.py install && \
+    cd /workspace/deps && \
+    git clone --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
+    cd nve && git submodule update --init --recursive && \
+    cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
+    if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then AVX512_ENV=""; else AVX512_ENV="PYNVE_DISABLE_AVX512=1"; fi && \
+    env TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" PYNVE_WITH_TORCH_BINDINGS=1 ${AVX512_ENV} \
+    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
