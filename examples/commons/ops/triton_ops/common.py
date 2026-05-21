@@ -37,6 +37,9 @@ from typing import Any, Dict, List, Tuple, Union
 
 import torch
 
+# torch 26.04 circular-import workaround for wrap_triton — do not remove
+import torch._inductor.dependencies  # noqa: F401
+
 # @manual=//triton:triton
 import triton
 
