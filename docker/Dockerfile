@@ -23,7 +23,9 @@ RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
     fi
 
 # Layer 0a: FBGEMM Path A (slow ~55min nvcc compile).
-RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
+# FBGEMM v1.5.0 setup.py imports: setuptools_git_versioning, scikit-build (skbuild),
+# tabulate; install all three up-front so the import block on line 24 succeeds.
+RUN pip install --no-cache-dir setuptools-git-versioning scikit-build tabulate && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
     python3 setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
