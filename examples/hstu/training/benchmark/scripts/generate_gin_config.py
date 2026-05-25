@@ -46,6 +46,8 @@ def get_baseline_template():
 #   - Eviction Strategy: {evict}
 #   - Pipeline: {pipeline_type}
 #   - Tensor Parallel: {tp_size}
+#   - KV Channels: {kv_channels}
+#   - Contextual Features: {contextual_features}
 # ============================================================================
 
 # ===== Trainer Configuration =====
@@ -79,28 +81,15 @@ item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length
 item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
 
 {value_dist_section}
-# Contextual Features (only 3)
-user_contextual_features/FeatureArgs.feature_names = ['user_id', 'user_age']
-user_contextual_features/FeatureArgs.max_sequence_length = 1
-user_contextual_features/FeatureArgs.is_jagged = False
-{user_id_value_dist_section}
-
-item_contextual_features/FeatureArgs.feature_names = ['item_category_l1']
-item_contextual_features/FeatureArgs.max_sequence_length = 1
-item_contextual_features/FeatureArgs.is_jagged = False
+{contextual_feature_section}
 
 BenchmarkDatasetArgs.feature_args = [
     @item_and_action_feature/FeatureArgs(),
-    @user_contextual_features/FeatureArgs(),
-    @item_contextual_features/FeatureArgs(),
+{contextual_feature_args}
 ]
 
 BenchmarkDatasetArgs.item_feature_name = 'item'
-BenchmarkDatasetArgs.contextual_feature_names = [
-    'user_id',
-    'user_age',
-    'item_category_l1',
-]  # Total 3 contextual features
+BenchmarkDatasetArgs.contextual_feature_names = {contextual_feature_names}
 BenchmarkDatasetArgs.action_feature_name = 'action'
 BenchmarkDatasetArgs.max_num_candidates = 0
 BenchmarkDatasetArgs.num_generated_batches = {log_interval}
@@ -121,32 +110,12 @@ action_embedding/EmbeddingArgs.table_name = 'action'
 action_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 100
 action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
 
-# Contextual Feature Embeddings (3 total)
-user_id_emb/DynamicEmbeddingArgs.feature_names = ['user_id']
-user_id_emb/DynamicEmbeddingArgs.table_name = 'user_id'
-user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
-user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
-user_id_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
-user_id_emb/DynamicEmbeddingArgs.caching = {caching}
-user_id_emb/DynamicEmbeddingArgs.dist_type = '{dist_type}'
-
-user_age_emb/EmbeddingArgs.feature_names = ['user_age']
-user_age_emb/EmbeddingArgs.table_name = 'user_age'
-user_age_emb/EmbeddingArgs.item_vocab_size_or_capacity = 100
-user_age_emb/EmbeddingArgs.sharding_type = 'data_parallel'
-
-item_cat_l1_emb/EmbeddingArgs.feature_names = ['item_category_l1']
-item_cat_l1_emb/EmbeddingArgs.table_name = 'item_category_l1'
-item_cat_l1_emb/EmbeddingArgs.item_vocab_size_or_capacity = 50
-item_cat_l1_emb/EmbeddingArgs.sharding_type = 'data_parallel'
-
-# Aggregate all embedding configs (5 embedding tables total)
+{contextual_embedding_section}
+# Aggregate all embedding configs ({embedding_table_count} embedding tables total)
 BenchmarkDatasetArgs.embedding_args = [
     @item_embedding/DynamicEmbeddingArgs(),
     @action_embedding/EmbeddingArgs(),
-    @user_id_emb/DynamicEmbeddingArgs(),
-    @user_age_emb/EmbeddingArgs(),
-    @item_cat_l1_emb/EmbeddingArgs(),
+{contextual_embedding_args}
 ]
 
 # ===== Network Configuration =====
@@ -155,7 +124,7 @@ NetworkArgs.contextual_embedding_dim = 128  # Same as item_embedding_dim
 NetworkArgs.num_layers = 8
 NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 1024
-NetworkArgs.kv_channels = 256
+NetworkArgs.kv_channels = {kv_channels}
 
 # Kernel config
 NetworkArgs.kernel_backend = '{kernel_backend}'
@@ -274,6 +243,20 @@ Examples:
     )
 
     parser.add_argument(
+        "--kv_channels",
+        type=int,
+        default=256,
+        help="KV channels per head (default: 256)",
+    )
+
+    parser.add_argument(
+        "--include-contextual",
+        action="store_true",
+        default=False,
+        help="Generate contextual features and their embedding tables (default: omitted).",
+    )
+
+    parser.add_argument(
         "--value_dist",
         type=str,
         choices=["uniform", "zipf"],
@@ -382,6 +365,57 @@ def generate_config(args):
         value_dist_section = "# Item-ID value distribution: uniform (default)"
         user_id_value_dist_section = ""
 
+    if not args.include_contextual:
+        contextual_feature_section = (
+            "# Contextual features are omitted. Pass --include-contextual to "
+            "generate contextual features and embedding tables."
+        )
+        contextual_feature_args = ""
+        contextual_feature_names = "[]"
+        contextual_embedding_section = ""
+        contextual_embedding_args = ""
+        embedding_table_count = 2
+    else:
+        contextual_feature_section = f"""# Contextual Features (only 3)
+user_contextual_features/FeatureArgs.feature_names = ['user_id', 'user_age']
+user_contextual_features/FeatureArgs.max_sequence_length = 1
+user_contextual_features/FeatureArgs.is_jagged = False
+{user_id_value_dist_section}
+
+item_contextual_features/FeatureArgs.feature_names = ['item_category_l1']
+item_contextual_features/FeatureArgs.max_sequence_length = 1
+item_contextual_features/FeatureArgs.is_jagged = False"""
+        contextual_feature_args = """    @user_contextual_features/FeatureArgs(),
+    @item_contextual_features/FeatureArgs(),"""
+        contextual_feature_names = """[
+    'user_id',
+    'user_age',
+    'item_category_l1',
+]  # Total 3 contextual features"""
+        contextual_embedding_section = f"""# Contextual Feature Embeddings (3 total)
+user_id_emb/DynamicEmbeddingArgs.feature_names = ['user_id']
+user_id_emb/DynamicEmbeddingArgs.table_name = 'user_id'
+user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
+user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
+user_id_emb/DynamicEmbeddingArgs.evict_strategy = '{args.evict}'
+user_id_emb/DynamicEmbeddingArgs.caching = {args.caching}
+user_id_emb/DynamicEmbeddingArgs.dist_type = '{args.dist_type}'
+
+user_age_emb/EmbeddingArgs.feature_names = ['user_age']
+user_age_emb/EmbeddingArgs.table_name = 'user_age'
+user_age_emb/EmbeddingArgs.item_vocab_size_or_capacity = 100
+user_age_emb/EmbeddingArgs.sharding_type = 'data_parallel'
+
+item_cat_l1_emb/EmbeddingArgs.feature_names = ['item_category_l1']
+item_cat_l1_emb/EmbeddingArgs.table_name = 'item_category_l1'
+item_cat_l1_emb/EmbeddingArgs.item_vocab_size_or_capacity = 50
+item_cat_l1_emb/EmbeddingArgs.sharding_type = 'data_parallel'
+"""
+        contextual_embedding_args = """    @user_id_emb/DynamicEmbeddingArgs(),
+    @user_age_emb/EmbeddingArgs(),
+    @item_cat_l1_emb/EmbeddingArgs(),"""
+        embedding_table_count = 5
+
     # Generate balanced_shuffler line
     if args.balanced_shuffler:
         balanced_shuffler_line = (
@@ -402,8 +436,15 @@ def generate_config(args):
         dist_type=args.dist_type,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
+        kv_channels=args.kv_channels,
+        contextual_features="Included" if args.include_contextual else "Omitted",
         value_dist_section=value_dist_section,
-        user_id_value_dist_section=user_id_value_dist_section,
+        contextual_feature_section=contextual_feature_section,
+        contextual_feature_args=contextual_feature_args,
+        contextual_feature_names=contextual_feature_names,
+        contextual_embedding_section=contextual_embedding_section,
+        contextual_embedding_args=contextual_embedding_args,
+        embedding_table_count=embedding_table_count,
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         max_train_iters=args.max_train_iters,

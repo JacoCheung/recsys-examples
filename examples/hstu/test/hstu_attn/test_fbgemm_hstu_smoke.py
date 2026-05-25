@@ -206,3 +206,121 @@ def test_fbgemm_hstu_fwd_bwd(
     assert_hstu_close(nk.grad, ref_k.grad, ref_k_fp32.grad, fwd=False)
     assert_hstu_close(nv.grad, ref_v.grad, ref_v_fp32.grad, fwd=False)
     print(f"[BWD] sm{arch_sm} head_dim={head_dim} ctx={max_num_contextuals} PASS")
+
+
+def test_fused_hstu_op_b200_smoke():
+    """Run a small fused_hstu_op fwd+bwd case on Blackwell."""
+    arch_sm = get_arch_sm()
+    if get_arch_major() != 10:
+        pytest.skip(f"fused_hstu_op B200 smoke only runs on sm10x, got sm{arch_sm}")
+
+    from configs.hstu_config import KernelBackend
+    from ops.fused_hstu_op import fused_hstu_op
+
+    torch.manual_seed(1234)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batchsize = 2
+    max_seqlen = 64
+    num_heads = 2
+    dim_per_head = 128
+    hidden_size = num_heads * dim_per_head
+
+    lengths = torch.randint(
+        low=2,
+        high=max_seqlen + 1,
+        size=(batchsize,),
+        device=device,
+        dtype=torch.int32,
+    )
+    seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths).to(torch.int32)
+    total_length = int(seq_offsets[-1].item())
+
+    num_targets = torch.randint(
+        low=0,
+        high=5,
+        size=(batchsize,),
+        device=device,
+        dtype=torch.int32,
+    )
+    num_targets = torch.clamp(
+        num_targets, max=lengths - 1, min=torch.zeros_like(num_targets)
+    )
+
+    input = torch.empty(
+        (total_length, hidden_size), dtype=dtype, device=device
+    ).uniform_(-0.1, 0.1)
+    input.requires_grad_()
+
+    input_norm_weight = torch.nn.Parameter(
+        torch.empty((hidden_size,), dtype=dtype, device=device).uniform_(0.5, 1.5)
+    )
+    input_norm_bias = torch.nn.Parameter(
+        torch.empty((hidden_size,), dtype=dtype, device=device).uniform_(-0.01, 0.01)
+    )
+    output_norm_weight = torch.nn.Parameter(
+        torch.empty((hidden_size,), dtype=dtype, device=device).uniform_(0.5, 1.5)
+    )
+    output_norm_bias = torch.nn.Parameter(
+        torch.empty((hidden_size,), dtype=dtype, device=device).uniform_(-0.01, 0.01)
+    )
+    linear_uvqk_weight = torch.nn.Parameter(
+        torch.empty((hidden_size, hidden_size * 4), dtype=dtype, device=device)
+    )
+    torch.nn.init.xavier_uniform_(linear_uvqk_weight)
+    linear_uvqk_bias = torch.nn.Parameter(
+        torch.empty((hidden_size * 4,), dtype=dtype, device=device).uniform_(
+            -0.01, 0.01
+        )
+    )
+    linear_proj_weight = torch.nn.Parameter(
+        torch.empty((hidden_size, hidden_size), dtype=dtype, device=device)
+    )
+    torch.nn.init.xavier_uniform_(linear_proj_weight)
+
+    out = fused_hstu_op(
+        input=input,
+        seqlen_offsets=seq_offsets,
+        max_seqlen=max_seqlen,
+        scaling_seqlen=max_seqlen,
+        linear_uvqk_weight=linear_uvqk_weight,
+        linear_uvqk_bias=linear_uvqk_bias,
+        linear_proj_weight=linear_proj_weight,
+        num_heads=num_heads,
+        linear_dim_per_head=dim_per_head,
+        attention_dim_per_head=dim_per_head,
+        ln_eps=1e-5,
+        dropout_ratio=0.0,
+        training=True,
+        input_norm_weight=input_norm_weight,
+        input_norm_bias=input_norm_bias,
+        output_norm_weight=output_norm_weight,
+        output_norm_bias=output_norm_bias,
+        attn_backend=KernelBackend.CUTLASS,
+        num_targets=num_targets,
+        num_contextuals=None,
+        target_group_size=1,
+        alpha=1.0 / (dim_per_head**0.5),
+        causal=True,
+        residual=False,
+        recompute_input_layernorm=False,
+        recompute_input_silu=False,
+    )
+    assert torch.isfinite(out.float()).all()
+
+    dout = torch.empty_like(out).uniform_(-0.1, 0.1)
+    out.backward(dout)
+    torch.cuda.synchronize()
+
+    grads = [
+        input.grad,
+        input_norm_weight.grad,
+        input_norm_bias.grad,
+        output_norm_weight.grad,
+        output_norm_bias.grad,
+        linear_uvqk_weight.grad,
+        linear_uvqk_bias.grad,
+        linear_proj_weight.grad,
+    ]
+    assert all(g is not None and torch.isfinite(g.float()).all() for g in grads)
+    print(f"[FUSED_OP] sm{arch_sm} head_dim={dim_per_head} ctx=0 PASS")
