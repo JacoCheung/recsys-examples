@@ -134,6 +134,28 @@ _TC_FLOPS_PER_SM_PER_CYCLE = {
 # All values below are the dense Tensor Core peaks from NVIDIA datasheets.
 # Format: {gpu_name_pattern: {dtype: peak_tflops_dense}}
 _KNOWN_GPU_SPECS: Dict[str, Dict[str, float]] = {
+    # GB200 Grace Blackwell Superchip: specs are published for 2 GPUs.
+    # Values here are per-GPU dense peaks.
+    "GB200": {
+        "fp64": 40,
+        "fp32": 80,
+        "tf32": 1250,
+        "fp16": 2500,
+        "bf16": 2500,
+        "fp8": 5000,
+        "int8": 5000,
+    },
+    # HGX B200: specs are published for 8 GPUs.
+    # Values here are per-GPU dense peaks.
+    "B200": {
+        "fp64": 37,
+        "fp32": 75,
+        "tf32": 1125,
+        "fp16": 2250,
+        "bf16": 2250,
+        "fp8": 4500,
+        "int8": 4500,
+    },
     # H100 SXM5: 132 SMs, boost ~1830 MHz
     "H100": {
         "fp64": 67,
@@ -177,6 +199,8 @@ _KNOWN_GPU_SPECS: Dict[str, Dict[str, float]] = {
 
 # Known GPU clock frequencies (MHz)
 _GPU_CLOCK_MHZ = {
+    "GB200": 2100,
+    "B200": 2000,
     "H100": 1980,
     "H200": 1980,
     "A100": 1410,
@@ -187,6 +211,8 @@ _GPU_CLOCK_MHZ = {
 # Known GPU memory bandwidth (GB/s)
 # Format: {gpu_pattern: (sxm_bandwidth, pcie_bandwidth)} or {gpu_pattern: bandwidth}
 _GPU_MEMORY_BANDWIDTH: Dict[str, Union[float, Tuple[float, float]]] = {
+    "GB200": 8000,  # HBM3e
+    "B200": 8000,  # HBM3e
     "H100": (3350, 2000),  # HBM3: SXM vs PCIe
     "H200": 4800,  # HBM3e
     "A100": (2039, 1555),  # HBM2e: SXM vs PCIe
@@ -196,6 +222,8 @@ _GPU_MEMORY_BANDWIDTH: Dict[str, Union[float, Tuple[float, float]]] = {
 
 # Known NVLink bandwidth (GB/s, bidirectional)
 _NVLINK_BANDWIDTH = {
+    "GB200": 1800,  # NVLink 5.0
+    "B200": 1800,  # NVLink 5.0
     "H100": 900,  # NVLink 4.0
     "H200": 900,  # NVLink 4.0
     "A100": 600,  # NVLink 3.0
