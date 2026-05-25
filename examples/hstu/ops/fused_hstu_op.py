@@ -38,6 +38,40 @@ from ops.triton_ops.triton_norm_mul_dropout import (
 )
 
 
+def _get_addmm_silu_fwd_impl(device: torch.device):
+    sm = torch.cuda.get_device_properties(device).major
+    if sm == 8:
+        return triton_addmm_silu_fwd
+    if sm in (9, 10):
+        return torch_addmm_silu_fwd
+    raise ValueError(f"Unsupported SM major version: {sm}")
+
+
+def _import_sm100_hstu_ops():
+    try:
+        from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu
+    except ImportError:
+        try:
+            from hstu.hstu_blackwell import hstu_ops_gpu
+        except ImportError:
+            from hstu_blackwell import hstu_ops_gpu
+    return hstu_ops_gpu
+
+
+def _blackwell_num_contexts_or_none(
+    num_contexts: Optional[Union[int, torch.Tensor]],
+) -> None:
+    if num_contexts is None:
+        return None
+    if isinstance(num_contexts, int):
+        if num_contexts == 0:
+            return None
+        raise ValueError("Blackwell fused_hstu_op does not support contextual tokens")
+    if torch.count_nonzero(num_contexts).item() == 0:
+        return None
+    raise ValueError("Blackwell fused_hstu_op does not support contextual tokens")
+
+
 class FusedHSTULayerFunction(torch.autograd.Function):
     """
     This function has better precision performance than the native HSTULayer.
@@ -188,13 +222,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
 
             ctx.input_BLOCK_D = input_BLOCK_D
             ctx.input_num_warps = input_num_warps
-            sm = torch.cuda.get_device_properties(0).major
-            if sm == 8:
-                addmm_silu_fwd_impl = triton_addmm_silu_fwd
-            elif sm == 9:
-                addmm_silu_fwd_impl = torch_addmm_silu_fwd
-            else:
-                raise ValueError(f"Unsupported SM major version: {sm}")
+            addmm_silu_fwd_impl = _get_addmm_silu_fwd_impl(input.device)
             # 2. linear & silu
             # bias is 1D
             linear_uvqk, silu_linear_uvqk = addmm_silu_fwd_impl(
@@ -336,6 +364,29 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     -1,
                     output_dtype,  # quant_mode, output_dtype
                 )
+            elif sm_major_version == 10:
+                assert q.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ), f"Blackwell fwd expects bfloat16 or float16, got {q.dtype}"
+                num_contexts = _blackwell_num_contexts_or_none(num_contexts)
+                jagged_attn_output = hstu.hstu_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    scaling_seqlen,
+                    num_contexts,
+                    num_targets,
+                    target_group_size=target_group_size,
+                    window_size=(-1, 0),
+                    alpha=alpha,
+                )
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
             # in case of padding
@@ -411,13 +462,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             x,
             w,
         ):
-            sm = torch.cuda.get_device_properties(0).major
-            if sm == 8:
-                addmm_silu_fwd_impl = triton_addmm_silu_fwd
-            elif sm == 9:
-                addmm_silu_fwd_impl = torch_addmm_silu_fwd
-            else:
-                raise ValueError(f"Unsupported SM major version: {sm}")
+            addmm_silu_fwd_impl = _get_addmm_silu_fwd_impl(x.device)
             y, _ = addmm_silu_fwd_impl(
                 x=x,
                 w=w,
@@ -704,6 +749,74 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     output_dtype,
                     False,  # deterministic
                 )
+            elif sm_major_version == 10:
+                assert dout.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ), f"Blackwell bwd expects bfloat16 or float16, got {dout.dtype}"
+                num_contexts = _blackwell_num_contexts_or_none(num_contexts)
+                if q.shape[-1] in (64, 128):
+                    sm100_ops = _import_sm100_hstu_ops()
+                    dq, dk, dv, _ = sm100_ops.hstu_varlen_bwd_100(
+                        dout,
+                        q,
+                        k,
+                        v,
+                        seq_offsets_q,
+                        seq_offsets_q,
+                        max_seqlen_q,
+                        max_seqlen_q,
+                        dq,
+                        dk,
+                        dv,
+                        num_contexts,
+                        num_targets,
+                        target_group_size,
+                        window_size_left,
+                        window_size_right,
+                        alpha,
+                        None,
+                        False,
+                        None,
+                        False,  # rab, has_drab, func, deterministic
+                    )
+                else:
+                    from ops.pt_ops.pt_hstu_attention import pytorch_hstu_mha
+
+                    with torch.enable_grad():
+                        q_ref = q.detach().requires_grad_(True)
+                        k_ref = k.detach().requires_grad_(True)
+                        v_ref = v.detach().requires_grad_(True)
+                        ref_out = pytorch_hstu_mha(
+                            max_seq_len=max_seqlen_q,
+                            alpha=alpha,
+                            q=q_ref,
+                            k=k_ref,
+                            v=v_ref,
+                            seq_offsets=seq_offsets_q,
+                            causal=ctx.causal,
+                            dropout_pr=0.0,
+                            training=True,
+                            num_targets=num_targets,
+                            num_contextuals=num_contexts,
+                            target_group_size=target_group_size,
+                            scaling_seqlen=scaling_seqlen,
+                        )
+                        grad_q, grad_k, grad_v = torch.autograd.grad(
+                            ref_out, (q_ref, k_ref, v_ref), dout
+                        )
+                    if dq is None:
+                        dq = grad_q
+                    else:
+                        dq.copy_(grad_q)
+                    if dk is None:
+                        dk = grad_k
+                    else:
+                        dk.copy_(grad_k)
+                    if dv is None:
+                        dv = grad_v
+                    else:
+                        dv.copy_(grad_v)
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
 
