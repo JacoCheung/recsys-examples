@@ -599,69 +599,20 @@ def cal_hstu_flops(
     num_contextuals_tensor = torch.cat(num_contextuals)
     num_candidates_tensor = torch.cat(num_candidates)
 
-    # Use DP process group if provided, otherwise use default world group
-    if dp_pg is not None:
-        dp_world_size = torch.distributed.get_world_size(group=dp_pg)
-        dp_rank = torch.distributed.get_rank(group=dp_pg)
-        dst_global_rank = torch.distributed.get_global_rank(dp_pg, 0)
-    else:
-        dp_world_size = torch.distributed.get_world_size()
-        dp_rank = torch.distributed.get_rank()
-        dst_global_rank = 0
-
-    # Gather to group rank 0 in the DP group
-    gathered_seqlens = (
-        [torch.empty_like(seqlens_tensor) for _ in range(dp_world_size)]
-        if dp_rank == 0
-        else None
-    )
-    gathered_num_contextuals = (
-        [torch.empty_like(num_contextuals_tensor) for _ in range(dp_world_size)]
-        if dp_rank == 0
-        else None
-    )
-    gathered_num_candidates = (
-        [torch.empty_like(num_candidates_tensor) for _ in range(dp_world_size)]
-        if dp_rank == 0
-        else None
-    )
-
-    torch.distributed.gather(
-        seqlens_tensor, gathered_seqlens, dst=dst_global_rank, group=dp_pg
-    )
-    torch.distributed.gather(
+    flops = cal_hstu_flops_single_rank(
+        num_layers,
+        hidden_size,
+        num_heads,
+        dim_per_head,
+        seqlens_tensor,
         num_contextuals_tensor,
-        gathered_num_contextuals,
-        dst=dst_global_rank,
-        group=dp_pg,
-    )
-    torch.distributed.gather(
         num_candidates_tensor,
-        gathered_num_candidates,
-        dst=dst_global_rank,
-        group=dp_pg,
+        has_bwd,
+        is_causal,
+        residual,
     )
-
-    if dp_rank == 0:
-        flops = (
-            cal_hstu_flops_single_rank(
-                num_layers,
-                hidden_size,
-                num_heads,
-                dim_per_head,
-                torch.cat(gathered_seqlens),
-                torch.cat(gathered_num_contextuals),
-                torch.cat(gathered_num_candidates),
-                has_bwd,
-                is_causal,
-                residual,
-            )
-            .cpu()
-            .item()
-        )
-    else:
-        flops = 0
-    return flops
+    torch.distributed.all_reduce(flops, group=dp_pg)
+    return flops.cpu().item()
 
 
 def get_mfu_summary(
