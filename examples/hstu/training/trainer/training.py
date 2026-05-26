@@ -130,6 +130,15 @@ def batched(it: Iterator, n: int):
         yield chain((x,), islice(it, n - 1))
 
 
+def _warm_up_data_parallel_collective() -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        return
+
+    warmup = torch.zeros(1, device=torch.cuda.current_device())
+    dist.all_reduce(warmup, group=parallel_state.get_data_parallel_group())
+    torch.cuda.synchronize()
+
+
 def train_with_pipeline(
     pipeline: Union[
         JaggedMegatronPrefetchTrainPipelineSparseDist,
@@ -163,6 +172,7 @@ def train_with_pipeline(
     iter_slices = batched(train_loader_iter, n)
     start_iter = 0
     pipeline._model.train()
+    _warm_up_data_parallel_collective()
     for batched_iterator in iter_slices:
         # for one slice(every eval interval)
         for train_iter in watched_iter(count(start_iter), timeout=60, check_interval=1):
