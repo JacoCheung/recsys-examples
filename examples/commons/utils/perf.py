@@ -351,18 +351,15 @@ def _calculate_peak_tflops(
             tflops = num_sms * clock_mhz * 1e6 * flops_per_sm_per_cycle * 2 / 1e12
             peak_tflops[dtype] = tflops
 
-    # Validate/override with known specs if available
+    # Prefer known dense Tensor Core specs when available.  The formula above
+    # uses the device's reported max graphics clock, which can differ from the
+    # reference boost clock used in datasheets.  For example, H100 at 1980 MHz
+    # would compute ~1071 BF16 TFLOPS, while the dense datasheet value is 989.
     name_upper = device_name.upper()
     for pattern, known_specs in _KNOWN_GPU_SPECS.items():
-        if pattern in name_upper:
-            # Use known specs as reference (they account for real boost behavior)
+        if pattern.upper() in name_upper:
             for dtype, known_tflops in known_specs.items():
-                # If calculated value is significantly different, use known value
-                if (
-                    dtype not in peak_tflops
-                    or abs(peak_tflops[dtype] - known_tflops) / known_tflops > 0.2
-                ):
-                    peak_tflops[dtype] = known_tflops
+                peak_tflops[dtype] = known_tflops
             break
 
     return peak_tflops
@@ -394,9 +391,9 @@ def get_current_device_spec(device_index: Optional[int] = None) -> DeviceSpec:
         SMs: 132, Clock: 1980 MHz
         Memory: 80.0 GB, Bandwidth: 3350 GB/s
         Peak TFLOPS (Tensor Core):
-          bf16: 1979.0 TFLOPS
-          fp16: 1979.0 TFLOPS
-          fp8: 3958.0 TFLOPS
+          bf16: 989.0 TFLOPS
+          fp16: 989.0 TFLOPS
+          fp8: 1979.0 TFLOPS
           ...
 
         >>> # Get peak BF16 TFLOPS for MFU calculation
@@ -638,10 +635,10 @@ def get_mfu_summary(
         >>> print(summary)
         MFU Summary:
           Achieved TFLOPS: 500.00 (global)
-          Peak TFLOPS per GPU: 1979.00 (bf16)
+          Peak TFLOPS per GPU: 989.00 (bf16)
           World size: 8
-          Global Peak TFLOPS: 15832.00
-          MFU: 3.16%
+          Global Peak TFLOPS: 7912.00
+          MFU: 6.32%
     """
     if device_spec is None:
         device_spec = get_current_device_spec()

@@ -262,12 +262,15 @@ def train_with_pipeline(
                 print_rank_0(
                     f"[train] [iter {train_iter}, tokens {global_tokens}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS, MFU {mfu:.2f}%]: loss {avg_loss:.6f}"
                 )
-                last_td = cur_td + last_td
                 tokens_logged.zero_()
                 loss_logged.zero_()
                 ddp_seqlens = []
                 ddp_num_contextuals = []
                 ddp_num_candidates = []
+                # Keep log-time collectives and metric bookkeeping out of the
+                # next measured training interval.
+                last_td = 0
+                gpu_timer.start()
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
             # The training slice's batched_iterator is already exhausted
             # at this point, so the pipeline has drained naturally
