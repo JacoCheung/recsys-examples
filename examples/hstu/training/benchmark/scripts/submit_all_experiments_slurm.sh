@@ -628,7 +628,9 @@ for i in "${!EXP_NAMES[@]}"; do
     SBATCH_ARGS+=(--cpus-per-task=8)
     SBATCH_ARGS+=(--mem=0)
     SBATCH_ARGS+=(--time="${TIME_LIMIT}")
-    SBATCH_ARGS+=(--exclusive)
+    if [ "$BENCHMARK_TYPE" = "e2e" ]; then
+        SBATCH_ARGS+=(--exclusive)
+    fi
     # cw-dfw batch_short rejects jobs without an explicit GPU spec, while
     # some other clusters reject this GRES form. Keep the request
     # cluster/partition aware.
