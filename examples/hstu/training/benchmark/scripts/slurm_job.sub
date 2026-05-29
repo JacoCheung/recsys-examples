@@ -328,21 +328,6 @@ hstu-layer)
         2>&1 | tee -a ${LOG_FILE}
 
     EXIT_CODE=${PIPESTATUS[0]}
-
-    # Post-nsys analysis: export sqlite + build sunburst.
-    if [ ${EXIT_CODE} -eq 0 ] && [ ${ENABLE_NSYS} -eq 1 ] && [ ${ENABLE_POST_NSYS_ANALYZE:-0} -eq 1 ]; then
-        echo ""
-        echo "📊 Post-nsys analysis → sunburst"
-        NSYS_REP="${NSYS_OUTPUT}.nsys-rep"
-        NSYS_SQLITE="${NSYS_OUTPUT}.sqlite"
-        SUNBURST_HTML="${NSYS_OUTPUT}_sunburst.html"
-        SUNBURST_PNG="${NSYS_OUTPUT}_sunburst.png"
-        if [ -f "${NSYS_REP}" ]; then
-            srun --container-image=${CONTAINER_IMAGE} --container-mounts=${CONTAINER_MOUNTS} --overlap --ntasks=1 bash -c "cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && nsys export --type sqlite --output '${NSYS_SQLITE}' --force-overwrite true '${NSYS_REP}' && python training/benchmark/scripts/build_layer_sunburst.py '${NSYS_SQLITE}' --output '${SUNBURST_HTML}' --png '${SUNBURST_PNG}' --label '${EXP_NAME}'" 2>&1 | tee -a ${LOG_FILE} || echo "⚠️  post-nsys-analyze failed (non-fatal)" | tee -a ${LOG_FILE}
-        else
-            echo "❌ nsys-rep not found: ${NSYS_REP}" | tee -a ${LOG_FILE}
-        fi
-    fi
     ;;
 
 hstu-attn-kernel)

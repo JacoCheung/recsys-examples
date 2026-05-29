@@ -22,8 +22,6 @@
 #   --results-dir=PATH   Output directory (default: training/benchmark/results)
 #   --nproc=N            Number of processes/GPUs for e2e (default: 8, ignored otherwise)
 #   --nsys               Enable nsys profile sampling (e2e + hstu-layer)
-#   --post-nsys-analyze Auto-generate sunburst chart from nsys-rep after run
-#                        (hstu-layer only; requires plotly/matplotlib)
 #   --dry-run            Print commands only, do not execute
 #   --help,-h            Show help information
 #
@@ -66,7 +64,6 @@ BENCHMARK_TYPE="e2e"
 NPROC=8
 EXP_FILE=""
 ENABLE_NSYS=0
-ENABLE_POST_NSYS_ANALYZE=0
 DRY_RUN=0
 CUSTOM_HSTU_ROOT=""
 CUSTOM_RESULTS_DIR=""
@@ -116,10 +113,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --nsys)
             ENABLE_NSYS=1
-            shift
-            ;;
-        --post-nsys-analyze)
-            ENABLE_POST_NSYS_ANALYZE=1
             shift
             ;;
         --dry-run)
@@ -383,9 +376,6 @@ for i in "${!EXP_NAMES[@]}"; do
     RUN_ARGS+=(--hstu-root="${HSTU_ROOT}")
     if [ ${ENABLE_NSYS} -eq 1 ]; then
         RUN_ARGS+=(--nsys)
-    fi
-    if [ ${ENABLE_POST_NSYS_ANALYZE} -eq 1 ]; then
-        RUN_ARGS+=(--post-nsys-analyze)
     fi
 
     # Run experiment

@@ -20,9 +20,6 @@
 #                          For hstu-layer: wraps the benchmark with
 #                          `nsys profile -c cudaProfilerApi` and auto-injects
 #                          `--profile True` into --exp-args.
-#   --post-nsys-analyze   After a successful --nsys run, export the nsys-rep
-#                          to sqlite and generate a sunburst chart
-#                          (hstu-layer only; requires plotly/matplotlib).
 #   --dry-run              Print commands only, do not execute
 #   --help,-h              Show this help
 #
@@ -50,7 +47,6 @@ BENCHMARK_TYPE="e2e"
 EXP_ARGS=""
 NPROC=${NPROC:-8}
 ENABLE_NSYS=0
-ENABLE_POST_NSYS_ANALYZE=0
 CUSTOM_OUTPUT_DIR=""
 DRY_RUN=0
 CUSTOM_HSTU_ROOT=""
@@ -94,10 +90,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --nsys)
             ENABLE_NSYS=1
-            shift
-            ;;
-        --post-nsys-analyze)
-            ENABLE_POST_NSYS_ANALYZE=1
             shift
             ;;
         --output-dir=*)
@@ -371,26 +363,6 @@ hstu-layer)
 
     ${CMD} 2>&1 | tee -a ${LOG_FILE}
     EXIT_CODE=${PIPESTATUS[0]}
-
-    # Post-nsys analysis: export sqlite + build sunburst (hstu-layer only).
-    if [ ${EXIT_CODE} -eq 0 ] && [ ${ENABLE_NSYS} -eq 1 ] && [ ${ENABLE_POST_NSYS_ANALYZE} -eq 1 ]; then
-        echo ""
-        echo "📊 Post-nsys analysis → sunburst"
-        NSYS_REP="${NSYS_OUTPUT}.nsys-rep"
-        NSYS_SQLITE="${NSYS_OUTPUT}.sqlite"
-        SUNBURST_HTML="${NSYS_OUTPUT}_sunburst.html"
-        SUNBURST_PNG="${NSYS_OUTPUT}_sunburst.png"
-        if [ -f "${NSYS_REP}" ]; then
-            nsys export --type sqlite --output "${NSYS_SQLITE}" --force-overwrite true "${NSYS_REP}" 2>&1 | tail -3 | tee -a "${LOG_FILE}"
-            python training/benchmark/scripts/build_layer_sunburst.py \
-                "${NSYS_SQLITE}" \
-                --output "${SUNBURST_HTML}" \
-                --png "${SUNBURST_PNG}" \
-                --label "${EXP_NAME}" 2>&1 | tee -a "${LOG_FILE}"
-        else
-            echo "❌ nsys-rep not found: ${NSYS_REP}" | tee -a "${LOG_FILE}"
-        fi
-    fi
     ;;
 
 hstu-attn-kernel)

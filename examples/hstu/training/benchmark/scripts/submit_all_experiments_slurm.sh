@@ -89,7 +89,6 @@ set -e
 # ============================================================================
 BENCHMARK_TYPE="e2e"
 ENABLE_NSYS=0
-ENABLE_POST_NSYS_ANALYZE=0
 SEQUENTIAL=0
 PARTITION="batch"
 ACCOUNT=""
@@ -158,10 +157,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --nsys)
             ENABLE_NSYS=1
-            shift
-            ;;
-        --post-nsys-analyze)
-            ENABLE_POST_NSYS_ANALYZE=1
             shift
             ;;
         --mem-debug)
@@ -656,7 +651,7 @@ for i in "${!EXP_NAMES[@]}"; do
 
     # Export environment variables — slurm_job.sub consumes BENCHMARK_TYPE +
     # EXP_OUTPUT_DIR and reads EXP_ARGS / GIN_OPTIONS from exp_args.txt.
-    EXPORT_VARS="ALL,BENCHMARK_TYPE=${BENCHMARK_TYPE},EXP_NAME=${exp},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},ENABLE_POST_NSYS_ANALYZE=${ENABLE_POST_NSYS_ANALYZE},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${EXP_MEM_DEBUG},CUDA_MEM_WATCHDOG=${EXP_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${EXP_CACHE_DEBUG}"
+    EXPORT_VARS="ALL,BENCHMARK_TYPE=${BENCHMARK_TYPE},EXP_NAME=${exp},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${EXP_MEM_DEBUG},CUDA_MEM_WATCHDOG=${EXP_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${EXP_CACHE_DEBUG}"
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script
