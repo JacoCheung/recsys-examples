@@ -90,7 +90,14 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 
 4. **Hash-RoundRobin recovers and improves throughput with caching enabled**: `hash_roundrobin` raises average throughput from 4748 TFLOPS to 4938 TFLOPS and reaches the best non-prefetch peak of 5390 TFLOPS.
 
-5. **Prefetch is nearly flat in this run**: The prefetch pipeline adds a small average gain over Hash-RoundRobin, from 4938 TFLOPS to 4969 TFLOPS. Peak throughput reaches 5410 TFLOPS, or 34.19% MFU.
+5. **Prefetch is nearly flat in this run**: The prefetch pipeline adds a small average gain over Hash-RoundRobin, from 4938 TFLOPS to 4969 TFLOPS. Peak throughput reaches 5410 TFLOPS, or 34.19% MFU. The profile explains why the gain is limited: the fastest captured Hash-RoundRobin step already has little communication overlap opportunity, and the explicit prefetch kernels are very small.
+
+   | Variant | Fastest profiled step | Timeline TFLOPS | GPU busy time | Kernel sum | Total overlap | NCCL overlap | Exposed NCCL | Explicit prefetch kernels |
+   |---------|----------------------:|----------------:|--------------:|-----------:|--------------:|-------------:|-------------:|--------------------------:|
+   | Hash-RoundRobin | 159 | 6264 | 84.93 ms | 85.63 ms | 0.71 ms (0.75%) | 0.33 ms (0.36%) | 3.12 ms (3.33%) | 0.00 ms |
+   | Prefetch pipeline | 154 | 6326 | 85.99 ms | 89.09 ms | 3.10 ms (3.33%) | 1.50 ms (1.61%) | 2.14 ms (2.30%) | 0.014 ms (0.015%) |
+
+   See the [GPU time breakdown in `PERF_ANALYSIS.md`](./PERF_ANALYSIS.md#22-gpu-time-breakdown) for the category definitions. In short, NCCL is a small slice of the profiled GPU window, so there is little communication time to hide; the pipeline's own prefetch kernels are also too small to move end-to-end throughput much.
 
 ---
 

@@ -127,6 +127,14 @@ python training/benchmark/scripts/hstu_attn_kernel_benchmark.py \
 
 <p align="center"><img src="figs/hstu_attn_mfu.png" width="60%" /></p>
 
+MFU uses the dense BF16 Tensor Core peak of 989 TFLOPS per H100 GPU.
+
+| Phase | Best config | Time | TFLOPS | MFU |
+|-------|-------------|-----:|-------:|----:|
+| Forward | BS=64, SeqLen=4096 | 3.501 ms | 628.1 | 63.5% |
+| Backward | BS=16, SeqLen=4096 | 3.908 ms | 351.7 | 35.6% |
+| Forward+Backward | BS=32, SeqLen=4096 | 9.572 ms | 402.0 | 40.6% |
+
 The CUTLASS attention kernel achieves peak MFU at large batch × seqlen products, where the GPU compute units are fully saturated. OOM (grey cells) occurs at the largest configurations.
 
 ### Fused HSTU Layer Benchmark
