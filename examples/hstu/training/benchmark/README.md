@@ -121,7 +121,7 @@ bash training/benchmark/scripts/submit_all_experiments_slurm.sh \
 python training/benchmark/scripts/hstu_attn_kernel_benchmark.py \
     --gin-config-file training/configs/benchmark_ranking.gin \
     --batch-sizes 4,8,16,32,64 \
-    --seqlens 512,1024,2048,4096
+    --seqlens 128,256,512,1024,2048,4096,8192,16384
 ```
 
 #### Results (single H100-SXM5-80GB)

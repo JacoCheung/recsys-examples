@@ -28,7 +28,7 @@ Usage (run from examples/hstu/):
     python training/benchmark/scripts/hstu_attn_kernel_benchmark.py \\
         --gin-config-file training/configs/benchmark_ranking.gin \\
         --batch-sizes 1,2,4,8,16,32,64,128 \\
-        --seqlens 64,128,256,512,1024,2048,4096 \\
+        --seqlens 128,256,512,1024,2048,4096,8192,16384 \\
         --warmup-iters 10 --bench-iters 50
 
     # Via launch wrapper (sensible defaults)
@@ -424,7 +424,7 @@ def main():
     parser.add_argument(
         "--seqlens",
         type=str,
-        default="64,128,256,512,1024,2048,4096",
+        default="128,256,512,1024,2048,4096,8192,16384",
         help="Comma-separated list of sequence lengths to sweep.",
     )
     parser.add_argument(
