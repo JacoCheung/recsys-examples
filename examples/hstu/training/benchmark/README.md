@@ -86,7 +86,7 @@ with the right `--benchmark-type`.
 
 Progressive benchmark measuring end-to-end MFU as optimizations are incrementally enabled (workload-balanced shuffler, CUTLASS attention, DynamicEmb caching, hash-roundrobin sharding, and prefetch pipeline).
 
-See the [E2E benchmark documentation](./E2E_BENCHMARK.md) for the latest results and analysis.
+See the [E2E benchmark documentation](./E2E_BENCHMARK.md) for the latest results and the [performance analysis](./PERF_ANALYSIS.md) for the GPU time breakdown.
 
 ### HSTU Attention Kernel Benchmark
 
@@ -107,7 +107,7 @@ bash training/benchmark/scripts/submit_all_experiments_slurm.sh \
 # Ad-hoc one-off (bypass the config file)
 python training/benchmark/scripts/hstu_attn_kernel_benchmark.py \
     --gin-config-file training/configs/benchmark_ranking.gin \
-    --batch-sizes 4,8,16,32,64 \
+    --batch-sizes 1,2,4,8,16,32,64,128 \
     --seqlens 128,256,512,1024,2048,4096,8192,16384
 ```
 
@@ -119,11 +119,11 @@ MFU uses the dense BF16 Tensor Core peak of 989 TFLOPS per H100 GPU.
 
 | Phase | Best config | Time | TFLOPS | MFU |
 |-------|-------------|-----:|-------:|----:|
-| Forward | BS=64, SeqLen=4096 | 3.501 ms | 628.1 | 63.5% |
-| Backward | BS=16, SeqLen=4096 | 3.908 ms | 351.7 | 35.6% |
-| Forward+Backward | BS=32, SeqLen=4096 | 9.572 ms | 402.0 | 40.6% |
+| Forward | BS=32, SeqLen=16384 | 25.256 ms | 696.6 | 70.4% |
+| Backward | BS=128, SeqLen=16384 | 462.121 ms | 380.7 | 38.5% |
+| Forward+Backward | BS=2, SeqLen=16384 | 8.834 ms | 435.6 | 44.0% |
 
-The CUTLASS attention kernel achieves peak MFU at large batch × seqlen products, where the GPU compute units are fully saturated. OOM (grey cells) occurs at the largest configurations.
+The CUTLASS attention kernel reaches peak MFU at large sequence lengths, where the GPU compute units are fully saturated.
 
 ### Fused HSTU Layer Benchmark
 
