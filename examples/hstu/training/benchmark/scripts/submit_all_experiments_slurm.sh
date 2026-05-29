@@ -626,7 +626,11 @@ for i in "${!EXP_NAMES[@]}"; do
     SBATCH_ARGS+=(--nodes="${NODES}")
     SBATCH_ARGS+=(--ntasks-per-node="${RANKS_PER_NODE}")
     SBATCH_ARGS+=(--cpus-per-task=8)
-    SBATCH_ARGS+=(--mem=0)
+    if [ "$BENCHMARK_TYPE" = "e2e" ]; then
+        SBATCH_ARGS+=(--mem=0)
+    else
+        SBATCH_ARGS+=(--mem="${HSTU_SLURM_SINGLE_GPU_MEM:-256G}")
+    fi
     SBATCH_ARGS+=(--time="${TIME_LIMIT}")
     if [ "$BENCHMARK_TYPE" = "e2e" ]; then
         SBATCH_ARGS+=(--exclusive)
