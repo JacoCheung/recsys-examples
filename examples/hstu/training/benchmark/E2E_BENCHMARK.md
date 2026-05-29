@@ -69,33 +69,33 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 
 **Hardware**: 2× H100-SXM5-80GB nodes (16 GPUs total).
 
-**Run**: `cwdfw_benchmark_cont_full_nsys_20260528_202615`, commit `bc40d89c`. The table reports average TFLOPS/MFU from the logged intervals after the first warmup log, iter 199-999. Peak columns report the best logged interval. MFU uses 989 BF16 dense Tensor Core TFLOPS per H100 GPU, or 15.824 PFLOPS for the 16-GPU run.
+**Run**: `cwdfw_benchmark_cont_full_nsys_20260528_202615`, commit `bc40d89c`. The table reports per-GPU average TFLOPS/MFU from the logged intervals after the first warmup log, iter 199-999. Peak columns report the best logged interval. MFU uses 989 BF16 dense Tensor Core TFLOPS per H100 GPU.
 
-| Exp | Name | Avg TFLOPS | Avg MFU (%) | Peak TFLOPS | Peak MFU (%) | Speedup vs Baseline | Notes |
-|-----|------|-----------:|------------:|-------------:|-------------:|---------------------:|-------|
-| 0 | Baseline | 1210 | 7.65 | 1240 | 7.84 | 1.00× | Triton attention, no shuffler/caching |
-| 1 | +Shuffler | 1852 | 11.70 | 1933 | 12.22 | 1.53× | Balances Zipf-distributed sequence lengths |
-| 2 | **+CUTLASS** | **4841** | **30.59** | **5270** | **33.30** | **4.00×** | Attention kernel swap, largest single-step gain |
-| 3 | +DynamicEmb Caching | 4748 | 30.00 | 5156 | 32.58 | 3.93× | Enables HBM cache for DynamicEmb hot rows |
-| 4 | +Hash-RoundRobin | 4938 | 31.21 | 5390 | 34.06 | 4.08× | Row-wise `hash_roundrobin` DynamicEmb placement |
-| 5 | +Prefetch Pipeline | 4969 | 31.40 | 5410 | 34.19 | 4.11× | Prefetch pipeline on top of caching + Hash-RoundRobin |
+| Exp | Name | Avg TFLOPS/GPU | Avg MFU (%) | Peak TFLOPS/GPU | Peak MFU (%) | Speedup vs Baseline | Notes |
+|-----|------|---------------:|------------:|-----------------:|-------------:|---------------------:|-------|
+| 0 | Baseline | 75.6 | 7.65 | 77.5 | 7.84 | 1.00× | Triton attention, no shuffler/caching |
+| 1 | +Shuffler | 115.8 | 11.70 | 120.8 | 12.22 | 1.53× | Balances Zipf-distributed sequence lengths |
+| 2 | **+CUTLASS** | **302.6** | **30.59** | **329.4** | **33.30** | **4.00×** | Attention kernel swap, largest single-step gain |
+| 3 | +DynamicEmb Caching | 296.8 | 30.00 | 322.3 | 32.58 | 3.93× | Enables HBM cache for DynamicEmb hot rows |
+| 4 | +Hash-RoundRobin | 308.6 | 31.21 | 336.9 | 34.06 | 4.08× | Row-wise `hash_roundrobin` DynamicEmb placement |
+| 5 | +Prefetch Pipeline | 310.6 | 31.40 | 338.1 | 34.19 | 4.11× | Prefetch pipeline on top of caching + Hash-RoundRobin |
 
 ### Key Takeaways
 
-1. **CUTLASS attention is the main jump**: Replacing Triton attention with CUTLASS raises average throughput from 1852 TFLOPS to 4841 TFLOPS after the shuffler step, and reaches 5270 peak TFLOPS.
+1. **CUTLASS attention is the main jump**: Replacing Triton attention with CUTLASS raises average throughput from 115.8 TFLOPS/GPU to 302.6 TFLOPS/GPU after the shuffler step, and reaches 329.4 peak TFLOPS/GPU.
 
-2. **Workload-balanced shuffler gives a clear baseline lift**: Zipf-distributed sequence lengths create load imbalance with O(n²) attention. The shuffler improves average throughput from 1210 TFLOPS to 1852 TFLOPS, a 1.53× speedup.
+2. **Workload-balanced shuffler gives a clear baseline lift**: Zipf-distributed sequence lengths create load imbalance with O(n²) attention. The shuffler improves average throughput from 75.6 TFLOPS/GPU to 115.8 TFLOPS/GPU, a 1.53× speedup.
 
 3. **DynamicEmb caching changes memory behavior more than raw throughput**: Caching slightly lowers average throughput compared with CUTLASS-only in this run, but it enables the intended host/HBM split for large DynamicEmb tables.
 
-4. **Hash-RoundRobin recovers and improves throughput with caching enabled**: `hash_roundrobin` raises average throughput from 4748 TFLOPS to 4938 TFLOPS and reaches the best non-prefetch peak of 5390 TFLOPS.
+4. **Hash-RoundRobin recovers and improves throughput with caching enabled**: `hash_roundrobin` raises average throughput from 296.8 TFLOPS/GPU to 308.6 TFLOPS/GPU and reaches the best non-prefetch peak of 336.9 TFLOPS/GPU.
 
-5. **Pipeline is nearly flat in this run**: Using the prefetch pipeline adds a small average gain over Hash-RoundRobin, from 4938 TFLOPS to 4969 TFLOPS. Peak throughput reaches 5410 TFLOPS, or 34.19% MFU. The profile explains why the pipeline gain is limited: the fastest captured Hash-RoundRobin step already has little communication overlap opportunity, and the explicit prefetch kernels are very small.
+5. **Pipeline is nearly flat in this run**: Using the prefetch pipeline adds a small average gain over Hash-RoundRobin, from 308.6 TFLOPS/GPU to 310.6 TFLOPS/GPU. Peak throughput reaches 338.1 TFLOPS/GPU, or 34.19% MFU. The profile explains why the pipeline gain is limited: the fastest captured Hash-RoundRobin step already has little communication overlap opportunity, and the explicit prefetch kernels are very small.
 
-   | Variant | Fastest profiled step | Timeline TFLOPS | GPU busy time | Kernel sum | Total overlap | NCCL overlap | Exposed NCCL | Explicit prefetch kernels |
-   |---------|----------------------:|----------------:|--------------:|-----------:|--------------:|-------------:|-------------:|--------------------------:|
-   | Hash-RoundRobin | 159 | 6264 | 84.93 ms | 85.63 ms | 0.71 ms (0.75%) | 0.33 ms (0.36%) | 3.12 ms (3.33%) | 0.00 ms |
-   | Prefetch pipeline | 154 | 6326 | 85.99 ms | 89.09 ms | 3.10 ms (3.33%) | 1.50 ms (1.61%) | 2.14 ms (2.30%) | 0.014 ms (0.015%) |
+   | Variant | Fastest profiled step | Timeline TFLOPS/GPU | GPU busy time | Kernel sum | Total overlap | NCCL overlap | Exposed NCCL | Explicit prefetch kernels |
+   |---------|----------------------:|--------------------:|--------------:|-----------:|--------------:|-------------:|-------------:|--------------------------:|
+   | Hash-RoundRobin | 159 | 391.5 | 84.93 ms | 85.63 ms | 0.71 ms (0.75%) | 0.33 ms (0.36%) | 3.12 ms (3.33%) | 0.00 ms |
+   | Prefetch pipeline | 154 | 395.4 | 85.99 ms | 89.09 ms | 3.10 ms (3.33%) | 1.50 ms (1.61%) | 2.14 ms (2.30%) | 0.014 ms (0.015%) |
 
    See the [GPU time breakdown in `PERF_ANALYSIS.md`](./PERF_ANALYSIS.md#22-gpu-time-breakdown) for the category definitions. In short, NCCL is a small slice of the profiled GPU window, so the pipeline has little communication time to hide; the pipeline's own prefetch kernels are also too small to move end-to-end throughput much.
 
