@@ -99,7 +99,7 @@ Progressive benchmark measuring end-to-end MFU as optimizations are incrementall
 | 4 | +Hash-RoundRobin | 4938 | 31.21 | 5390 | 34.06 | 4.08× |
 | 5 | +Prefetch Pipeline | 4969 | 31.40 | 5410 | 34.19 | 4.11× |
 
-CUTLASS attention is the largest single contributor, raising average throughput to 4.00× over the baseline. Prefetch is nearly flat in this run because the profiled GPU window has little communication time available to hide. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
+CUTLASS attention is the largest single contributor, raising average throughput to 4.00× over the baseline. The pipeline adds little in this run because the profiled GPU window has little communication time available to hide. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
 
 ### HSTU Attention Kernel Benchmark
 
