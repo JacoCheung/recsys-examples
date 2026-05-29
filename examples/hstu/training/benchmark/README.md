@@ -84,21 +84,22 @@ with the right `--benchmark-type`.
 
 ### End-to-End Training Performance
 
-Progressive benchmark measuring end-to-end MFU as optimizations are incrementally enabled (workload-balanced shuffler, CUTLASS attention, selective recompute, tensor parallel).
+Progressive benchmark measuring end-to-end MFU as optimizations are incrementally enabled (workload-balanced shuffler, CUTLASS attention, DynamicEmb caching, hash-roundrobin sharding, and prefetch pipeline).
 
 **[E2E Benchmark Documentation](./E2E_BENCHMARK.md)**
 
 #### Results (2× H100-SXM5-80GB nodes, 16 GPUs, Zipf α=1.05)
 
-| Exp | Name | TFLOPS | MFU (%) | Speedup |
-|-----|------|--------|---------|---------|
-| 0 | Baseline (Triton, DP-only) | 1092 | 6.38 | 1.00× |
-| 1 | +Shuffler | 1667 | 9.73 | 1.53× |
-| 2 | **+CUTLASS Attention** | **3933** | **22.96** | **3.60×** |
-| 3 | +Selective Recompute | 3919 | 22.88 | 3.59× |
-| 4 | +Tensor Parallel (TP=2) | 2880 | 16.81 | 2.64× |
+| Exp | Name | Avg TFLOPS | Avg MFU (%) | Peak TFLOPS | Peak MFU (%) | Speedup |
+|-----|------|-----------:|------------:|-------------:|-------------:|--------:|
+| 0 | Baseline | 1210 | 7.65 | 1240 | 7.84 | 1.00× |
+| 1 | +Shuffler | 1852 | 11.70 | 1933 | 12.22 | 1.53× |
+| 2 | **+CUTLASS Attention** | **4841** | **30.59** | **5270** | **33.30** | **4.00×** |
+| 3 | +DynamicEmb Caching | 4748 | 30.00 | 5156 | 32.58 | 3.93× |
+| 4 | +Hash-RoundRobin | 4938 | 31.21 | 5390 | 34.06 | 4.08× |
+| 5 | +Prefetch Pipeline | 4969 | 31.40 | 5410 | 34.19 | 4.11× |
 
-CUTLASS attention (3.6×) is the largest single contributor, reflecting the attention-bound nature of HSTU. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
+CUTLASS attention is the largest single contributor, raising average throughput to 4.00× over the baseline. Prefetch is nearly flat in this run because the profiled GPU window has little communication time available to hide. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
 
 ### HSTU Attention Kernel Benchmark
 
