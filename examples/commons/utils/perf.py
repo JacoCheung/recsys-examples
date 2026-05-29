@@ -608,7 +608,8 @@ def cal_hstu_flops(
         is_causal,
         residual,
     )
-    torch.distributed.all_reduce(flops, group=dp_pg)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(flops, group=dp_pg)
     return flops.cpu().item()
 
 
