@@ -1,6 +1,7 @@
 # OCI-HSG Blackwell E2E benchmark variants.
 # Keep hidden_size=1024 while avoiding the sm100 head_dim=256 backward fallback:
 #   4 heads x 256 -> 8 heads x 128.
+# Match benchmark_cont steady-state throughput settings: log every 20 iters.
 
-exp4_caching_hr,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --value_dist zipf --value_dist_alpha 1.05 --kv_channels 128 --num_attention_heads 8
-exp5_prefetch,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05 --kv_channels 128 --num_attention_heads 8
+exp4_caching_hr,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --value_dist zipf --value_dist_alpha 1.05 --kv_channels 128 --num_attention_heads 8 --log_interval 20
+exp5_prefetch,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05 --kv_channels 128 --num_attention_heads 8 --log_interval 20
