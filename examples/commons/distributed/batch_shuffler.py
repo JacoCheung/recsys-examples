@@ -9,6 +9,7 @@ from commons.ops.collective_ops import gather_along_first_dim
 from commons.perf_model.partitioner import karmarkar_karp
 from commons.sequence_batch.batch import BaseBatch
 from commons.utils.logger import debug_rank_0
+from commons.utils.tensor_transfer import tensor_from_cpu_array_like, tensor_to_cpu_list
 
 from .batch_all2all import _build_dst_rank_local, pad_and_all2all_batch
 from .batch_allgather import pad_and_allgather_batch
@@ -111,7 +112,7 @@ def _strip_dense_padding(batch: BaseBatch, actual_bs: int) -> BaseBatch:
 def _log_load_balance(
     batch_idx: int,
     all_workloads: List[float],
-    partitions_indices: torch.Tensor,
+    partitions_indices: Union[torch.Tensor, List[List[int]]],
     local_batch_size: int,
     num_partitions: int,
 ) -> None:
@@ -121,13 +122,18 @@ def _log_load_balance(
     Args:
         partitions_indices: 2-D int64 tensor ``[W, B]`` (may be on GPU).
     """
-    wl = torch.tensor(all_workloads, dtype=torch.float64)
-    pi = partitions_indices.cpu()
+    pi = (
+        tensor_to_cpu_list(partitions_indices)
+        if isinstance(partitions_indices, torch.Tensor)
+        else partitions_indices
+    )
     before_loads = [
-        wl[r * local_batch_size : (r + 1) * local_batch_size].sum().item()
+        sum(all_workloads[r * local_batch_size : (r + 1) * local_batch_size])
         for r in range(num_partitions)
     ]
-    after_loads = [wl[pi[r]].sum().item() for r in range(num_partitions)]
+    after_loads = [
+        sum(all_workloads[int(idx)] for idx in pi[r]) for r in range(num_partitions)
+    ]
     before_max, before_min = max(before_loads), min(before_loads)
     after_max, after_min = max(after_loads), min(after_loads)
     before_imb = (before_max - before_min) / before_max * 100 if before_max > 0 else 0.0
@@ -249,7 +255,7 @@ class BaseTaskBalancedBatchShuffler:
         # leads to reading incomplete / stale data and non-deterministic KK
         # partitions.  Converting here forces the D2H onto _memcpy_stream,
         # which is serialised after the AllGather.
-        allgather_workloads_cpu = allgather_workloads.tolist()
+        allgather_workloads_cpu = tensor_to_cpu_list(allgather_workloads)
 
         # Create handle for this batch's shuffle state
         # This allows multiple batches to be in shuffle state simultaneously
@@ -328,8 +334,10 @@ class BaseTaskBalancedBatchShuffler:
         # KK partitions the *global* batch (including padding samples with
         # workload == 0), so ``partitions_indices`` — and consequently
         # ``indices_this_rank`` — may reference padding positions.
-        partitions_indices = torch.tensor(
-            partitions_list, dtype=torch.int64, device=meta["device"]
+        partitions_indices = tensor_from_cpu_array_like(
+            partitions_list,
+            dtype=torch.int64,
+            device=meta["device"],
         )
         if has_padding:
             partitions_indices = _sort_partitions_padding_last(
@@ -356,7 +364,11 @@ class BaseTaskBalancedBatchShuffler:
         # stripped from dense tensors at the end of this method.
         indices_this_rank = partitions_indices[meta["rank"]]
         actual_bs = (
-            (allgather_wl[indices_this_rank] > 0).sum().item()
+            sum(
+                1
+                for idx in partitions_list[meta["rank"]]
+                if meta["allgather_workloads_cpu"][int(idx)] > 0
+            )
             if has_padding
             else indices_this_rank.numel()
         )
@@ -448,7 +460,7 @@ class BaseTaskBalancedBatchShuffler:
         # 1. Allgather the workloads
         allgather_workloads = gather_along_first_dim(workloads, pg_group)
         # KK runs on CPU; .tolist() is needed regardless.
-        allgather_wl_cpu = allgather_workloads.tolist()
+        allgather_wl_cpu = tensor_to_cpu_list(allgather_workloads)
         # Padding sits at the tail of each rank's chunk — O(W) check.
         has_padding = any(
             allgather_wl_cpu[(i + 1) * local_batch_size - 1] == 0
@@ -462,8 +474,10 @@ class BaseTaskBalancedBatchShuffler:
         partitions_list = karmarkar_karp(
             allgather_wl_cpu, num_partitions, equal_size=True
         )
-        partitions_indices = torch.tensor(
-            partitions_list, dtype=torch.int64, device=workloads.device
+        partitions_indices = tensor_from_cpu_array_like(
+            partitions_list,
+            dtype=torch.int64,
+            device=workloads.device,
         )
         if has_padding:
             partitions_indices = _sort_partitions_padding_last(
