@@ -46,6 +46,7 @@ def get_baseline_template():
 #   - Eviction Strategy: {evict}
 #   - Pipeline: {pipeline_type}
 #   - Tensor Parallel: {tp_size}
+#   - Attention Heads: {num_attention_heads}
 #   - KV Channels: {kv_channels}
 #   - Contextual Features: {contextual_features}
 # ============================================================================
@@ -122,7 +123,7 @@ BenchmarkDatasetArgs.embedding_args = [
 NetworkArgs.item_embedding_dim = 128
 NetworkArgs.contextual_embedding_dim = 128  # Same as item_embedding_dim
 NetworkArgs.num_layers = 8
-NetworkArgs.num_attention_heads = 4
+NetworkArgs.num_attention_heads = {num_attention_heads}
 NetworkArgs.hidden_size = 1024
 NetworkArgs.kv_channels = {kv_channels}
 
@@ -247,6 +248,15 @@ Examples:
         type=int,
         default=256,
         help="KV channels per head (default: 256)",
+    )
+
+    parser.add_argument(
+        "--num_attention_heads",
+        "--num-attention-heads",
+        dest="num_attention_heads",
+        type=int,
+        default=4,
+        help="Number of attention heads (default: 4)",
     )
 
     parser.add_argument(
@@ -436,6 +446,7 @@ item_cat_l1_emb/EmbeddingArgs.sharding_type = 'data_parallel'
         dist_type=args.dist_type,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
+        num_attention_heads=args.num_attention_heads,
         kv_channels=args.kv_channels,
         contextual_features="Included" if args.include_contextual else "Omitted",
         value_dist_section=value_dist_section,
