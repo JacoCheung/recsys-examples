@@ -152,6 +152,25 @@ export MEM_DEBUG=${MEM_DEBUG:-0}
 export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0}
 export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5}
 export CACHE_DEBUG=${CACHE_DEBUG:-0}
+export KK_FORCE_PYTHON=${KK_FORCE_PYTHON:-0}
+export KK_REQUIRE_CPP=${KK_REQUIRE_CPP:-0}
+
+if [ "${BENCHMARK_TYPE}" = "e2e" ] && [ "${KK_REQUIRE_CPP}" = "1" ]; then
+    echo "Building required C++ KK partitioner extension..."
+    KK_BUILD_LOCK="${EXP_OUTPUT_DIR}/../.kk_cpu_ops_build.lock"
+    (
+        flock 200
+        srun --kill-on-bad-exit=1 \
+            --nodes=1 \
+            --ntasks=1 \
+            --ntasks-per-node=1 \
+            --cpus-per-task=8 \
+            --container-image=${CONTAINER_IMAGE} \
+            --container-mounts=${CONTAINER_MOUNTS} \
+            bash -lc "cd '${HSTU_ROOT}/../commons' && BUILD_EXT_ONLY=kk_cpu_ops python setup.py build_ext --inplace && python -c 'import kk_cpu_ops; print(\"kk_cpu_ops:\", kk_cpu_ops.__file__)'"
+    ) 200>"${KK_BUILD_LOCK}"
+    echo ""
+fi
 
 # Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
 LAUNCH_BLOCKING_ENV=""
@@ -270,6 +289,8 @@ WRAPPER_EOF
                 export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && \
                 export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && \
                 export CACHE_DEBUG=${CACHE_DEBUG:-0} && \
+                export KK_FORCE_PYTHON=${KK_FORCE_PYTHON:-0} && \
+                export KK_REQUIRE_CPP=${KK_REQUIRE_CPP:-0} && \
                 export RANK=\${SLURM_PROCID} && \
                 export LOCAL_RANK=\${SLURM_LOCALID} && \
                 export WORLD_SIZE=\${SLURM_NTASKS} && \
@@ -293,7 +314,7 @@ WRAPPER_EOF
             --unbuffered \
             --container-image=${CONTAINER_IMAGE} \
             --container-mounts=${CONTAINER_MOUNTS} \
-            bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RANK=\${SLURM_PROCID} && export LOCAL_RANK=\${SLURM_LOCALID} && export WORLD_SIZE=\${SLURM_NTASKS} && export LOCAL_WORLD_SIZE=\${SLURM_NTASKS_PER_NODE:-\$((SLURM_NTASKS / SLURM_NNODES))} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+            bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export KK_FORCE_PYTHON=${KK_FORCE_PYTHON:-0} && export KK_REQUIRE_CPP=${KK_REQUIRE_CPP:-0} && export RANK=\${SLURM_PROCID} && export LOCAL_RANK=\${SLURM_LOCALID} && export WORLD_SIZE=\${SLURM_NTASKS} && export LOCAL_WORLD_SIZE=\${SLURM_NTASKS_PER_NODE:-\$((SLURM_NTASKS / SLURM_NNODES))} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
             2>&1 | tee -a ${LOG_FILE}
 
         EXIT_CODE=${PIPESTATUS[0]}

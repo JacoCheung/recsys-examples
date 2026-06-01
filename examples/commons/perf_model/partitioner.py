@@ -51,6 +51,7 @@ except ImportError:
 #   3. Sibling .so next to the ``perf_model`` package — the location used by
 #      ``python setup.py build_ext --inplace`` during dev iteration.
 _FORCE_PYTHON = os.environ.get("KK_FORCE_PYTHON", "0") == "1"
+_REQUIRE_CPP = os.environ.get("KK_REQUIRE_CPP", "0") == "1"
 _kk_cpu_ops = None
 if not _FORCE_PYTHON:
     try:
@@ -80,6 +81,12 @@ if not _FORCE_PYTHON:
                     _sys.modules.setdefault("kk_cpu_ops", _kk_cpu_ops)
                 except Exception:
                     _kk_cpu_ops = None
+
+if _REQUIRE_CPP and _kk_cpu_ops is None:
+    raise ImportError(
+        "KK_REQUIRE_CPP=1 but kk_cpu_ops is not importable. "
+        "Build it with: BUILD_EXT_ONLY=kk_cpu_ops python setup.py build_ext --inplace"
+    )
 
 
 def karmarkar_karp(
