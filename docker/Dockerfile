@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
 ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG DEVEL_IMAGE=devel
 
