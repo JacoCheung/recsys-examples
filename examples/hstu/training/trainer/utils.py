@@ -222,6 +222,52 @@ def get_data_loader(
     return datasets.get_data_loader(train_dataset), datasets.get_data_loader(test_dataset)  # type: ignore[attr-defined]
 
 
+def get_yambda_streaming_data_loader(
+    dataset_args: DatasetArgs,
+    trainer_args: TrainerArgs,
+    num_tasks: int,
+):
+    if dataset_args.dataset_name != "yambda-5b":
+        raise ValueError(
+            "yambda_streaming_train_eval is only supported for DatasetArgs.dataset_name='yambda-5b'"
+        )
+    if trainer_args.train_batch_size != trainer_args.eval_batch_size:
+        raise ValueError(
+            "Yambda reference streaming uses one window-switched dataset; "
+            "train_batch_size and eval_batch_size must match."
+        )
+    streaming_dataset = datasets.yambda.YambdaDataset(
+        dataset_path=dataset_args.dataset_path,
+        batch_size=trainer_args.train_batch_size,
+        max_history_seqlen=dataset_args.max_history_seqlen,
+        max_num_candidates=dataset_args.max_num_candidates,
+        num_tasks=num_tasks,
+        rank=dist.get_rank(),
+        world_size=dist.get_world_size(),
+        shuffle=False,
+        random_seed=trainer_args.seed,
+        history_length=dataset_args.yambda_history_length,
+        scan_window=dataset_args.yambda_scan_window,
+        max_samples=None,
+        sample_start=0,
+        window_ts=trainer_args.yambda_streaming_start_ts,
+        streaming_window_seconds=dataset_args.yambda_streaming_window_seconds,
+        streaming_sort_within_window=dataset_args.yambda_streaming_sort_within_window,
+        cache_dir=dataset_args.yambda_cache_dir,
+        metadata_path=dataset_args.yambda_metadata_path,
+        disable_cross_features=dataset_args.yambda_disable_cross_features,
+        drop_last=True,
+        rank_split="round_robin",
+    )
+    streaming_loader = datasets.get_data_loader(streaming_dataset)  # type: ignore[attr-defined]
+    return (
+        streaming_dataset,
+        streaming_dataset,
+        streaming_loader,
+        streaming_loader,
+    )
+
+
 def create_optimizer_params(optimizer_args: OptimizerArgs):
     return OptimizerParam(
         optimizer_str=optimizer_args.optimizer_str,
@@ -235,24 +281,36 @@ def create_optimizer_params(optimizer_args: OptimizerArgs):
 
 def create_sparse_optimizer_params(optimizer_args: OptimizerArgs):
     return OptimizerParam(
-        optimizer_str=optimizer_args.sparse_optimizer_str
-        if optimizer_args.sparse_optimizer_str is not None
-        else optimizer_args.optimizer_str,
-        learning_rate=optimizer_args.sparse_learning_rate
-        if optimizer_args.sparse_learning_rate is not None
-        else optimizer_args.learning_rate,
-        adam_beta1=optimizer_args.sparse_adam_beta1
-        if optimizer_args.sparse_adam_beta1 is not None
-        else optimizer_args.adam_beta1,
-        adam_beta2=optimizer_args.sparse_adam_beta2
-        if optimizer_args.sparse_adam_beta2 is not None
-        else optimizer_args.adam_beta2,
-        adam_eps=optimizer_args.sparse_adam_eps
-        if optimizer_args.sparse_adam_eps is not None
-        else optimizer_args.adam_eps,
-        weight_decay=optimizer_args.sparse_weight_decay
-        if optimizer_args.sparse_weight_decay is not None
-        else optimizer_args.weight_decay,
+        optimizer_str=(
+            optimizer_args.sparse_optimizer_str
+            if optimizer_args.sparse_optimizer_str is not None
+            else optimizer_args.optimizer_str
+        ),
+        learning_rate=(
+            optimizer_args.sparse_learning_rate
+            if optimizer_args.sparse_learning_rate is not None
+            else optimizer_args.learning_rate
+        ),
+        adam_beta1=(
+            optimizer_args.sparse_adam_beta1
+            if optimizer_args.sparse_adam_beta1 is not None
+            else optimizer_args.adam_beta1
+        ),
+        adam_beta2=(
+            optimizer_args.sparse_adam_beta2
+            if optimizer_args.sparse_adam_beta2 is not None
+            else optimizer_args.adam_beta2
+        ),
+        adam_eps=(
+            optimizer_args.sparse_adam_eps
+            if optimizer_args.sparse_adam_eps is not None
+            else optimizer_args.adam_eps
+        ),
+        weight_decay=(
+            optimizer_args.sparse_weight_decay
+            if optimizer_args.sparse_weight_decay is not None
+            else optimizer_args.weight_decay
+        ),
     )
 
 
@@ -346,9 +404,11 @@ def create_dynamic_optitons_dict(
             )
             dynamic_options_dict[embedding_args.table_name] = DynamicEmbTableOptions(
                 global_hbm_for_values=embedding_args.global_hbm_for_values,
-                evict_strategy=DynamicEmbEvictStrategy.LRU
-                if embedding_args.evict_strategy == "lru"
-                else DynamicEmbEvictStrategy.LFU,
+                evict_strategy=(
+                    DynamicEmbEvictStrategy.LRU
+                    if embedding_args.evict_strategy == "lru"
+                    else DynamicEmbEvictStrategy.LFU
+                ),
                 safe_check_mode=DynamicEmbCheckMode.IGNORE,
                 bucket_capacity=128,
                 training=training,

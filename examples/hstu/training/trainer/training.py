@@ -15,7 +15,7 @@
 import csv
 import os
 from itertools import chain, count, cycle, islice
-from typing import Iterator, Optional, Union
+from typing import Any, Dict, Iterator, Optional, Union
 
 import commons.checkpoint as checkpoint
 import torch  # pylint: disable-unused-import
@@ -52,6 +52,7 @@ def _append_eval_metrics_csv(
     eval_iter: int,
     eval_users: int,
     eval_metric_dict,
+    extra_fields: Optional[Dict[str, Any]] = None,
 ) -> None:
     if trainer_args.metrics_output_path == "":
         return
@@ -70,9 +71,14 @@ def _append_eval_metrics_csv(
         "train_iter": -1 if train_iter is None else train_iter,
         "eval_iter": eval_iter,
         "eval_users": eval_users,
+        **(extra_fields or {}),
         **metric_items,
     }
-    fieldnames = ["train_iter", "eval_iter", "eval_users"] + sorted(metric_items)
+    fieldnames = (
+        ["train_iter", "eval_iter", "eval_users"]
+        + sorted((extra_fields or {}).keys())
+        + sorted(metric_items)
+    )
     write_header = not os.path.exists(output_path) or os.path.getsize(output_path) == 0
     with open(output_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -91,10 +97,15 @@ def evaluate(
     trainer_args: TrainerArgs,
     eval_loader: torch.utils.data.DataLoader,
     train_iter: Optional[int] = None,
+    max_eval_iters: Optional[int] = None,
+    extra_csv_fields: Optional[Dict[str, Any]] = None,
 ):
     eval_iter = 0
     torch.cuda.nvtx.range_push(f"#evaluate")
-    max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
+    if max_eval_iters is None:
+        max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
+    elif max_eval_iters <= 0:
+        max_eval_iters = len(eval_loader)
     max_eval_iters = min(max_eval_iters, len(eval_loader))
     # Limit the iterator to exactly max_eval_iters elements so that it
     # exhausts before (or together with) the loop.  This lets the
@@ -136,8 +147,289 @@ def evaluate(
         eval_iter=eval_iter,
         eval_users=eval_users,
         eval_metric_dict=eval_metric_dict,
+        extra_fields=extra_csv_fields,
     )
     torch.cuda.nvtx.range_pop()
+
+
+def _positive_or_none(value: Optional[int]) -> Optional[int]:
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _log_train_step(
+    pipeline: Union[
+        JaggedMegatronPrefetchTrainPipelineSparseDist,
+        JaggedMegatronTrainNonePipeline,
+        JaggedMegatronTrainPipelineSparseDist,
+    ],
+    trainer_args: TrainerArgs,
+    gpu_timer: GPUTimer,
+    last_td: float,
+    ddp_seqlens,
+    ddp_num_contextuals,
+    ddp_num_candidates,
+    tokens_logged: torch.Tensor,
+    loss_logged: torch.Tensor,
+    train_iter: int,
+) -> float:
+    gpu_timer.stop()
+    cur_td = gpu_timer.elapsed_time() - last_td
+    hstu_config = get_unwrapped_module(pipeline._model)._hstu_config
+    (
+        num_layers,
+        hidden_size,
+        num_heads,
+        dim_per_head,
+        is_causal,
+        residual,
+    ) = (
+        hstu_config.num_layers,
+        hstu_config.hidden_size,
+        hstu_config.num_attention_heads,
+        hstu_config.kv_channels,
+        hstu_config.is_causal,
+        hstu_config.residual,
+    )
+    dp_pg = parallel_state.get_data_parallel_group()
+    flops = cal_hstu_flops(
+        num_layers,
+        hidden_size,
+        num_heads,
+        dim_per_head,
+        seqlens=ddp_seqlens,
+        num_contextuals=ddp_num_contextuals,
+        num_candidates=ddp_num_candidates,
+        has_bwd=True,
+        is_causal=is_causal,
+        residual=residual,
+        dp_pg=dp_pg,
+    )
+    mfu = cal_mfu(flops / cur_td / 1e9, world_size=dist.get_world_size(), dtype="bf16")
+    global_tokens = int(tokens_logged.item())
+    torch.distributed.all_reduce(
+        loss_logged, group=parallel_state.get_data_parallel_group()
+    )
+    avg_loss = loss_logged.item() / global_tokens
+    print_rank_0(
+        f"[train] [iter {train_iter}, tokens {global_tokens}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS, MFU {mfu:.2f}%]: loss {avg_loss:.6f}"
+    )
+    tokens_logged.zero_()
+    loss_logged.zero_()
+    gpu_timer.start()
+    return 0
+
+
+def _train_streaming_window(
+    pipeline: Union[
+        JaggedMegatronPrefetchTrainPipelineSparseDist,
+        JaggedMegatronTrainNonePipeline,
+        JaggedMegatronTrainPipelineSparseDist,
+    ],
+    trainer_args: TrainerArgs,
+    train_loader: torch.utils.data.DataLoader,
+    dense_optimizer: torch.optim.Optimizer,
+    global_train_iter: int,
+    max_window_train_iters: Optional[int],
+) -> int:
+    if max_window_train_iters is None:
+        window_train_iters = len(train_loader)
+    else:
+        window_train_iters = min(max_window_train_iters, len(train_loader))
+    max_train_iters = trainer_args.max_train_iters
+    if max_train_iters is not None:
+        remaining = max_train_iters - global_train_iter
+        if remaining <= 0:
+            return global_train_iter
+        window_train_iters = min(window_train_iters, remaining)
+    if window_train_iters <= 0:
+        return global_train_iter
+
+    gpu_timer = GPUTimer()
+    gpu_timer.start()
+    last_td = 0.0
+    ddp_seqlens = []
+    ddp_num_contextuals = []
+    ddp_num_candidates = []
+    tokens_logged = torch.zeros(1).cuda().float()
+    loss_logged = torch.zeros(1).cuda().float()
+    iterated_train_loader = islice(iter(train_loader), window_train_iters)
+    pipeline._model.train()
+
+    for train_iter in watched_iter(
+        count(global_train_iter), timeout=60, check_interval=1
+    ):
+        if trainer_args.profile and train_iter == trainer_args.profile_step_start:
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+            torch.cuda.profiler.start()
+        if trainer_args.profile and train_iter == trainer_args.profile_step_end:
+            torch.cuda.profiler.stop()
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        if (
+            train_iter * trainer_args.ckpt_save_interval > 0
+            and train_iter % trainer_args.ckpt_save_interval == 0
+        ):
+            save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
+            save_ckpts(save_path, pipeline._model, dense_optimizer)
+        try:
+            torch.cuda.nvtx.range_push(f"step {train_iter}")
+            (
+                local_loss_sum,
+                global_tokens_step,
+                (
+                    local_loss,
+                    logits,
+                    labels,
+                    (ddp_seqlen, ddp_num_contextual, ddp_num_candidate),
+                ),
+            ) = pipeline.progress(iterated_train_loader)
+            ddp_seqlens.append(ddp_seqlen.view(-1))
+            ddp_num_contextuals.append(ddp_num_contextual.view(-1))
+            ddp_num_candidates.append(ddp_num_candidate.view(-1))
+            tokens_logged += global_tokens_step
+            loss_logged += local_loss_sum
+            torch.cuda.nvtx.range_pop()
+        except StopIteration:
+            torch.cuda.nvtx.range_pop()
+            break
+        global_train_iter = train_iter + 1
+        is_log_step = (
+            train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0
+        )
+        if is_log_step:
+            last_td = _log_train_step(
+                pipeline,
+                trainer_args,
+                gpu_timer,
+                last_td,
+                ddp_seqlens,
+                ddp_num_contextuals,
+                ddp_num_candidates,
+                tokens_logged,
+                loss_logged,
+                train_iter,
+            )
+            ddp_seqlens = []
+            ddp_num_contextuals = []
+            ddp_num_candidates = []
+    return global_train_iter
+
+
+def train_yambda_streaming_with_pipeline(
+    pipeline: Union[
+        JaggedMegatronPrefetchTrainPipelineSparseDist,
+        JaggedMegatronTrainNonePipeline,
+        JaggedMegatronTrainPipelineSparseDist,
+    ],
+    stateful_metric_module: torch.nn.Module,
+    trainer_args: TrainerArgs,
+    train_dataset: Any,
+    eval_dataset: Any,
+    train_loader: torch.utils.data.DataLoader,
+    eval_loader: torch.utils.data.DataLoader,
+    dense_optimizer: torch.optim.Optimizer,
+) -> None:
+    """Reference-style Yambda temporal streaming train/eval.
+
+    For each train window T, train only anchors whose target timestamp lies in
+    T. Evaluation scores the immediate future window T+1. The eval cadence is
+    controlled in window units, matching recommendation_v4's
+    streaming_train_eval_loop.eval_every_n_windows.
+    """
+    start_ts = trainer_args.yambda_streaming_start_ts
+    num_train_ts = trainer_args.yambda_streaming_num_train_ts
+    eval_every = max(1, trainer_args.yambda_streaming_eval_every_n_windows)
+    eval_each_window = trainer_args.yambda_streaming_eval_each_window
+    max_train_batches = _positive_or_none(
+        trainer_args.yambda_streaming_num_train_batches
+    )
+    max_eval_batches = _positive_or_none(trainer_args.yambda_streaming_num_eval_batches)
+
+    if hasattr(train_dataset, "num_windows"):
+        available_windows = train_dataset.num_windows()
+        max_train_windows = max(0, available_windows - 1 - start_ts)
+        if num_train_ts > max_train_windows:
+            print_rank_0(
+                "[yambda_streaming_train_eval] "
+                f"start_ts={start_ts}, num_train_ts={num_train_ts} exceeds "
+                f"available_windows={available_windows}; "
+                f"clamping num_train_ts to {max_train_windows}"
+            )
+            num_train_ts = max_train_windows
+
+    print_rank_0(
+        "[yambda_streaming_train_eval] "
+        f"start_ts={start_ts}, num_train_ts={num_train_ts}, "
+        f"eval_each_window={eval_each_window}, eval_every_n_windows={eval_every}, "
+        f"num_train_batches={max_train_batches or 'full'}, "
+        f"num_eval_batches={max_eval_batches or 'full'}"
+    )
+    pipeline._model.train()
+    _warm_up_data_parallel_collective()
+
+    global_train_iter = 0
+    for window_index, train_ts in enumerate(range(start_ts, start_ts + num_train_ts)):
+        if (
+            trainer_args.max_train_iters is not None
+            and global_train_iter >= trainer_args.max_train_iters
+        ):
+            break
+        train_dataset.set_window(
+            train_ts,
+            max_samples=None,
+            sample_start=0,
+            shuffle=False,
+            random_seed=trainer_args.seed + train_ts,
+        )
+        print_rank_0(
+            "[yambda_streaming_train_eval] "
+            f"train_ts={train_ts}, window_index={window_index}, "
+            f"train_batches={len(train_loader)}"
+        )
+        global_train_iter = _train_streaming_window(
+            pipeline,
+            trainer_args,
+            train_loader,
+            dense_optimizer,
+            global_train_iter,
+            max_train_batches,
+        )
+
+        should_eval = eval_each_window and (
+            eval_every <= 1
+            or window_index % eval_every == 0
+            or window_index == num_train_ts - 1
+        )
+        if should_eval:
+            eval_ts = train_ts + 1
+            eval_dataset.set_window(
+                eval_ts,
+                max_samples=None,
+                sample_start=0,
+                shuffle=False,
+                random_seed=trainer_args.seed + eval_ts + 1,
+            )
+            print_rank_0(
+                "[yambda_streaming_train_eval] "
+                f"eval_ts={eval_ts}, after_train_ts={train_ts}, "
+                f"eval_batches={len(eval_loader)}"
+            )
+            pipeline._model.eval()
+            evaluate(
+                pipeline,
+                stateful_metric_module,
+                trainer_args=trainer_args,
+                eval_loader=eval_loader,
+                train_iter=global_train_iter,
+                max_eval_iters=0 if max_eval_batches is None else max_eval_batches,
+                extra_csv_fields={
+                    "window_index": window_index,
+                    "train_ts": train_ts,
+                    "eval_ts": eval_ts,
+                },
+            )
+            pipeline._model.train()
 
 
 def maybe_load_ckpts(

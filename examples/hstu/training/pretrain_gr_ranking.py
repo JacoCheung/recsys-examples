@@ -32,7 +32,11 @@ from configs import RankingConfig
 from megatron.core import parallel_state, tensor_parallel
 from model import get_ranking_model
 from modules.metrics import get_multi_event_metric_module
-from trainer.training import maybe_load_ckpts, train_with_pipeline
+from trainer.training import (
+    maybe_load_ckpts,
+    train_with_pipeline,
+    train_yambda_streaming_with_pipeline,
+)
 from trainer.utils import (
     create_dynamic_optitons_dict,
     create_embedding_configs,
@@ -42,6 +46,7 @@ from trainer.utils import (
     get_data_loader,
     get_dataset_and_embedding_args,
     get_embedding_vector_storage_multiplier,
+    get_yambda_streaming_data_loader,
 )
 from utils import (  # from hstu.utils
     BenchmarkDatasetArgs,
@@ -88,6 +93,11 @@ def main():
     network_args = NetworkArgs()
     optimizer_args = OptimizerArgs()
     tp_args = TensorModelParallelArgs()
+    is_yambda_streaming = trainer_args.training_mode in (
+        "yambda_streaming_train_eval",
+        "streaming-train-eval",
+        "streaming_train_eval",
+    )
 
     init.initialize_distributed()
     init.initialize_model_parallel(
@@ -103,9 +113,22 @@ def main():
     # We need to create the dataloader before model initialization in case the dataset is random.
     # In our scenario, the dataset across tp rank should be different. We need to fork the state
     with tensor_parallel.get_cuda_rng_tracker().fork():
-        train_dataloader, test_dataloader = get_data_loader(
-            "ranking", dataset_args, trainer_args, task_config.num_tasks
-        )
+        if is_yambda_streaming:
+            assert isinstance(dataset_args, DatasetArgs)
+            (
+                streaming_train_dataset,
+                streaming_eval_dataset,
+                train_dataloader,
+                test_dataloader,
+            ) = get_yambda_streaming_data_loader(
+                dataset_args, trainer_args, task_config.num_tasks
+            )
+        else:
+            streaming_train_dataset = None
+            streaming_eval_dataset = None
+            train_dataloader, test_dataloader = get_data_loader(
+                "ranking", dataset_args, trainer_args, task_config.num_tasks
+            )
     model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
 
     dynamic_options_dict = create_dynamic_optitons_dict(
@@ -190,14 +213,28 @@ def main():
         batch_shuffler=batch_shuffler,
     )
 
-    train_with_pipeline(
-        pipeline,
-        stateful_metric_module,
-        trainer_args,
-        train_dataloader,
-        test_dataloader,
-        dense_optimizer,
-    )
+    if is_yambda_streaming:
+        assert streaming_train_dataset is not None
+        assert streaming_eval_dataset is not None
+        train_yambda_streaming_with_pipeline(
+            pipeline,
+            stateful_metric_module,
+            trainer_args,
+            streaming_train_dataset,
+            streaming_eval_dataset,
+            train_dataloader,
+            test_dataloader,
+            dense_optimizer,
+        )
+    else:
+        train_with_pipeline(
+            pipeline,
+            stateful_metric_module,
+            trainer_args,
+            train_dataloader,
+            test_dataloader,
+            dense_optimizer,
+        )
     init.destroy_global_state()
 
 

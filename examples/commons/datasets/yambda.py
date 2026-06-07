@@ -321,12 +321,21 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
         cache_dir: Optional[str] = None,
         metadata_path: Optional[str] = None,
         disable_cross_features: bool = False,
+        drop_last: bool = False,
+        rank_split: str = "contiguous",
     ) -> None:
         super().__init__()
         if max_num_candidates != 1:
             raise ValueError("Yambda ranking currently expects max_num_candidates=1")
         if num_tasks != 1:
             raise ValueError("Yambda listen-plus ranking expects num_tasks=1")
+        if rank_split not in ("contiguous", "round_robin"):
+            raise ValueError(
+                "rank_split must be either 'contiguous' or 'round_robin', "
+                f"got {rank_split}"
+            )
+        if rank_split == "round_robin" and not drop_last:
+            raise ValueError("round_robin rank_split requires drop_last=True")
 
         (
             self._processed_dir,
@@ -353,6 +362,10 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
         self._scan_window = scan_window
         self._random_seed = random_seed
         self._shuffle = shuffle
+        self._streaming_window_seconds = streaming_window_seconds
+        self._streaming_sort_within_window = streaming_sort_within_window
+        self._drop_last = drop_last
+        self._rank_split = rank_split
         self._device = torch.device("cpu")
         self._contextual_feature_names = (
             ["uid"] if disable_cross_features else list(YAMBDA_CONTEXTUAL_FEATURE_NAMES)
@@ -368,11 +381,35 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
             "action_weight": max_history_seqlen,
         }
 
-        sample_ids = self._load_sample_ids(
-            window_ts=window_ts,
-            streaming_window_seconds=streaming_window_seconds,
-            streaming_sort_within_window=streaming_sort_within_window,
+        self._set_sample_ids(
+            sample_ids=self._load_sample_ids(
+                window_ts=window_ts,
+                streaming_window_seconds=streaming_window_seconds,
+                streaming_sort_within_window=streaming_sort_within_window,
+            ),
+            max_samples=max_samples,
+            sample_start=sample_start,
+            shuffle=shuffle,
+            random_seed=random_seed,
         )
+
+        print_rank_0(
+            "[YambdaDataset] "
+            f"processed={self._processed_dir}, cache={self._cache_dir}, "
+            f"metadata={self._metadata_dir}, samples={self._num_samples:,}, "
+            f"rank={rank}/{world_size}, batch={batch_size}, window_ts={window_ts}, "
+            f"shuffle={shuffle}, drop_last={drop_last}, rank_split={rank_split}, "
+            f"disable_cross_features={disable_cross_features}"
+        )
+
+    def _set_sample_ids(
+        self,
+        sample_ids: np.ndarray,
+        max_samples: Optional[int],
+        sample_start: int,
+        shuffle: bool,
+        random_seed: int,
+    ) -> None:
         total_samples = int(sample_ids.shape[0])
         if sample_start < 0:
             raise ValueError(f"sample_start must be >= 0, got {sample_start}")
@@ -382,16 +419,45 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
             else min(total_samples, sample_start + max_samples)
         )
         self._sample_ids = np.array(sample_ids[sample_start:end], dtype=np.int64)
-        if self._shuffle:
+        self._shuffle = shuffle
+        self._random_seed = random_seed
+        if shuffle:
             rng = np.random.default_rng(random_seed)
             self._sample_ids = rng.permutation(self._sample_ids)
         self._num_samples = int(self._sample_ids.shape[0])
+
+    def set_window(
+        self,
+        window_ts: int,
+        *,
+        max_samples: Optional[int] = None,
+        sample_start: int = 0,
+        shuffle: bool = False,
+        random_seed: Optional[int] = None,
+    ) -> None:
+        """Switch the active anchor set to one streaming time window.
+
+        This mirrors the reference Yambda streaming path: a train window T is
+        followed by evaluating window T+1. Window indices are anchor positions
+        whose target timestamp falls inside the fixed-duration window.
+        """
+        self._set_sample_ids(
+            sample_ids=self._load_sample_ids(
+                window_ts=window_ts,
+                streaming_window_seconds=self._streaming_window_seconds,
+                streaming_sort_within_window=self._streaming_sort_within_window,
+            ),
+            max_samples=max_samples,
+            sample_start=sample_start,
+            shuffle=shuffle,
+            random_seed=self._random_seed if random_seed is None else random_seed,
+        )
         print_rank_0(
             "[YambdaDataset] "
-            f"processed={self._processed_dir}, cache={self._cache_dir}, "
-            f"metadata={self._metadata_dir}, samples={self._num_samples:,}, "
-            f"rank={rank}/{world_size}, batch={batch_size}, "
-            f"disable_cross_features={disable_cross_features}"
+            f"set_window={window_ts}, samples={self._num_samples:,}, "
+            f"rank={self._rank}/{self._world_size}, batch={self._batch_size}, "
+            f"shuffle={shuffle}, drop_last={self._drop_last}, "
+            f"rank_split={self._rank_split}"
         )
 
     def _load_sample_ids(
@@ -425,13 +491,51 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
         anchor_ts = _load_npy_readonly(anchor_ts_path)
         lo = int(meta["t_min"]) + window_ts * streaming_window_seconds
         hi = lo + streaming_window_seconds
-        sample_ids = np.where((anchor_ts >= lo) & (anchor_ts < hi))[0].astype(np.int64)
-        if streaming_sort_within_window and sample_ids.size > 0:
-            sample_ids = sample_ids[np.argsort(anchor_ts[sample_ids], kind="stable")]
+        import fcntl
+
+        lock_path = str(cache_path) + ".lock"
+        with open(lock_path, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            if cache_path.exists():
+                return _load_npy_readonly(cache_path)
+            sample_ids = np.where((anchor_ts >= lo) & (anchor_ts < hi))[0].astype(
+                np.int64
+            )
+            if streaming_sort_within_window and sample_ids.size > 0:
+                sample_ids = sample_ids[
+                    np.argsort(anchor_ts[sample_ids], kind="stable")
+                ]
+            tmp_path = str(cache_path) + ".tmp.npy"
+            np.save(tmp_path, sample_ids)
+            os.replace(tmp_path, cache_path)
+        print_rank_0(
+            "[YambdaDataset] "
+            f"window_ts={window_ts}, range=[{lo}, {hi}), "
+            f"samples={int(sample_ids.size):,}, cache={cache_path}"
+        )
         return sample_ids
 
     def __len__(self) -> int:
+        if self._rank_split == "round_robin":
+            rank_samples = self._num_samples // self._world_size
+            if self._drop_last:
+                return rank_samples // self._batch_size
+            return math.ceil(rank_samples / self._batch_size)
+        if self._drop_last:
+            return self._num_samples // self._global_batch_size
         return math.ceil(self._num_samples / self._global_batch_size)
+
+    def num_windows(self) -> int:
+        """Number of fixed-duration streaming windows in the anchor cache."""
+        meta_path = self._cache_dir / f"anchor_ts_L{self._history_length}.meta.json"
+        if not meta_path.exists():
+            return 0
+        import json
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+        span = int(meta["t_max"]) - int(meta["t_min"]) + 1
+        return math.ceil(span / self._streaming_window_seconds)
 
     def _flat_pos(self, sample_id: int) -> int:
         return int(self._positions[int(sample_id)])
@@ -525,19 +629,37 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
         return contextual, sequence_features, action_weights.tolist(), label
 
     def __iter__(self) -> Iterator[YambdaHSTUBatch]:
+        rank_sample_ids = None
+        if self._rank_split == "round_robin":
+            usable_samples = (
+                (self._num_samples // self._world_size) * self._world_size
+                if self._drop_last
+                else self._num_samples
+            )
+            rank_sample_ids = self._sample_ids[:usable_samples][
+                self._rank :: self._world_size
+            ]
         for global_batch_idx in range(len(self)):
-            local_batch_start = min(
-                global_batch_idx * self._global_batch_size
-                + self._rank * self._batch_size,
-                self._num_samples,
-            )
-            local_batch_end = min(
-                global_batch_idx * self._global_batch_size
-                + (self._rank + 1) * self._batch_size,
-                self._num_samples,
-            )
-            sample_ids = self._sample_ids[local_batch_start:local_batch_end]
-            actual_batch_size = int(local_batch_end - local_batch_start)
+            if rank_sample_ids is not None:
+                local_batch_start = global_batch_idx * self._batch_size
+                local_batch_end = min(
+                    local_batch_start + self._batch_size,
+                    int(rank_sample_ids.shape[0]),
+                )
+                sample_ids = rank_sample_ids[local_batch_start:local_batch_end]
+            else:
+                local_batch_start = min(
+                    global_batch_idx * self._global_batch_size
+                    + self._rank * self._batch_size,
+                    self._num_samples,
+                )
+                local_batch_end = min(
+                    global_batch_idx * self._global_batch_size
+                    + (self._rank + 1) * self._batch_size,
+                    self._num_samples,
+                )
+                sample_ids = self._sample_ids[local_batch_start:local_batch_end]
+            actual_batch_size = int(sample_ids.shape[0])
             pad_size = self._batch_size - actual_batch_size
 
             values_by_key: Dict[str, List[int]] = {

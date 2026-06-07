@@ -70,6 +70,11 @@ class TrainerArgs:
     ckpt_load_dir: str = ""
     metrics_output_path: str = ""
 
+    # training loop mode
+    # - standard -> existing step-based train/eval loop
+    # - yambda_streaming_train_eval -> reference Yambda temporal-window loop
+    training_mode: str = "standard"
+
     # overlap pipeline type
     # - none -> no overlap
     # - native -> overlap [h2d, input dist, fwd+bwd]
@@ -81,9 +86,25 @@ class TrainerArgs:
     # - False -> use IdentityBalancedBatchShuffler (no load balancing)
     enable_balanced_shuffler: bool = False
 
+    # Yambda reference streaming train/eval loop.
+    yambda_streaming_start_ts: int = 150
+    yambda_streaming_num_train_ts: int = 30
+    yambda_streaming_eval_each_window: bool = True
+    yambda_streaming_eval_every_n_windows: int = 1
+    yambda_streaming_num_train_batches: Optional[int] = None
+    yambda_streaming_num_eval_batches: Optional[int] = None
+
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
             self.max_train_iters = int(self.max_train_iters)
+        if isinstance(self.yambda_streaming_num_train_batches, str):
+            self.yambda_streaming_num_train_batches = int(
+                self.yambda_streaming_num_train_batches
+            )
+        if isinstance(self.yambda_streaming_num_eval_batches, str):
+            self.yambda_streaming_num_eval_batches = int(
+                self.yambda_streaming_num_eval_batches
+            )
 
 
 @dataclass

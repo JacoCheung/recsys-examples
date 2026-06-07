@@ -19,7 +19,7 @@ TrainerArgs.yambda_streaming_num_train_batches = 0
 TrainerArgs.yambda_streaming_num_eval_batches = 0
 
 DatasetArgs.dataset_name = "yambda-5b"
-DatasetArgs.dataset_path = "/lustre/fsw/portfolios/coreai/users/junzhang/datasets/yambda"
+DatasetArgs.dataset_path = "/home/scratch.junzhang_sw/workspace/datasets/yambda"
 DatasetArgs.max_history_seqlen = 2039
 DatasetArgs.max_num_candidates = 1
 DatasetArgs.shuffle = False
