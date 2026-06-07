@@ -484,6 +484,30 @@ def test_different_type(batch_size, max_len, hidden_dim, dtype):
     print(result)
 
 
+def test_jagged_tensor_concat_integer_values_no_grad():
+    offsets1 = torch.tensor([0, 1, 3], dtype=torch.int64, device=device)
+    offsets2 = torch.tensor([0, 2, 3], dtype=torch.int64, device=device)
+    values1 = torch.tensor([[10], [11], [12]], dtype=torch.int64, device=device)
+    values2 = torch.tensor([[20], [21], [22]], dtype=torch.int64, device=device)
+
+    result_values, result_lengths = jagged_2D_tensor_concat(
+        [values1, values2],
+        [offsets1, offsets2],
+        [2, 2],
+    )
+
+    expected_values = torch.tensor(
+        [[10], [20], [21], [11], [12], [22]],
+        dtype=torch.int64,
+        device=device,
+    )
+    expected_lengths = torch.tensor([3, 3], dtype=torch.int64, device=device)
+    assert result_values.dtype == torch.int64
+    assert not result_values.requires_grad
+    assert torch.equal(result_values, expected_values)
+    assert torch.equal(result_lengths, expected_lengths)
+
+
 @pytest.mark.parametrize(
     "batch_size,max_len,hidden_dim",
     [

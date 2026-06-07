@@ -66,7 +66,11 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
                 (total_length, hidden_dim),
                 dtype=values_list[0].dtype,
                 device=values_list[0].device,
-            ).requires_grad_(True)
+            )
+            if merged_values.is_floating_point() or merged_values.is_complex():
+                merged_values.requires_grad_(
+                    any(value.requires_grad for value in values_list)
+                )
 
         device_properties = torch.cuda.get_device_properties(0)
         BLOCK_SIZE = 256
@@ -196,6 +200,48 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous()
 
 
+def _jagged_2D_tensor_concat_pytorch(
+    values_list: List[torch.Tensor],
+    offsets_list: List[torch.Tensor],
+    max_seqlens: List[int],
+):
+    if len(offsets_list) == 1:
+        single_offsets = offsets_list[0]
+        lengths = single_offsets[1:] - single_offsets[:-1]
+        return values_list[0], lengths
+
+    padded_dense_list = []
+    padded_mask_list = []
+    lengths_list = []
+    for values, offsets, max_seqlen in zip(values_list, offsets_list, max_seqlens):
+        lengths_list.append(offsets[1:] - offsets[:-1])
+        padded_dense_list.append(
+            torch.ops.fbgemm.jagged_to_padded_dense(
+                values=values,
+                offsets=[offsets],
+                max_lengths=[max_seqlen],
+                padding_value=0,
+            )
+        )
+        mask_values = torch.ones(
+            (values.size(0), 1), dtype=torch.int64, device=values.device
+        )
+        padded_mask_list.append(
+            torch.ops.fbgemm.jagged_to_padded_dense(
+                values=mask_values,
+                offsets=[offsets],
+                max_lengths=[max_seqlen],
+                padding_value=0,
+            ).to(torch.bool)
+        )
+
+    concatted_dense = torch.cat(padded_dense_list, dim=1)
+    concatted_mask = torch.cat(padded_mask_list, dim=1)
+    concatted_values = concatted_dense.flatten(0, 1)[concatted_mask.view(-1), :]
+    concatted_lengths = torch.sum(torch.stack(lengths_list), dim=0)
+    return concatted_values, concatted_lengths
+
+
 def jagged_2D_tensor_concat(
     values_list: List[torch.Tensor],
     offsets_list: List[torch.Tensor],
@@ -208,6 +254,13 @@ def jagged_2D_tensor_concat(
     # assert all(v.is_contiguous() for v in values_list)
 
     values_list = [switch_to_contiguous_if_needed(v) for v in values_list]
+
+    if not (values_list[0].is_floating_point() or values_list[0].is_complex()):
+        return _jagged_2D_tensor_concat_pytorch(
+            values_list,
+            offsets_list,
+            max_seqlens,
+        )
 
     max_seqlen = max(max_seqlens)
     # Handle case where values_list length > 128 by batching
