@@ -295,14 +295,42 @@ WRAPPER_EOF
         echo "🏃 Running standard training (no profiling)..."
         echo ""
 
+        RANK_ENV_WRAPPER="${EXP_OUTPUT_DIR}/.rank_env_wrapper_${SLURM_JOB_ID}.sh"
+        cat > ${RANK_ENV_WRAPPER} << 'WRAPPER_EOF'
+#!/bin/bash
+GLOBAL_RANK=${SLURM_PROCID:-0}
+NODE_ID=${SLURM_NODEID:-0}
+
+RANK_TMP_PARENT="${HSTU_RANK_TMP_PARENT:-/tmp}"
+RANK_TMP_ROOT="${RANK_TMP_PARENT}/hstu_benchmark_${SLURM_JOB_ID}_node${NODE_ID}_rank${GLOBAL_RANK}"
+mkdir -p \
+    "${RANK_TMP_ROOT}/tmp" \
+    "${RANK_TMP_ROOT}/triton" \
+    "${RANK_TMP_ROOT}/torchinductor" \
+    "${RANK_TMP_ROOT}/xdg"
+export TMPDIR="${RANK_TMP_ROOT}/tmp"
+export TMP="${TMPDIR}"
+export TEMP="${TMPDIR}"
+export XDG_CACHE_HOME="${RANK_TMP_ROOT}/xdg"
+export TRITON_CACHE_DIR="${RANK_TMP_ROOT}/triton"
+export TORCHINDUCTOR_CACHE_DIR="${RANK_TMP_ROOT}/torchinductor"
+
+echo "[Rank ${GLOBAL_RANK}] TMPDIR=${TMPDIR}"
+echo "[Rank ${GLOBAL_RANK}] TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+
+exec "$@"
+WRAPPER_EOF
+        chmod +x ${RANK_ENV_WRAPPER}
+
         srun --kill-on-bad-exit=1 \
             --unbuffered \
             --container-image=${CONTAINER_IMAGE} \
             --container-mounts=${CONTAINER_MOUNTS} \
-            bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export HSTU_STATIC_EMB_UVM_CACHING=${HSTU_STATIC_EMB_UVM_CACHING:-1} && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RANK=\${SLURM_PROCID} && export LOCAL_RANK=\${SLURM_LOCALID} && export WORLD_SIZE=\${SLURM_NTASKS} && export LOCAL_WORLD_SIZE=\${SLURM_NTASKS_PER_NODE:-\$((SLURM_NTASKS / SLURM_NNODES))} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+            bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export HSTU_STATIC_EMB_UVM_CACHING=${HSTU_STATIC_EMB_UVM_CACHING:-1} && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RANK=\${SLURM_PROCID} && export LOCAL_RANK=\${SLURM_LOCALID} && export WORLD_SIZE=\${SLURM_NTASKS} && export LOCAL_WORLD_SIZE=\${SLURM_NTASKS_PER_NODE:-\$((SLURM_NTASKS / SLURM_NNODES))} && ${LAUNCH_BLOCKING_ENV}${RANK_ENV_WRAPPER} python -u ${TRAIN_CMD}" \
             2>&1 | tee -a ${LOG_FILE}
 
         EXIT_CODE=${PIPESTATUS[0]}
+        rm -f ${RANK_ENV_WRAPPER}
     fi
     ;;
 
