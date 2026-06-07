@@ -86,6 +86,11 @@ def create_hstu_config(
         hstu_preprocessing_config = HSTUPreprocessingConfig(
             item_embedding_dim=network_args.item_embedding_dim,
             contextual_embedding_dim=network_args.contextual_embedding_dim,
+            enable_yambda_action_encoder=network_args.enable_yambda_action_encoder,
+            yambda_action_embedding_dim=network_args.yambda_action_embedding_dim,
+            yambda_action_mlp_hidden_dim=network_args.yambda_action_mlp_hidden_dim,
+            yambda_num_contextual_features=network_args.yambda_num_contextual_features,
+            yambda_additional_embedding_dim=network_args.yambda_additional_embedding_dim,
         )
     else:
         hstu_preprocessing_config = None
@@ -167,22 +172,53 @@ def get_data_loader(
         )
     else:
         assert isinstance(dataset_args, DatasetArgs)
-        (
-            train_dataset,
-            test_dataset,
-        ) = datasets.hstu_sequence_dataset.get_dataset(
-            dataset_name=dataset_args.dataset_name,
-            dataset_path=dataset_args.dataset_path,
-            max_history_seqlen=dataset_args.max_history_seqlen,
-            max_num_candidates=dataset_args.max_num_candidates,
-            num_tasks=num_tasks,
-            batch_size=trainer_args.train_batch_size,
-            rank=dist.get_rank(),
-            world_size=dist.get_world_size(),
-            shuffle=dataset_args.shuffle,
-            random_seed=trainer_args.seed,
-            eval_batch_size=trainer_args.eval_batch_size,
-        )
+        if dataset_args.dataset_name == "yambda-5b":
+            (
+                train_dataset,
+                test_dataset,
+            ) = datasets.yambda.get_dataset(
+                dataset_path=dataset_args.dataset_path,
+                max_history_seqlen=dataset_args.max_history_seqlen,
+                max_num_candidates=dataset_args.max_num_candidates,
+                num_tasks=num_tasks,
+                train_batch_size=trainer_args.train_batch_size,
+                eval_batch_size=trainer_args.eval_batch_size,
+                rank=dist.get_rank(),
+                world_size=dist.get_world_size(),
+                shuffle=dataset_args.shuffle,
+                random_seed=trainer_args.seed,
+                history_length=dataset_args.yambda_history_length,
+                scan_window=dataset_args.yambda_scan_window,
+                max_train_samples=dataset_args.yambda_max_train_samples,
+                max_eval_samples=dataset_args.yambda_max_eval_samples,
+                train_sample_start=dataset_args.yambda_train_sample_start,
+                eval_sample_start=dataset_args.yambda_eval_sample_start,
+                train_window_ts=dataset_args.yambda_train_window_ts,
+                eval_window_ts=dataset_args.yambda_eval_window_ts,
+                eval_shuffle=dataset_args.yambda_eval_shuffle,
+                streaming_window_seconds=dataset_args.yambda_streaming_window_seconds,
+                streaming_sort_within_window=dataset_args.yambda_streaming_sort_within_window,
+                cache_dir=dataset_args.yambda_cache_dir,
+                metadata_path=dataset_args.yambda_metadata_path,
+                disable_cross_features=dataset_args.yambda_disable_cross_features,
+            )
+        else:
+            (
+                train_dataset,
+                test_dataset,
+            ) = datasets.hstu_sequence_dataset.get_dataset(
+                dataset_name=dataset_args.dataset_name,
+                dataset_path=dataset_args.dataset_path,
+                max_history_seqlen=dataset_args.max_history_seqlen,
+                max_num_candidates=dataset_args.max_num_candidates,
+                num_tasks=num_tasks,
+                batch_size=trainer_args.train_batch_size,
+                rank=dist.get_rank(),
+                world_size=dist.get_world_size(),
+                shuffle=dataset_args.shuffle,
+                random_seed=trainer_args.seed,
+                eval_batch_size=trainer_args.eval_batch_size,
+            )
     return datasets.get_data_loader(train_dataset), datasets.get_data_loader(test_dataset)  # type: ignore[attr-defined]
 
 
@@ -193,6 +229,30 @@ def create_optimizer_params(optimizer_args: OptimizerArgs):
         adam_beta1=optimizer_args.adam_beta1,
         adam_beta2=optimizer_args.adam_beta2,
         adam_eps=optimizer_args.adam_eps,
+        weight_decay=optimizer_args.weight_decay,
+    )
+
+
+def create_sparse_optimizer_params(optimizer_args: OptimizerArgs):
+    return OptimizerParam(
+        optimizer_str=optimizer_args.sparse_optimizer_str
+        if optimizer_args.sparse_optimizer_str is not None
+        else optimizer_args.optimizer_str,
+        learning_rate=optimizer_args.sparse_learning_rate
+        if optimizer_args.sparse_learning_rate is not None
+        else optimizer_args.learning_rate,
+        adam_beta1=optimizer_args.sparse_adam_beta1
+        if optimizer_args.sparse_adam_beta1 is not None
+        else optimizer_args.adam_beta1,
+        adam_beta2=optimizer_args.sparse_adam_beta2
+        if optimizer_args.sparse_adam_beta2 is not None
+        else optimizer_args.adam_beta2,
+        adam_eps=optimizer_args.sparse_adam_eps
+        if optimizer_args.sparse_adam_eps is not None
+        else optimizer_args.adam_eps,
+        weight_decay=optimizer_args.sparse_weight_decay
+        if optimizer_args.sparse_weight_decay is not None
+        else optimizer_args.weight_decay,
     )
 
 
@@ -230,6 +290,11 @@ def create_embedding_configs(
             for arg in embedding_args
         ]
     if isinstance(dataset_args, DatasetArgs):
+        if dataset_args.dataset_name == "yambda-5b":
+            return [
+                create_embedding_config(network_args.hidden_size, arg)
+                for arg in embedding_args
+            ]
         from commons.hstu_data_preprocessor import get_common_preprocessors
 
         common_preprocessors = get_common_preprocessors()
@@ -306,6 +371,82 @@ def get_dataset_and_embedding_args(
         return benchmark_dataset_args, benchmark_dataset_args.embedding_args
     assert isinstance(dataset_args, DatasetArgs)
     HASH_SIZE = 10_000_000
+    if dataset_args.dataset_name == "yambda-5b":
+        embedding_args = [
+            EmbeddingArgs(
+                feature_names=["item_id"],
+                table_name="item_id",
+                item_vocab_size_or_capacity=9_390_624,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["artist_id"],
+                table_name="artist_id",
+                item_vocab_size_or_capacity=1_293_395,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["album_id"],
+                table_name="album_id",
+                item_vocab_size_or_capacity=3_367_692,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["uid"],
+                table_name="uid",
+                item_vocab_size_or_capacity=1_000_001,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["user_x_artist"],
+                table_name="user_x_artist",
+                item_vocab_size_or_capacity=100_000_000,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["user_x_album"],
+                table_name="user_x_album",
+                item_vocab_size_or_capacity=40_000_000,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["user_x_hour"],
+                table_name="user_x_hour",
+                item_vocab_size_or_capacity=24_000_000,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["item_x_hour"],
+                table_name="item_x_hour",
+                item_vocab_size_or_capacity=40_000_000,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["artist_x_hour"],
+                table_name="artist_x_hour",
+                item_vocab_size_or_capacity=32_000_000,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["user_x_is_organic"],
+                table_name="user_x_is_organic",
+                item_vocab_size_or_capacity=2_000_000,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["user_x_artist_x_hour"],
+                table_name="user_x_artist_x_hour",
+                item_vocab_size_or_capacity=40_000_000,
+                sharding_type="model_parallel",
+            ),
+        ]
+        if dataset_args.yambda_disable_cross_features:
+            embedding_args = [
+                arg
+                for arg in embedding_args
+                if not any("_x_" in feature for feature in arg.feature_names)
+            ]
+        return dataset_args, embedding_args
     if dataset_args.dataset_name == "kuairand-pure":
         return dataset_args, [
             EmbeddingArgs(

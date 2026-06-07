@@ -48,7 +48,7 @@ class RankingConfig(BaseTaskConfig):
 
     Args:
         prediction_head_arch (List[int]): Architecture of the prediction head.
-        prediction_head_act_type (str): Activation function type for the prediction head layers. Must be one of: ``'relu'`` | ``'gelu'``. Defaults to ``'relu'``.
+        prediction_head_act_type (str): Activation function type for the prediction head layers. Must be one of: ``'relu'`` | ``'gelu'`` | ``'swish_layernorm'``. Defaults to ``'relu'``.
         prediction_head_bias (bool): Whether to use bias terms in the prediction head layers. Defaults to ``True``.
         num_tasks (int): Number of tasks. Defaults to ``1``.
         eval_metrics (Tuple[str], optional): Tuple of evaluation metric type str during training. Refer to :obj:`~modules.metrics.metric_modules.MetricType`

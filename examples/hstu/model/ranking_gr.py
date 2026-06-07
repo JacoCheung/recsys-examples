@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
@@ -21,10 +21,13 @@ from commons.distributed.dmp_to_tp import (
     jt_dict_grad_scaling_and_allgather,
 )
 from commons.modules.embedding import ShardedEmbedding
+from commons.ops.length_to_offsets import length_to_complete_offsets
+from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from configs import HSTUConfig, RankingConfig
 from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.hstu_block import HSTUBlock
+from modules.hstu_processor import YambdaEmbeddingMLP
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP
 from modules.multi_task_loss_module import MultiTaskLossModule
@@ -56,6 +59,17 @@ class RankingGR(BaseModel):
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
 
         self._hstu_block = HSTUBlock(hstu_config)
+        self._use_yambda_reference_head = (
+            hstu_config.hstu_preprocessing_config is not None
+            and hstu_config.hstu_preprocessing_config.enable_yambda_action_encoder
+        )
+        self._yambda_item_embedding_mlp: Optional[YambdaEmbeddingMLP] = None
+        if self._use_yambda_reference_head:
+            self._yambda_item_embedding_mlp = YambdaEmbeddingMLP(
+                input_embedding_dim=3 * hstu_config.hidden_size,
+                hidden_dim=hstu_config.hidden_size,
+                output_embedding_dim=hstu_config.hidden_size,
+            )
         self._mlp = MLP(
             hstu_config.hidden_size,
             task_config.prediction_head_arch,
@@ -85,6 +99,8 @@ class RankingGR(BaseModel):
             RankingGR: The model with bfloat16 precision.
         """
         self._hstu_block.bfloat16()
+        if self._yambda_item_embedding_mlp is not None:
+            self._yambda_item_embedding_mlp.bfloat16()
         self._mlp.bfloat16()
         return self
 
@@ -96,8 +112,40 @@ class RankingGR(BaseModel):
             RankingGR: The model with half precision.
         """
         self._hstu_block.half()
+        if self._yambda_item_embedding_mlp is not None:
+            self._yambda_item_embedding_mlp.half()
         self._mlp.half()
         return self
+
+    def _get_yambda_candidate_item_embeddings(
+        self,
+        embeddings: Dict[str, JaggedTensor],
+        batch: HSTUBatch,
+    ) -> Optional[torch.Tensor]:
+        if self._yambda_item_embedding_mlp is None:
+            return None
+        sequence_feature_names = getattr(batch, "sequence_feature_names", None)
+        if sequence_feature_names is None or len(sequence_feature_names) == 0:
+            return None
+        if batch.num_candidates is None:
+            raise ValueError("Yambda reference item tower expects num_candidates")
+
+        num_candidates_offsets = length_to_complete_offsets(batch.num_candidates).to(
+            embeddings[sequence_feature_names[0]].offsets().dtype
+        )
+        total_candidates = batch.num_candidates.sum()
+        candidate_embeddings = []
+        for name in sequence_feature_names:
+            jt = embeddings[name]
+            _, candidates = triton_split_2D_jagged(
+                jt.values(),
+                batch.feature_to_max_seqlen[name],
+                offsets_a=jt.offsets() - num_candidates_offsets,
+                offsets_b=num_candidates_offsets,
+                seq_len_b=total_candidates,
+            )
+            candidate_embeddings.append(candidates)
+        return self._yambda_item_embedding_mlp(torch.cat(candidate_embeddings, dim=1))
 
     def get_logit_and_labels(
         self, batch: HSTUBatch
@@ -125,12 +173,18 @@ class RankingGR(BaseModel):
             parallel_state.get_tensor_model_parallel_group(),
         )
         batch = dmp_batch_to_tp(batch)
+        candidate_item_embeddings = self._get_yambda_candidate_item_embeddings(
+            embeddings,
+            batch,
+        )
         # hidden_states is a JaggedData
         hidden_states_jagged, seqlen_after_preprocessor = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
         )
         hidden_states = hidden_states_jagged.values
+        if candidate_item_embeddings is not None:
+            hidden_states = hidden_states * candidate_item_embeddings
         logits = self._mlp(hidden_states)
         return logits, seqlen_after_preprocessor, batch.labels.values()
 
@@ -153,6 +207,8 @@ class RankingGR(BaseModel):
             labels,
         ) = self.get_logit_and_labels(batch)
         losses = self._loss_module(jagged_item_logit.float(), labels)
+        if self._use_yambda_reference_head:
+            losses = losses * 0.2
         return losses, (
             losses.detach(),
             jagged_item_logit.detach(),

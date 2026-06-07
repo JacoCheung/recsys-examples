@@ -1,0 +1,66 @@
+TrainerArgs.train_batch_size = 128
+TrainerArgs.eval_batch_size = 128
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 50000
+TrainerArgs.max_train_iters = 842983
+TrainerArgs.max_eval_iters = 10000
+TrainerArgs.seed = 1234
+TrainerArgs.profile = False
+TrainerArgs.pipeline_type = "none"
+TrainerArgs.enable_balanced_shuffler = False
+
+DatasetArgs.dataset_name = "yambda-5b"
+DatasetArgs.dataset_path = "/lustre/fsw/portfolios/coreai/users/junzhang/datasets/yambda"
+DatasetArgs.max_history_seqlen = 2039
+DatasetArgs.max_num_candidates = 1
+DatasetArgs.shuffle = True
+DatasetArgs.yambda_eval_shuffle = True
+DatasetArgs.yambda_history_length = 2039
+DatasetArgs.yambda_scan_window = 20000
+DatasetArgs.yambda_train_window_ts = None
+DatasetArgs.yambda_eval_window_ts = None
+DatasetArgs.yambda_max_train_samples = 2911213764
+DatasetArgs.yambda_max_eval_samples = 323468196
+DatasetArgs.yambda_train_sample_start = 0
+DatasetArgs.yambda_eval_sample_start = 2911213764
+DatasetArgs.yambda_disable_cross_features = False
+
+NetworkArgs.dtype_str = "bfloat16"
+NetworkArgs.kernel_backend = "cutlass"
+NetworkArgs.recompute_input_layernorm = True
+NetworkArgs.recompute_input_silu = True
+NetworkArgs.num_layers = 5
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 512
+NetworkArgs.kv_channels = 128
+NetworkArgs.target_group_size = 1
+NetworkArgs.num_position_buckets = 8192
+NetworkArgs.item_embedding_dim = 512
+NetworkArgs.contextual_embedding_dim = 512
+NetworkArgs.enable_yambda_action_encoder = True
+NetworkArgs.yambda_action_embedding_dim = 8
+NetworkArgs.yambda_action_mlp_hidden_dim = 256
+NetworkArgs.yambda_num_contextual_features = 8
+NetworkArgs.yambda_additional_embedding_dim = 1024
+NetworkArgs.disable_contextual_mask = False
+
+RankingArgs.prediction_head_arch = [512, 1]
+RankingArgs.prediction_head_act_type = "swish_layernorm"
+RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 1
+RankingArgs.eval_metrics = ("AUC",)
+
+OptimizerArgs.optimizer_str = "adam"
+OptimizerArgs.learning_rate = 1e-3
+OptimizerArgs.adam_beta1 = 0.95
+OptimizerArgs.adam_beta2 = 0.999
+OptimizerArgs.adam_eps = 1e-8
+OptimizerArgs.weight_decay = 0.0
+OptimizerArgs.sparse_optimizer_str = "row_wise_adagrad"
+OptimizerArgs.sparse_learning_rate = 1e-3
+OptimizerArgs.sparse_adam_beta1 = 0.95
+OptimizerArgs.sparse_adam_beta2 = 0.999
+OptimizerArgs.sparse_adam_eps = 1e-8
+OptimizerArgs.sparse_weight_decay = 0.0
+
+TensorModelParallelArgs.tensor_model_parallel_size = 1

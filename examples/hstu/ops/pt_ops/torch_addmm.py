@@ -22,13 +22,18 @@ def torch_addmm_silu_fwd(
     w: torch.Tensor,
     y: torch.Tensor,
     silu: bool = False,
+    inplace_silu: bool = False,
 ) -> torch.Tensor:
     """
     compute z = silu(y + x @ w); silu is optional
     """
     z = torch.addmm(y, x, w)
     if silu:
-        silu_z = torch.nn.functional.silu(z)
+        if inplace_silu:
+            silu_z = torch.nn.functional.silu(z, inplace=True)
+            z = None
+        else:
+            silu_z = torch.nn.functional.silu(z)
     else:
         silu_z = None
     return z, silu_z

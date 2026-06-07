@@ -38,6 +38,7 @@ from trainer.utils import (
     create_embedding_configs,
     create_hstu_config,
     create_optimizer_params,
+    create_sparse_optimizer_params,
     get_data_loader,
     get_dataset_and_embedding_args,
     get_embedding_vector_storage_multiplier,
@@ -112,16 +113,17 @@ def main():
         network_args.hidden_size,
         training=True,
         embedding_dim_multiplier=get_embedding_vector_storage_multiplier(
-            optimizer_args.optimizer_str
+            optimizer_args.sparse_optimizer_str or optimizer_args.optimizer_str
         ),
     )
 
-    optimizer_param = create_optimizer_params(optimizer_args)
+    dense_optimizer_param = create_optimizer_params(optimizer_args)
+    sparse_optimizer_param = create_sparse_optimizer_params(optimizer_args)
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
         config=hstu_config,
-        sparse_optimizer_param=optimizer_param,
-        dense_optimizer_param=optimizer_param,
+        sparse_optimizer_param=sparse_optimizer_param,
+        dense_optimizer_param=dense_optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
         pipeline_type=trainer_args.pipeline_type,
     )

@@ -28,8 +28,38 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
+from typing import List, Tuple
+
+
+def _parse_set_binding(binding: str) -> Tuple[str, str]:
+    if "=" not in binding:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --set binding {binding!r}; expected NAME=VALUE."
+        )
+    name, value = binding.split("=", 1)
+    name = name.strip()
+    if not name:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --set binding {binding!r}; binding name is empty."
+        )
+    return name, value.strip()
+
+
+def _apply_set_bindings(config: str, bindings: List[Tuple[str, str]]) -> str:
+    lines = config.splitlines()
+    for name, value in bindings:
+        pattern = re.compile(rf"^(\s*{re.escape(name)}\s*=\s*).*$")
+        replacement = f"{name} = {value}"
+        for idx, line in enumerate(lines):
+            if pattern.match(line):
+                lines[idx] = replacement
+                break
+        else:
+            lines.append(replacement)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def get_baseline_template():
@@ -176,6 +206,21 @@ Examples:
         type=str,
         default=None,
         help="Output file path. If not specified, output to stdout.",
+    )
+    parser.add_argument(
+        "--template-file",
+        type=str,
+        default=None,
+        help="Read an existing gin file and optionally apply --set overrides.",
+    )
+    parser.add_argument(
+        "--set",
+        dest="set_bindings",
+        action="append",
+        type=_parse_set_binding,
+        default=[],
+        metavar="NAME=VALUE",
+        help="Override or append a gin binding when --template-file is used.",
     )
 
     # Optimization switches
@@ -343,6 +388,12 @@ Examples:
 
 def generate_config(args):
     """Generate the gin config content based on args."""
+    if args.template_file is not None:
+        template_path = Path(args.template_file)
+        if not template_path.is_absolute():
+            template_path = Path.cwd() / template_path
+        config = template_path.read_text()
+        return _apply_set_bindings(config, args.set_bindings)
 
     # Auto-set ratio to 0.1 (10%) when caching is enabled but ratio is 0
     ratio = args.ratio

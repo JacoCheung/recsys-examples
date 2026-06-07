@@ -28,6 +28,8 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 from commons.ops.triton_ops.common import triton_autotune
+from commons.utils.clear_tensor_data import clear_tensor_data
+from ops.triton_ops.triton_silu import triton_silu_bwd
 
 ENABLE_FULL_TURNING_SPACE = False
 
@@ -284,10 +286,15 @@ def triton_addmm_silu_bwd(
     silu: bool = False,
     wgrad_stream: Optional[torch.cuda.Stream] = None,
     wgrad_event: Optional[torch.cuda.Event] = None,
+    clear_silu_inputs: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if silu:
         assert z is not None, "z is required for silu"
-        dz = torch.ops.aten.silu_backward(grad_output, z)
+        if clear_silu_inputs:
+            dz = triton_silu_bwd(grad_output, z, out=grad_output)
+            clear_tensor_data(z, clear_storage=True)
+        else:
+            dz = torch.ops.aten.silu_backward(grad_output, z)
     else:
         dz = grad_output
     if is_y_1d:

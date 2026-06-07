@@ -14,6 +14,7 @@
 # limitations under the License.
 
 # pyre-strict
+import os
 from typing import Dict, Tuple, Union
 
 import torch
@@ -160,6 +161,7 @@ def apply_dmp(
     pg: torch.distributed.ProcessGroup,
     device: torch.device,
     pipeline_type: str = "native",
+    embedding_output_dtype: SparseType = SparseType.FP32,
 ):
     enable_prefetch_pipeline = pipeline_type == "prefetch"
     assert (
@@ -173,7 +175,7 @@ def apply_dmp(
         "eps": sparse_optimizer_param.adam_eps,
         # 'weight_decay_mode' : WeightDecayMode.NONE,
         # TODO, expose below params to users
-        "output_dtype": SparseType.FP32,
+        "output_dtype": embedding_output_dtype,
         # only when compute kernel is FUSED_UVM_CACHING or KEY_VALUE are the below params effective.
         "cache_precision": SparseType.FP32,
         "stochastic_rounding": False,
@@ -190,12 +192,17 @@ def apply_dmp(
                 for config in module.embedding_configs():
                     data_parallel_embedding_table_names.append(config.name)
 
+    planner_pipeline_type = (
+        "prefetch"
+        if os.environ.get("HSTU_STATIC_EMB_UVM_CACHING", "0") == "1"
+        else pipeline_type
+    )
     planner = get_planner(
         eb_configs,
         set(data_parallel_embedding_table_names),
         dynamicemb_options_dict,
         device,
-        pipeline_type,
+        planner_pipeline_type,
     )
     qcomm_codecs_registry = get_qcomm_codecs_registry(
         qcomms_config=QCommsConfig(
@@ -282,6 +289,12 @@ def make_optimizer_and_shard(
     if pg is None:
         pg = dist.group.WORLD
 
+    embedding_output_dtype = SparseType.FP32
+    if config.bf16:
+        embedding_output_dtype = SparseType.BF16
+    elif config.fp16:
+        embedding_output_dtype = SparseType.FP16
+
     model = apply_dmp(
         model,
         dynamicemb_options_dict,
@@ -289,6 +302,7 @@ def make_optimizer_and_shard(
         pg,
         device,
         pipeline_type,
+        embedding_output_dtype,
     )
     model, dense_optimizer = apply_megatron_ddp(
         model, config, dense_optimizer_param, device

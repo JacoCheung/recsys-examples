@@ -148,6 +148,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
 export CUDA_MODULE_LOADING=EAGER
 export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 export FILL_DYNAMICEMB_TABLES=1
+export HSTU_STATIC_EMB_UVM_CACHING="${HSTU_STATIC_EMB_UVM_CACHING:-1}"
 export MEM_DEBUG=${MEM_DEBUG:-0}
 export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0}
 export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5}
@@ -188,6 +189,10 @@ e2e)
     echo ""
 
     ${GIN_CMD} | tee ${CONFIG_FILE}
+    if ! grep -q '^TrainerArgs\.metrics_output_path' "${CONFIG_FILE}"; then
+        METRICS_OUTPUT_PATH="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}_metrics.csv"
+        echo "TrainerArgs.metrics_output_path = \"${METRICS_OUTPUT_PATH}\"" | tee -a "${CONFIG_FILE}"
+    fi
     echo ""
     echo "✅ Config saved to: ${CONFIG_FILE}"
     echo ""
@@ -266,6 +271,7 @@ WRAPPER_EOF
                 export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
                 export PYTHONUNBUFFERED=1 && \
                 export DISABLE_RICH=1 && \
+                export HSTU_STATIC_EMB_UVM_CACHING=${HSTU_STATIC_EMB_UVM_CACHING:-1} && \
                 export MEM_DEBUG=${MEM_DEBUG:-0} && \
                 export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && \
                 export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && \
@@ -293,7 +299,7 @@ WRAPPER_EOF
             --unbuffered \
             --container-image=${CONTAINER_IMAGE} \
             --container-mounts=${CONTAINER_MOUNTS} \
-            bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RANK=\${SLURM_PROCID} && export LOCAL_RANK=\${SLURM_LOCALID} && export WORLD_SIZE=\${SLURM_NTASKS} && export LOCAL_WORLD_SIZE=\${SLURM_NTASKS_PER_NODE:-\$((SLURM_NTASKS / SLURM_NNODES))} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+            bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export HSTU_STATIC_EMB_UVM_CACHING=${HSTU_STATIC_EMB_UVM_CACHING:-1} && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && export RANK=\${SLURM_PROCID} && export LOCAL_RANK=\${SLURM_LOCALID} && export WORLD_SIZE=\${SLURM_NTASKS} && export LOCAL_WORLD_SIZE=\${SLURM_NTASKS_PER_NODE:-\$((SLURM_NTASKS / SLURM_NNODES))} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
             2>&1 | tee -a ${LOG_FILE}
 
         EXIT_CODE=${PIPESTATUS[0]}

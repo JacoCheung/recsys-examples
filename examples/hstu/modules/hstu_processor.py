@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
-from typing import Dict, Optional, Union
+import os
+from typing import Dict, List, Optional, Tuple, Union, cast
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
@@ -26,6 +27,7 @@ from configs.inference_config import InferenceHSTUConfig
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
+from modules.utils import init_mlp_weights_optional_bias
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 try:
@@ -40,12 +42,228 @@ except ImportError:
     SUPPORT_TRAINING = False
 
 
+_YAMBDA_MLP_CHUNK_SIZE = int(os.environ.get("YAMBDA_MLP_CHUNK_SIZE", "131072"))
+
+
+def _chunked_mlp_forward(
+    mlp: torch.nn.Module,
+    inputs: torch.Tensor,
+    output_dim: int,
+    chunk_size: int = _YAMBDA_MLP_CHUNK_SIZE,
+) -> torch.Tensor:
+    if not inputs.is_cuda or inputs.size(0) <= chunk_size:
+        return mlp(inputs)
+    outputs = []
+    for start in range(0, inputs.size(0), chunk_size):
+        end = min(start + chunk_size, inputs.size(0))
+        outputs.append(mlp(inputs[start:end]))
+    return torch.cat(outputs, dim=0)
+
+
+class _SwishLayerNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.bias = torch.nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        normalized = torch.nn.functional.layer_norm(
+            x,
+            (x.shape[-1],),
+            self.weight.to(dtype),
+            self.bias.to(dtype),
+            self.eps,
+        )
+        return (x * torch.sigmoid(normalized)).to(dtype)
+
+
+class _LayerNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.bias = torch.nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        return torch.nn.functional.layer_norm(
+            x,
+            (x.shape[-1],),
+            self.weight.to(dtype),
+            self.bias.to(dtype),
+            self.eps,
+        ).to(dtype)
+
+
+class YambdaActionEmbeddingMLP(torch.nn.Module):
+    def __init__(
+        self,
+        action_embedding_dim: int,
+        hidden_dim: int,
+        output_embedding_dim: int,
+    ) -> None:
+        super().__init__()
+        self._output_embedding_dim = output_embedding_dim
+        self._mlp = torch.nn.Sequential(
+            torch.nn.Linear(action_embedding_dim, hidden_dim),
+            _SwishLayerNorm(hidden_dim),
+            torch.nn.Linear(hidden_dim, output_embedding_dim),
+            _LayerNorm(output_embedding_dim),
+        ).apply(init_mlp_weights_optional_bias)
+
+    def forward(self, action_embeddings: torch.Tensor) -> torch.Tensor:
+        return _chunked_mlp_forward(
+            self._mlp, action_embeddings, self._output_embedding_dim
+        )
+
+
+class YambdaEmbeddingMLP(torch.nn.Module):
+    def __init__(
+        self,
+        input_embedding_dim: int,
+        hidden_dim: int,
+        output_embedding_dim: int,
+    ) -> None:
+        super().__init__()
+        self._output_embedding_dim = output_embedding_dim
+        self._mlp = torch.nn.Sequential(
+            torch.nn.Linear(input_embedding_dim, hidden_dim),
+            _SwishLayerNorm(hidden_dim),
+            torch.nn.Linear(hidden_dim, output_embedding_dim),
+            _LayerNorm(output_embedding_dim),
+        ).apply(init_mlp_weights_optional_bias)
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        return _chunked_mlp_forward(self._mlp, embeddings, self._output_embedding_dim)
+
+    def forward_concat(self, *embedding_parts: torch.Tensor) -> torch.Tensor:
+        if len(embedding_parts) == 0:
+            raise ValueError("forward_concat expects at least one tensor")
+        rows = embedding_parts[0].size(0)
+        if not embedding_parts[0].is_cuda or rows <= _YAMBDA_MLP_CHUNK_SIZE:
+            return self.forward(torch.cat(list(embedding_parts), dim=1))
+        outputs = []
+        for start in range(0, rows, _YAMBDA_MLP_CHUNK_SIZE):
+            end = min(start + _YAMBDA_MLP_CHUNK_SIZE, rows)
+            chunk = torch.cat([part[start:end] for part in embedding_parts], dim=1)
+            outputs.append(self._mlp(chunk))
+        return torch.cat(outputs, dim=0)
+
+
+class YambdaContextualEmbeddingLinear(torch.nn.Module):
+    def __init__(
+        self,
+        num_contextual_features: int,
+        input_embedding_dim: int,
+        output_embedding_dim: int,
+    ) -> None:
+        super().__init__()
+        self._num_contextual_features = num_contextual_features
+        std = (2.0 / float(input_embedding_dim + output_embedding_dim)) ** 0.5
+        self._weights = torch.nn.Parameter(
+            torch.empty(
+                num_contextual_features,
+                input_embedding_dim,
+                output_embedding_dim,
+            ).normal_(0.0, std)
+        )
+        self._bias = torch.nn.Parameter(
+            torch.empty(num_contextual_features, output_embedding_dim).fill_(0.0)
+        )
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if embeddings.numel() == 0:
+            return embeddings.new_empty((0, self._bias.size(1)))
+        contextual = embeddings.view(
+            -1,
+            self._num_contextual_features,
+            embeddings.size(-1),
+        )
+        transformed = torch.baddbmm(
+            self._bias.view(-1, 1, self._bias.size(1)).to(contextual.dtype),
+            contextual.transpose(0, 1),
+            self._weights.to(contextual.dtype),
+        ).transpose(0, 1)
+        return transformed.reshape(-1, self._bias.size(1))
+
+
+class YambdaActionEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        action_embedding_dim: int = 8,
+        action_weights: Tuple[int, ...] = (1, 2, 4),
+        embedding_init_std: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "_combined_action_weights",
+            torch.tensor(action_weights, dtype=torch.int64),
+        )
+        self._num_action_types = len(action_weights)
+        self._action_embedding_dim = action_embedding_dim
+        self._action_embedding_table = torch.nn.Parameter(
+            torch.empty((self._num_action_types, action_embedding_dim)).normal_(
+                mean=0.0, std=embedding_init_std
+            )
+        )
+        self._target_action_embedding_table = torch.nn.Parameter(
+            torch.empty((1, self.output_embedding_dim)).normal_(
+                mean=0.0, std=embedding_init_std
+            )
+        )
+
+    @property
+    def output_embedding_dim(self) -> int:
+        return self._num_action_types * self._action_embedding_dim
+
+    def forward(
+        self,
+        action_weights_jt: JaggedTensor,
+        num_candidates: torch.Tensor,
+        max_history_seqlen: int,
+        max_num_candidates: int,
+    ) -> torch.Tensor:
+        seq_actions = action_weights_jt.values().to(torch.int64)
+        exploded_actions = (
+            torch.bitwise_and(
+                seq_actions.unsqueeze(-1),
+                self._combined_action_weights.unsqueeze(0),
+            )
+            > 0
+        )
+        history_action_embeddings = (
+            exploded_actions.unsqueeze(-1).to(self._action_embedding_table.dtype)
+            * self._action_embedding_table.unsqueeze(0)
+        ).view(-1, self.output_embedding_dim)
+
+        target_offsets = length_to_complete_offsets(num_candidates).to(
+            action_weights_jt.offsets().dtype
+        )
+        total_targets = int(num_candidates.sum().item())
+        target_action_embeddings = self._target_action_embedding_table.tile(
+            total_targets,
+            1,
+        )
+        action_embeddings, _ = jagged_2D_tensor_concat(
+            [history_action_embeddings, target_action_embeddings],
+            [action_weights_jt.offsets(), target_offsets],
+            [max_history_seqlen, max_num_candidates],
+        )
+        return action_embeddings
+
+
 def hstu_preprocess_embeddings(
     embeddings: Dict[str, JaggedTensor],
     batch: HSTUBatch,
     is_inference: bool,
     item_mlp: Optional[MLP] = None,
-    contextual_mlp: Optional[MLP] = None,
+    contextual_mlp: Optional[torch.nn.Module] = None,
+    yambda_content_embedding_mlp: Optional[YambdaEmbeddingMLP] = None,
+    yambda_additional_embedding_mlp: Optional[YambdaEmbeddingMLP] = None,
+    action_encoder: Optional[YambdaActionEncoder] = None,
+    action_embedding_mlp: Optional[YambdaActionEmbeddingMLP] = None,
     dtype: Optional[torch.dtype] = None,
     scaling_seqlen: int = -1,
 ) -> JaggedData:
@@ -73,104 +291,170 @@ def hstu_preprocess_embeddings(
     Returns:
         JaggedData: The preprocessed jagged data, ready for further processing in the HSTU architecture.
     """
-    item_jt = embeddings[batch.item_feature_name]  # history + candidate
-    dtype = item_jt.values().dtype if dtype is None else dtype
-    sequence_embeddings = item_jt.values().to(dtype)
-    sequence_embeddings_lengths = item_jt.lengths()
-    sequence_embeddings_lengths_offsets = item_jt.offsets()
-    sequence_max_seqlen = batch.feature_to_max_seqlen[batch.item_feature_name]
-
-    if batch.action_feature_name is not None:
-        action_jt = embeddings[batch.action_feature_name]
-        jagged_size = sequence_embeddings.size(0)
-        embedding_dim = sequence_embeddings.size(1)
-
-        if not is_inference:
-            sequence_embeddings = torch.cat(
-                [sequence_embeddings, action_jt.values().to(dtype)], dim=1
-            ).view(2 * jagged_size, embedding_dim)
-            sequence_embeddings_lengths = sequence_embeddings_lengths * 2
-            sequence_embeddings_lengths_offsets = (
-                sequence_embeddings_lengths_offsets * 2
+    sequence_feature_names = getattr(batch, "sequence_feature_names", None)
+    has_multi_feature_sequence = (
+        sequence_feature_names is not None and len(sequence_feature_names) > 0
+    )
+    if has_multi_feature_sequence:
+        sequence_feature_names = cast(List[str], sequence_feature_names)
+        sequence_jts = [embeddings[name] for name in sequence_feature_names]
+        item_jt = sequence_jts[0]
+        dtype = item_jt.values().dtype if dtype is None else dtype
+        if (
+            yambda_content_embedding_mlp is not None
+            and yambda_additional_embedding_mlp is not None
+        ):
+            sequence_embeddings = yambda_content_embedding_mlp(
+                sequence_jts[0].values().to(dtype)
             )
-            sequence_max_seqlen = sequence_max_seqlen * 2
+            sequence_embeddings = (
+                sequence_embeddings
+                + yambda_additional_embedding_mlp.forward_concat(
+                    *[jt.values().to(dtype) for jt in sequence_jts[1:]]
+                )
+            )
         else:
-            # TODO@junyi: We can optimize the concat:
-            # 1. use jagged split to get [history_embs, candidate_embs]
-            # 2. use cat to interleave the history_embs and history_action_embs part
-            # 3. use jagged concat to append the candidate_embs
-
-            action_offsets = action_jt.offsets()
-            item_offsets = item_jt.offsets()
-            candidates_indptr = item_offsets[: batch.batch_size] + action_jt.lengths()
-
-            item_embs = item_jt.values().to(dtype)
-            action_embs = action_jt.values().to(dtype)
-            if not torch.compiler.is_compiling():
-                interleaved_embeddings = [
-                    (
-                        torch.cat(
-                            [
-                                item_embs[
-                                    item_offsets[idx]
-                                    .item() : candidates_indptr[idx]
-                                    .item()
-                                ],
-                                action_embs[
-                                    action_offsets[idx]
-                                    .item() : action_offsets[idx + 1]
-                                    .item()
-                                ],
-                            ],
-                            dim=1,
-                        ).view(-1, embedding_dim),
-                        item_embs[
-                            candidates_indptr[idx].item() : item_offsets[idx + 1].item()
-                        ],
-                    )
-                    for idx in range(batch.batch_size)
-                ]
-                interleaved_embeddings = list(itertools.chain(*interleaved_embeddings))
-                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
-                    -1, embedding_dim
-                )
-            else:
-                interleaved_embeddings = list()
-                for idx in range(batch.batch_size):
-                    interleaved_embeddings.append(
-                        torch.cat(
-                            [
-                                item_embs[
-                                    torch.arange(
-                                        item_offsets[idx], candidates_indptr[idx]
-                                    )
-                                ],
-                                action_embs[
-                                    torch.arange(
-                                        action_offsets[idx], action_offsets[idx + 1]
-                                    )
-                                ],
-                            ],
-                            dim=1,
-                        ).view(-1, embedding_dim)
-                    )
-                    interleaved_embeddings.append(
-                        item_embs[
-                            torch.arange(candidates_indptr[idx], item_offsets[idx + 1])
-                        ]
-                    )
-                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
-                    -1, embedding_dim
-                )
-            sequence_embeddings_lengths = item_jt.lengths() + action_jt.lengths()
-            sequence_embeddings_lengths_offsets = (
-                item_jt.offsets() + action_jt.offsets()
+            sequence_embeddings = torch.cat(
+                [jt.values().to(dtype) for jt in sequence_jts], dim=1
             )
-            sequence_max_seqlen += batch.feature_to_max_seqlen[
-                batch.action_feature_name
-            ]
-        if item_mlp is not None:
+        sequence_embeddings_lengths = item_jt.lengths()
+        sequence_embeddings_lengths_offsets = item_jt.offsets()
+        sequence_max_seqlen = batch.feature_to_max_seqlen[sequence_feature_names[0]]
+        if item_mlp is not None and yambda_content_embedding_mlp is None:
             sequence_embeddings = item_mlp(sequence_embeddings)
+        if action_encoder is not None and action_embedding_mlp is not None:
+            action_weights = getattr(batch, "action_weights", None)
+            if action_weights is None:
+                raise ValueError(
+                    "Yambda action encoder is enabled but batch.action_weights is missing"
+                )
+            if batch.num_candidates is None:
+                raise ValueError(
+                    "Yambda action encoder expects ranking batches with num_candidates"
+                )
+            action_weight_feature_name = getattr(
+                batch, "action_weight_feature_name", "action_weight"
+            )
+            action_embeddings = action_encoder(
+                action_weights_jt=action_weights[action_weight_feature_name],
+                num_candidates=batch.num_candidates,
+                max_history_seqlen=batch.feature_to_max_seqlen[
+                    action_weight_feature_name
+                ],
+                max_num_candidates=batch.max_num_candidates,
+            )
+            sequence_embeddings = sequence_embeddings + action_embedding_mlp(
+                action_embeddings
+            ).to(sequence_embeddings.dtype)
+        has_interleaved_action = False
+    else:
+        item_jt = embeddings[batch.item_feature_name]  # history + candidate
+        dtype = item_jt.values().dtype if dtype is None else dtype
+        sequence_embeddings = item_jt.values().to(dtype)
+        sequence_embeddings_lengths = item_jt.lengths()
+        sequence_embeddings_lengths_offsets = item_jt.offsets()
+        sequence_max_seqlen = batch.feature_to_max_seqlen[batch.item_feature_name]
+        has_interleaved_action = batch.action_feature_name is not None
+
+        if batch.action_feature_name is not None:
+            action_jt = embeddings[batch.action_feature_name]
+            jagged_size = sequence_embeddings.size(0)
+            embedding_dim = sequence_embeddings.size(1)
+
+            if not is_inference:
+                sequence_embeddings = torch.cat(
+                    [sequence_embeddings, action_jt.values().to(dtype)], dim=1
+                ).view(2 * jagged_size, embedding_dim)
+                sequence_embeddings_lengths = sequence_embeddings_lengths * 2
+                sequence_embeddings_lengths_offsets = (
+                    sequence_embeddings_lengths_offsets * 2
+                )
+                sequence_max_seqlen = sequence_max_seqlen * 2
+            else:
+                # TODO@junyi: We can optimize the concat:
+                # 1. use jagged split to get [history_embs, candidate_embs]
+                # 2. use cat to interleave the history_embs and history_action_embs part
+                # 3. use jagged concat to append the candidate_embs
+
+                action_offsets = action_jt.offsets()
+                item_offsets = item_jt.offsets()
+                candidates_indptr = (
+                    item_offsets[: batch.batch_size] + action_jt.lengths()
+                )
+
+                item_embs = item_jt.values().to(dtype)
+                action_embs = action_jt.values().to(dtype)
+                if not torch.compiler.is_compiling():
+                    interleaved_embeddings = [
+                        (
+                            torch.cat(
+                                [
+                                    item_embs[
+                                        item_offsets[idx]
+                                        .item() : candidates_indptr[idx]
+                                        .item()
+                                    ],
+                                    action_embs[
+                                        action_offsets[idx]
+                                        .item() : action_offsets[idx + 1]
+                                        .item()
+                                    ],
+                                ],
+                                dim=1,
+                            ).view(-1, embedding_dim),
+                            item_embs[
+                                candidates_indptr[idx]
+                                .item() : item_offsets[idx + 1]
+                                .item()
+                            ],
+                        )
+                        for idx in range(batch.batch_size)
+                    ]
+                    interleaved_embeddings = list(
+                        itertools.chain(*interleaved_embeddings)
+                    )
+                    sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
+                        -1, embedding_dim
+                    )
+                else:
+                    interleaved_embeddings = list()
+                    for idx in range(batch.batch_size):
+                        interleaved_embeddings.append(
+                            torch.cat(
+                                [
+                                    item_embs[
+                                        torch.arange(
+                                            item_offsets[idx], candidates_indptr[idx]
+                                        )
+                                    ],
+                                    action_embs[
+                                        torch.arange(
+                                            action_offsets[idx], action_offsets[idx + 1]
+                                        )
+                                    ],
+                                ],
+                                dim=1,
+                            ).view(-1, embedding_dim)
+                        )
+                        interleaved_embeddings.append(
+                            item_embs[
+                                torch.arange(
+                                    candidates_indptr[idx], item_offsets[idx + 1]
+                                )
+                            ]
+                        )
+                    sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
+                        -1, embedding_dim
+                    )
+                sequence_embeddings_lengths = item_jt.lengths() + action_jt.lengths()
+                sequence_embeddings_lengths_offsets = (
+                    item_jt.offsets() + action_jt.offsets()
+                )
+                sequence_max_seqlen += batch.feature_to_max_seqlen[
+                    batch.action_feature_name
+                ]
+            if item_mlp is not None:
+                sequence_embeddings = item_mlp(sequence_embeddings)
 
     if (
         batch.num_candidates is not None
@@ -279,7 +563,7 @@ def hstu_preprocess_embeddings(
         contextual_seqlen_offsets=contextual_seqlen_offsets.to(torch.int32)
         if contextual_seqlen_offsets is not None
         else None,
-        has_interleaved_action=batch.action_feature_name is not None,
+        has_interleaved_action=has_interleaved_action,
         scaling_seqlen=scaling_seqlen,
         total_candidates_seq_len=total_candidates_seq_len,
     )
@@ -317,15 +601,63 @@ class HSTUBlockPreprocessor(torch.nn.Module):
 
         self._item_mlp = None
         self._contextual_mlp = None
+        self._yambda_content_embedding_mlp = None
+        self._yambda_additional_embedding_mlp = None
+        self._yambda_action_encoder = None
+        self._yambda_action_embedding_mlp = None
         if config.hstu_preprocessing_config is not None:
-            if config.hstu_preprocessing_config.item_embedding_dim > 0:
+            is_yambda_reference_preprocessor = (
+                config.hstu_preprocessing_config.enable_yambda_action_encoder
+            )
+            if is_yambda_reference_preprocessor:
+                preprocessor_hidden_dim = (
+                    config.hstu_preprocessing_config.yambda_action_mlp_hidden_dim
+                )
+                self._yambda_content_embedding_mlp = YambdaEmbeddingMLP(
+                    input_embedding_dim=config.hidden_size,
+                    hidden_dim=preprocessor_hidden_dim,
+                    output_embedding_dim=config.hidden_size,
+                )
+                self._yambda_additional_embedding_mlp = YambdaEmbeddingMLP(
+                    input_embedding_dim=(
+                        config.hstu_preprocessing_config.yambda_additional_embedding_dim
+                    ),
+                    hidden_dim=preprocessor_hidden_dim,
+                    output_embedding_dim=config.hidden_size,
+                )
+                self._contextual_mlp = YambdaContextualEmbeddingLinear(
+                    num_contextual_features=(
+                        config.hstu_preprocessing_config.yambda_num_contextual_features
+                    ),
+                    input_embedding_dim=config.hidden_size,
+                    output_embedding_dim=config.hidden_size,
+                )
+            elif config.hstu_preprocessing_config.item_embedding_dim > 0:
                 self._item_mlp = MLP(
                     in_size=config.hstu_preprocessing_config.item_embedding_dim,
                     layer_sizes=[config.hidden_size, config.hidden_size],
                     activation="relu",
                     bias=True,
                 )
-            if config.hstu_preprocessing_config.contextual_embedding_dim > 0:
+            if config.hstu_preprocessing_config.enable_yambda_action_encoder:
+                action_embedding_dim = (
+                    config.hstu_preprocessing_config.yambda_action_embedding_dim
+                )
+                self._yambda_action_encoder = YambdaActionEncoder(
+                    action_embedding_dim=action_embedding_dim,
+                    action_weights=(1, 2, 4),
+                )
+                self._yambda_action_embedding_mlp = YambdaActionEmbeddingMLP(
+                    action_embedding_dim=3 * action_embedding_dim,
+                    hidden_dim=(
+                        config.hstu_preprocessing_config.yambda_action_mlp_hidden_dim
+                    ),
+                    output_embedding_dim=config.hidden_size,
+                )
+            if (
+                not is_yambda_reference_preprocessor
+                and config.hstu_preprocessing_config.contextual_embedding_dim > 0
+            ):
                 self._contextual_mlp = MLP(
                     in_size=config.hstu_preprocessing_config.contextual_embedding_dim,
                     layer_sizes=[config.hidden_size, config.hidden_size],
@@ -385,6 +717,10 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             is_inference=self._is_inference,
             item_mlp=self._item_mlp,
             contextual_mlp=self._contextual_mlp,
+            yambda_content_embedding_mlp=self._yambda_content_embedding_mlp,
+            yambda_additional_embedding_mlp=self._yambda_additional_embedding_mlp,
+            action_encoder=self._yambda_action_encoder,
+            action_embedding_mlp=self._yambda_action_embedding_mlp,
             dtype=self._training_dtype,
             scaling_seqlen=self._scaling_seqlen,
         )
@@ -422,10 +758,16 @@ class HSTUBlockPostprocessor(torch.nn.Module):
         config (HSTUConfig): Configuration for the HSTU block.
     """
 
-    def __init__(self, is_inference: bool, sequence_parallel: bool = False):
+    def __init__(
+        self,
+        is_inference: bool,
+        sequence_parallel: bool = False,
+        normalize_output: bool = True,
+    ):
         super().__init__()
         self._is_inference = is_inference
         self._sequence_parallel = sequence_parallel
+        self._normalize_output = normalize_output
 
         if self._is_inference:
             self._sequence_parallel = False
@@ -507,9 +849,10 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             seqlen_offsets = seqlen_offsets // 2
             max_seqlen = max_seqlen // 2
 
-        sequence_embeddings = sequence_embeddings / torch.linalg.norm(
-            sequence_embeddings, ord=2, dim=-1, keepdim=True
-        ).clamp(min=1e-6)
+        if self._normalize_output:
+            sequence_embeddings = sequence_embeddings / torch.linalg.norm(
+                sequence_embeddings, ord=2, dim=-1, keepdim=True
+            ).clamp(min=1e-6)
 
         return JaggedData(
             values=sequence_embeddings,

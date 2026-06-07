@@ -84,6 +84,11 @@ class PositionEncodingConfig:
 class HSTUPreprocessingConfig:
     item_embedding_dim: int
     contextual_embedding_dim: int
+    enable_yambda_action_encoder: bool = False
+    yambda_action_embedding_dim: int = 8
+    yambda_action_mlp_hidden_dim: int = 256
+    yambda_num_contextual_features: int = 8
+    yambda_additional_embedding_dim: int = 1024
 
 
 @dataclass

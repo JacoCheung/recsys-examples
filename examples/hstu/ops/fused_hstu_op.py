@@ -225,12 +225,21 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             addmm_silu_fwd_impl = _get_addmm_silu_fwd_impl(input.device)
             # 2. linear & silu
             # bias is 1D
-            linear_uvqk, silu_linear_uvqk = addmm_silu_fwd_impl(
-                x=normed_input,
-                w=linear_weight,
-                y=linear_bias,
-                silu=True,
-            )
+            if recompute_input_silu and addmm_silu_fwd_impl is torch_addmm_silu_fwd:
+                linear_uvqk, silu_linear_uvqk = addmm_silu_fwd_impl(
+                    x=normed_input,
+                    w=linear_weight,
+                    y=linear_bias,
+                    silu=True,
+                    inplace_silu=True,
+                )
+            else:
+                linear_uvqk, silu_linear_uvqk = addmm_silu_fwd_impl(
+                    x=normed_input,
+                    w=linear_weight,
+                    y=linear_bias,
+                    silu=True,
+                )
             # for gemm backward
             saved_tensor_map.update(
                 {
@@ -238,6 +247,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     if not recompute_input_layernorm
                     else None,
                     "linear_uvqk_weight": linear_weight,
+                    "linear_uvqk_bias": linear_bias,
                 }
             )
             if recompute_input_layernorm:
@@ -245,7 +255,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 del normed_input
             saved_tensor_map.update(
                 {
-                    "silu_input": linear_uvqk,
+                    "silu_input": None if recompute_input_silu else linear_uvqk,
                 }
             )
             return silu_linear_uvqk
@@ -897,6 +907,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 silu=True,
                 wgrad_stream=wgrad_stream,
                 wgrad_event=wgrad_event,
+                clear_silu_inputs=False,
             )
             # # 2. ln
             grad_input, grad_ln_weight, grad_ln_bias = triton_weighted_layer_norm_bwd(
@@ -924,7 +935,13 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         saved_tensor_name = ctx.saved_tensor_name
         saved_tensors = ctx.saved_tensors
         saved_tensor_map = OrderedDict(zip(saved_tensor_name, saved_tensors))
-        duvqk = torch.empty_like(saved_tensor_map["silu_input"])
+        input_rows = saved_tensor_map["input"].shape[0]
+        uvqk_dim = sum(ctx.split_arg_list)
+        duvqk = torch.empty(
+            (input_rows, uvqk_dim),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
         pre_du, pre_dv, pre_dq, pre_dk = duvqk.split(ctx.split_arg_list, dim=-1)
         with nvtx.annotate("hstu linear_residual bwd", color="YELLOW"):
             (
@@ -938,11 +955,38 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 wgrad_stream=ctx.wgrad_stream,
                 wgrad_event=ctx.wgrad_event,
             )
+        clear_tensor_data(saved_tensor_map["linear_proj_input"], clear_storage=True)
+        saved_tensor_map["linear_proj_input"] = None
+        recomputed_merged_logit = None
         if ctx.recompute_input_silu:
+            if saved_tensor_map["linear_uvqk_input"] is None:
+                (
+                    normed_input,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = triton_weighted_layer_norm_fwd(
+                    x=saved_tensor_map["input"],
+                    weight=saved_tensor_map["input_ln_weight"],
+                    bias=saved_tensor_map["input_ln_bias"],
+                    eps=ctx.eps,
+                    mean=saved_tensor_map["input_ln_mean"],
+                    rstd=saved_tensor_map["input_ln_rstd"],
+                )
+                saved_tensor_map["linear_uvqk_input"] = normed_input
+            addmm_silu_fwd_impl = _get_addmm_silu_fwd_impl(grad_output.device)
+            silu_input, _ = addmm_silu_fwd_impl(
+                x=saved_tensor_map["linear_uvqk_input"],
+                w=saved_tensor_map["linear_uvqk_weight"],
+                y=saved_tensor_map["linear_uvqk_bias"],
+                silu=False,
+            )
+            saved_tensor_map["silu_input"] = silu_input
             silu_input = saved_tensor_map["silu_input"]
-            merged_logit = torch.ops.aten.silu(silu_input)
+            recomputed_merged_logit = torch.ops.aten.silu(silu_input)
             # split does nothing
-            u, v, q, k = merged_logit.split(ctx.split_arg_list, dim=-1)
+            u, v, q, k = recomputed_merged_logit.split(ctx.split_arg_list, dim=-1)
             saved_tensor_map["u"] = u
             saved_tensor_map["v"] = v.view(
                 -1, ctx.num_heads, ctx.attention_dim_per_head
@@ -976,10 +1020,13 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 wait_event=ctx.wgrad_event,
                 du=pre_du,
             )
+        clear_tensor_data(saved_tensor_map["out_ln_input"], clear_storage=True)
+        saved_tensor_map["out_ln_input"] = None
         with nvtx.annotate("hstu attn bwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
+                attn_grad_output = grad_output
                 grad_q, grad_k, grad_v = _hstu_attn_cutlass_bwd(
-                    dout=grad_output.view(
+                    dout=attn_grad_output.view(
                         -1, ctx.num_heads, ctx.attention_dim_per_head
                     ),
                     q=saved_tensor_map["q"],
@@ -998,10 +1045,13 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     dk=pre_dk.view(-1, ctx.num_heads, ctx.attention_dim_per_head),
                     dv=pre_dv.view(-1, ctx.num_heads, ctx.attention_dim_per_head),
                 )
+                clear_tensor_data(attn_grad_output, clear_storage=True)
+                del attn_grad_output
                 grad_output = duvqk
             else:
+                attn_grad_output = grad_output
                 grad_q, grad_k, grad_v = _hstu_attn_triton_bwd(
-                    dout=grad_output.view(
+                    dout=attn_grad_output.view(
                         -1, ctx.num_heads, ctx.attention_dim_per_head
                     ),
                     q=saved_tensor_map["q"],
@@ -1014,6 +1064,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     alpha=ctx.alpha,
                     contextual_seq_len=ctx.contextual_seq_len,
                 )
+                clear_tensor_data(attn_grad_output, clear_storage=True)
+                del attn_grad_output
                 grad_q = grad_q.view(-1, ctx.num_heads * ctx.attention_dim_per_head)
                 grad_k = grad_k.view(-1, ctx.num_heads * ctx.attention_dim_per_head)
                 grad_v = grad_v.view(-1, ctx.num_heads * ctx.attention_dim_per_head)
@@ -1021,9 +1073,19 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output = torch.cat(
                     [grad_u, grad_v, grad_q, grad_k], dim=-1
                 ).contiguous()
+        if recomputed_merged_logit is not None:
+            saved_tensor_map["u"] = None
+            saved_tensor_map["v"] = None
+            saved_tensor_map["q"] = None
+            saved_tensor_map["k"] = None
+            clear_tensor_data(recomputed_merged_logit, clear_storage=True)
+            del recomputed_merged_logit
 
         with nvtx.annotate("ln_linear_silu bwd", color="RED"):
-            if ctx.recompute_input_layernorm:
+            if (
+                ctx.recompute_input_layernorm
+                and saved_tensor_map["linear_uvqk_input"] is None
+            ):
                 (
                     normed_input,
                     _,

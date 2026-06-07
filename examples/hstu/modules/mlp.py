@@ -38,6 +38,44 @@ except:
 from modules.utils import init_mlp_weights_optional_bias
 
 
+class LayerNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.bias = torch.nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        return torch.nn.functional.layer_norm(
+            x.to(torch.float32),
+            (x.shape[-1],),
+            self.weight.to(torch.float32),
+            self.bias.to(torch.float32),
+            self.eps,
+        ).to(dtype)
+
+
+class SwishLayerNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.bias = torch.nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x_float = x.to(torch.float32)
+        normalized = torch.nn.functional.layer_norm(
+            x_float,
+            (x_float.shape[-1],),
+            self.weight.to(torch.float32),
+            self.bias.to(torch.float32),
+            self.eps,
+        )
+        return (x_float * torch.sigmoid(normalized)).to(dtype)
+
+
 class MLP(BaseModule):  # type: ignore
     """
     Multi-Layer Perceptron (MLP) module wrapper for processing jagged data.
@@ -65,15 +103,26 @@ class MLP(BaseModule):  # type: ignore
         else:
             super(BaseModule, self).__init__()
 
+        activation = activation.lower()
         if activation == "relu":
             activation_fn = torch.nn.ReLU
         elif activation == "gelu":
             activation_fn = torch.nn.GELU
+        elif activation == "swish_layernorm":
+            activation_fn = SwishLayerNorm
         else:
             raise ValueError(f"Activation function {activation} not supported")
 
         layers = []
         for i in range(len(layer_sizes)):
+            if i < len(layer_sizes) - 1:
+                activation_layer = (
+                    activation_fn(layer_sizes[i])
+                    if activation == "swish_layernorm"
+                    else activation_fn()
+                )
+            else:
+                activation_layer = torch.nn.Identity()
             layers.extend(
                 [
                     torch.nn.Linear(
@@ -83,9 +132,7 @@ class MLP(BaseModule):  # type: ignore
                         device=device,
                         dtype=dtype,
                     ),
-                    activation_fn()
-                    if i < len(layer_sizes) - 1
-                    else torch.nn.Identity(),
+                    activation_layer,
                 ]
             )
 

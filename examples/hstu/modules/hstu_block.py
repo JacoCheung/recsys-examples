@@ -39,7 +39,12 @@ class HSTUBlock(MegatronModule):
             is_inference=config.is_inference,
         )  # sequence parallel is from config
         self._postprocessor = HSTUBlockPostprocessor(
-            is_inference=config.is_inference, sequence_parallel=config.sequence_parallel
+            is_inference=config.is_inference,
+            sequence_parallel=config.sequence_parallel,
+            normalize_output=not (
+                config.hstu_preprocessing_config is not None
+                and config.hstu_preprocessing_config.enable_yambda_action_encoder
+            ),
         )
 
         HSTULayerImpl = (

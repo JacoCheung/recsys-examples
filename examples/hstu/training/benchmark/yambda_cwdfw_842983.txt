@@ -1,0 +1,4 @@
+# Yambda 5B ranking run for cw-dfw.
+# submit_remote.sh sets nodes/ranks/time; the gin template keeps the
+# reference-aligned model/optimizer and the requested long train/eval schedule.
+yambda_5b_ranking_cwdfw_full,--template-file training/configs/yambda_5b_ranking_cwdfw_full.gin

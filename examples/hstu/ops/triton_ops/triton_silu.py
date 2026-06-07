@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import torch
 
 # torch 26.04 circular-import workaround for wrap_triton — do not remove
@@ -88,6 +90,29 @@ def _silu_backward(
     )
 
 
+@triton.jit
+def _silu_backward_fixed(
+    grad_input_ptr: tl.tensor,
+    grad_output_ptr: tl.tensor,
+    input_ptr: tl.tensor,
+    x_size: tl.int32,
+    x_block_size: tl.constexpr,
+):
+    x_offset = tl.program_id(0) * x_block_size
+    mask = x_offset + tl.arange(0, x_block_size) < x_size
+    grad_input_ptr += x_offset
+    grad_output_ptr += x_offset
+    input_ptr += x_offset
+    cols = tl.arange(0, x_block_size)
+    grad_output = tl.load(grad_output_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    input = tl.load(input_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    sigma = tl.sigmoid(input)
+    grad_input = grad_output * (sigma + input * sigma * (1 - sigma))
+    tl.store(
+        grad_input_ptr + cols, grad_input.to(grad_input_ptr.dtype.element_ty), mask=mask
+    )
+
+
 def triton_silu_fwd(input: torch.Tensor) -> torch.Tensor:
     x_size = input.numel()
     input_1d = input.view(-1).contiguous()
@@ -105,22 +130,40 @@ def triton_silu_fwd(input: torch.Tensor) -> torch.Tensor:
 
 
 # TODO: compare performance with torch.ops.aten.silu_backward
-def triton_silu_bwd(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+def triton_silu_bwd(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     shape = input.shape
     input_1d = input.view(-1).contiguous()
-    grad_input = torch.empty_like(input_1d)
     grad_output_1d = grad_output.view(-1).contiguous()
+    if out is None:
+        grad_input = torch.empty_like(input_1d)
+    else:
+        assert out.shape == shape, f"incompatible out shape {out.shape}, {shape}"
+        grad_input = out.view(-1)
     x_size = input.numel()
 
     def grid(meta):
         return (triton.cdiv(x_size, meta["x_block_size"]),)
 
-    _silu_backward[grid](
-        grad_input,
-        grad_output_1d,
-        input_1d,
-        input_1d.numel(),
-    )
+    if out is None:
+        _silu_backward[grid](
+            grad_input,
+            grad_output_1d,
+            input_1d,
+            input_1d.numel(),
+        )
+    else:
+        _silu_backward_fixed[grid](
+            grad_input,
+            grad_output_1d,
+            input_1d,
+            input_1d.numel(),
+            x_block_size=1024,
+            num_warps=4,
+        )
     return grad_input.view(shape)
 
 

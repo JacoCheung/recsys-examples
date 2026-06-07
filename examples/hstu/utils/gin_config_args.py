@@ -68,6 +68,7 @@ class TrainerArgs:
     ckpt_save_interval: int = -1  # -1 means not save ckpt
     ckpt_save_dir: str = "./checkpoints"
     ckpt_load_dir: str = ""
+    metrics_output_path: str = ""
 
     # overlap pipeline type
     # - none -> no overlap
@@ -224,6 +225,20 @@ class DatasetArgs:
     dataset_path: Optional[str] = None
     max_num_candidates: int = 0
     shuffle: bool = False
+    yambda_history_length: int = 2039
+    yambda_scan_window: int = 20000
+    yambda_max_train_samples: Optional[int] = None
+    yambda_max_eval_samples: Optional[int] = None
+    yambda_train_sample_start: int = 0
+    yambda_eval_sample_start: int = 0
+    yambda_train_window_ts: Optional[int] = None
+    yambda_eval_window_ts: Optional[int] = None
+    yambda_eval_shuffle: bool = False
+    yambda_streaming_window_seconds: int = 86400
+    yambda_streaming_sort_within_window: bool = False
+    yambda_cache_dir: Optional[str] = None
+    yambda_metadata_path: Optional[str] = None
+    yambda_disable_cross_features: bool = False
 
 
 @gin.configurable
@@ -377,6 +392,11 @@ class NetworkArgs:
 
     item_embedding_dim: int = -1
     contextual_embedding_dim: int = -1
+    enable_yambda_action_encoder: bool = False
+    yambda_action_embedding_dim: int = 8
+    yambda_action_mlp_hidden_dim: int = 256
+    yambda_num_contextual_features: int = 8
+    yambda_additional_embedding_dim: int = 1024
 
     scaling_seqlen: int = -1
     embedding_backend: Optional[str] = None
@@ -412,6 +432,13 @@ class OptimizerArgs:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
+    weight_decay: float = 0.0
+    sparse_optimizer_str: Optional[str] = None
+    sparse_learning_rate: Optional[float] = None
+    sparse_adam_beta1: Optional[float] = None
+    sparse_adam_beta2: Optional[float] = None
+    sparse_adam_eps: Optional[float] = None
+    sparse_weight_decay: Optional[float] = None
 
 
 @gin.configurable
@@ -443,7 +470,8 @@ class RankingArgs:
     Attributes:
         prediction_head_arch (List[int]): **Required**. Prediction head architecture
             (list of layer sizes). Default: None.
-        prediction_head_act_type (str): Prediction head activation type: "relu" or "gelu".
+        prediction_head_act_type (str): Prediction head activation type: "relu",
+            "gelu", or "swish_layernorm".
             Default: "relu".
         prediction_head_bias (bool): Whether to use bias in prediction head. Default: True.
         num_tasks (int): Number of tasks (for multi-task learning). Default: 1.
@@ -464,7 +492,8 @@ class RankingArgs:
             assert self.prediction_head_act_type.lower() in [
                 "relu",
                 "gelu",
-            ], "prediction_head_act_type should be in ['relu', 'gelu']"
+                "swish_layernorm",
+            ], "prediction_head_act_type should be in ['relu', 'gelu', 'swish_layernorm']"
         self.eval_metrics = tuple(metric.upper() for metric in self.eval_metrics)
         for metric in self.eval_metrics:
             assert metric in [

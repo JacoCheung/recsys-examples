@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import csv
 import os
 from itertools import chain, count, cycle, islice
 from typing import Iterator, Optional, Union
@@ -36,6 +37,50 @@ from modules.metrics import RetrievalTaskMetricWithSampling
 from utils import TrainerArgs
 
 
+def _metric_to_csv_value(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        if value.numel() == 1:
+            return value.item()
+        return value.cpu().tolist()
+    return value
+
+
+def _append_eval_metrics_csv(
+    trainer_args: TrainerArgs,
+    train_iter: Optional[int],
+    eval_iter: int,
+    eval_users: int,
+    eval_metric_dict,
+) -> None:
+    if trainer_args.metrics_output_path == "":
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    output_path = trainer_args.metrics_output_path
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    metric_items = {
+        str(k): _metric_to_csv_value(v) for k, v in eval_metric_dict.items()
+    }
+    row = {
+        "train_iter": -1 if train_iter is None else train_iter,
+        "eval_iter": eval_iter,
+        "eval_users": eval_users,
+        **metric_items,
+    }
+    fieldnames = ["train_iter", "eval_iter", "eval_users"] + sorted(metric_items)
+    write_header = not os.path.exists(output_path) or os.path.getsize(output_path) == 0
+    with open(output_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def evaluate(
     pipeline: Union[
         JaggedMegatronPrefetchTrainPipelineSparseDist,
@@ -45,6 +90,7 @@ def evaluate(
     stateful_metric_module: torch.nn.Module,
     trainer_args: TrainerArgs,
     eval_loader: torch.utils.data.DataLoader,
+    train_iter: Optional[int] = None,
 ):
     eval_iter = 0
     torch.cuda.nvtx.range_push(f"#evaluate")
@@ -79,9 +125,17 @@ def evaluate(
             eval_metric_dict = stateful_metric_module.compute()
         dp_size = parallel_state.get_data_parallel_world_size()
     # TODO, fix the samples when there is incomplete batch
+    eval_users = eval_iter * dp_size * trainer_args.eval_batch_size
     print_rank_0(
-        f"[eval] [eval {eval_iter * dp_size * trainer_args.eval_batch_size} users]:\n    "
+        f"[eval] [eval {eval_users} users]:\n    "
         + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
+    )
+    _append_eval_metrics_csv(
+        trainer_args,
+        train_iter=train_iter,
+        eval_iter=eval_iter,
+        eval_users=eval_users,
+        eval_metric_dict=eval_metric_dict,
     )
     torch.cuda.nvtx.range_pop()
 
@@ -284,5 +338,6 @@ def train_with_pipeline(
                 stateful_metric_module,
                 trainer_args=trainer_args,
                 eval_loader=eval_loader,
+                train_iter=train_iter,
             )
             pipeline._model.train()

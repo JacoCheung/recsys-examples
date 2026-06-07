@@ -5,6 +5,7 @@ from . import (
     random_inference_dataset,
     sid_random_dataset,
     sid_sequence_dataset,
+    yambda,
 )
 from .data_loader import get_data_loader
 
@@ -16,4 +17,5 @@ __all__ = [
     "hstu_batch",
     "sid_random_dataset",
     "sid_sequence_dataset",
+    "yambda",
 ]
