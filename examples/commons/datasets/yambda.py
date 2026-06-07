@@ -65,6 +65,8 @@ class YambdaHSTUBatch(HSTUBatch):
     )
     action_weights: Optional[KeyedJaggedTensor] = None
     action_weight_feature_name: str = "action_weight"
+    sequence_timestamps: Optional[KeyedJaggedTensor] = None
+    sequence_timestamp_feature_name: str = "sequence_timestamp"
 
 
 def _load_npy_readonly(path: Union[str, Path]) -> np.ndarray:
@@ -542,15 +544,16 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
 
     def _gather_history(
         self, flat_pos: int, user_start: int
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         per_pool = max(1, self._history_length // 3)
         scan_start = max(int(user_start), int(flat_pos) - self._scan_window)
         scan_end = int(flat_pos)
         if scan_end <= scan_start:
             empty = np.empty(0, dtype=np.int64)
-            return empty, empty, empty, empty
+            return empty, empty, empty, empty, empty
 
         item_ids = self._store.flat_item_ids[scan_start:scan_end]
+        timestamps = self._store.flat_timestamps[scan_start:scan_end]
         is_lp = self._store.flat_is_listen_plus[scan_start:scan_end]
         is_like = self._store.flat_is_like[scan_start:scan_end]
         is_skip = self._store.flat_is_skip[scan_start:scan_end]
@@ -565,33 +568,39 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
         )
         if keep_local.size == 0:
             empty = np.empty(0, dtype=np.int64)
-            return empty, empty, empty, empty
+            return empty, empty, empty, empty, empty
         keep_local = keep_local[np.argsort(keep_local, kind="stable")]
 
         items = np.clip(item_ids[keep_local], 0, ITEM_ID_NUM_EMBEDDINGS - 1).astype(
             np.int64, copy=False
         )
+        event_timestamps = timestamps[keep_local].astype(np.int64, copy=False)
         weights = np.zeros(keep_local.shape[0], dtype=np.int64)
         weights[is_lp[keep_local]] |= LP_BIT
         weights[is_like[keep_local]] |= LIKE_BIT
         weights[is_skip[keep_local]] |= SKIP_BIT
         if items.shape[0] > self._max_history_seqlen:
             items = items[-self._max_history_seqlen :]
+            event_timestamps = event_timestamps[-self._max_history_seqlen :]
             weights = weights[-self._max_history_seqlen :]
         artists = self._item_to_artist[items]
         albums = self._item_to_album[items]
-        return items, artists, albums, weights
+        return items, artists, albums, weights, event_timestamps
 
     def _build_sample(
         self, sample_id: int
-    ) -> Tuple[Dict[str, int], Dict[str, List[int]], List[int], int]:
+    ) -> Tuple[Dict[str, int], Dict[str, List[int]], List[int], List[int], int]:
         flat_pos = self._flat_pos(sample_id)
         uid = int(self._store.flat_uid[flat_pos])
         uid = max(0, min(uid, UID_NUM_EMBEDDINGS - 1))
         user_start = int(self._store.user_start[uid])
-        items, artists, albums, action_weights = self._gather_history(
-            flat_pos, user_start
-        )
+        (
+            items,
+            artists,
+            albums,
+            action_weights,
+            history_timestamps,
+        ) = self._gather_history(flat_pos, user_start)
 
         target_item = int(
             np.clip(self._store.flat_item_ids[flat_pos], 0, ITEM_ID_NUM_EMBEDDINGS - 1)
@@ -626,7 +635,14 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
             "artist_id": artists.tolist() + [target_artist],
             "album_id": albums.tolist() + [target_album],
         }
-        return contextual, sequence_features, action_weights.tolist(), label
+        sequence_timestamps = history_timestamps.tolist() + [target_ts]
+        return (
+            contextual,
+            sequence_features,
+            action_weights.tolist(),
+            sequence_timestamps,
+            label,
+        )
 
     def __iter__(self) -> Iterator[YambdaHSTUBatch]:
         rank_sample_ids = None
@@ -676,12 +692,15 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
             num_candidates: List[int] = []
             action_weight_values: List[int] = []
             action_weight_lengths: List[int] = []
+            sequence_timestamp_values: List[int] = []
+            sequence_timestamp_lengths: List[int] = []
 
             for sample_id in sample_ids:
                 (
                     contextual,
                     sequence_features,
                     action_weights,
+                    sequence_timestamps,
                     label,
                 ) = self._build_sample(int(sample_id))
                 for name in self._contextual_feature_names:
@@ -693,6 +712,8 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
                     lengths_by_key[name].append(len(seq))
                 action_weight_values.extend(action_weights)
                 action_weight_lengths.append(len(action_weights))
+                sequence_timestamp_values.extend(sequence_timestamps)
+                sequence_timestamp_lengths.append(len(sequence_timestamps))
                 labels.append(label)
                 num_candidates.append(1)
 
@@ -701,6 +722,7 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
                     lengths_by_key[name].extend([0] * pad_size)
             if pad_size > 0:
                 action_weight_lengths.extend([0] * pad_size)
+                sequence_timestamp_lengths.extend([0] * pad_size)
 
             keys = self._contextual_feature_names + self._sequence_feature_names
             feature_values = torch.tensor(
@@ -738,6 +760,15 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
                     action_weight_lengths, device=self._device, dtype=torch.int64
                 ),
             )
+            sequence_timestamps_kjt = KeyedJaggedTensor.from_lengths_sync(
+                keys=["sequence_timestamp"],
+                values=torch.tensor(
+                    sequence_timestamp_values, device=self._device, dtype=torch.int64
+                ),
+                lengths=torch.tensor(
+                    sequence_timestamp_lengths, device=self._device, dtype=torch.int64
+                ),
+            )
 
             yield YambdaHSTUBatch(
                 features=features,
@@ -753,6 +784,8 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
                 sequence_feature_names=list(self._sequence_feature_names),
                 action_weights=action_weights_kjt,
                 action_weight_feature_name="action_weight",
+                sequence_timestamps=sequence_timestamps_kjt,
+                sequence_timestamp_feature_name="sequence_timestamp",
             )
 
 

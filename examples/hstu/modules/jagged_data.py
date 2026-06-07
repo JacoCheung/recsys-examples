@@ -45,6 +45,7 @@ class JaggedData:
     seqlen_offsets: torch.Tensor  # (batch_size + 1)
 
     max_seqlen: int
+    timestamps: Optional[torch.Tensor] = None
 
     max_num_candidates: int = 0
     num_candidates: Optional[torch.Tensor] = None
@@ -194,6 +195,7 @@ class JaggedData:
             "values": self.values,
             "seqlen": self.seqlen,
             "seqlen_offsets": self.seqlen_offsets,
+            "timestamps": self.timestamps,
             "max_seqlen": self.max_seqlen,
             "max_num_candidates": self.max_num_candidates,
             "num_candidates": self.num_candidates,
@@ -239,6 +241,9 @@ class JaggedData:
             seqlen_offsets=self.seqlen_offsets.to(
                 device=device, non_blocking=non_blocking
             ),
+            timestamps=self.timestamps.to(device=device, non_blocking=non_blocking)
+            if self.timestamps is not None
+            else self.timestamps,
             max_seqlen=self.max_seqlen,
             max_num_candidates=self.max_num_candidates,
             num_candidates=self.num_candidates.to(
@@ -281,6 +286,8 @@ def pad_jd_values(jd: JaggedData, pad_base: int, dim=0) -> JaggedData:
     # Check if already aligned
     if length % pad_base == 0:
         output_jd = jd.copy_others_but_set_values(values=jd.values.clone())
+        if jd.timestamps is not None:
+            output_jd.timestamps = jd.timestamps.clone()
         return output_jd
     aligned_size = ((length + pad_base - 1) // pad_base) * pad_base
     values = jd.values
@@ -291,6 +298,10 @@ def pad_jd_values(jd: JaggedData, pad_base: int, dim=0) -> JaggedData:
             values, (0, 0, 0, aligned_size - length), "constant", 0
         )
     )
+    if jd.timestamps is not None:
+        output_jd.timestamps = torch.nn.functional.pad(
+            jd.timestamps, (0, aligned_size - length), "constant", 0
+        )
     output_jd.padding_length = aligned_size - length
     return output_jd
 
@@ -304,9 +315,13 @@ def unpad_jd_values(jd: JaggedData, dim=0) -> JaggedData:
     padding_length = jd.padding_length
     if padding_length == 0:
         output_jd = jd.copy_others_but_set_values(values=jd.values.clone())
+        if jd.timestamps is not None:
+            output_jd.timestamps = jd.timestamps.clone()
         return output_jd
     output_jd = jd.copy_others_but_set_values(
         values=jd.values[0 : jd.seqlen_offsets[-1], ...]
     )
+    if jd.timestamps is not None:
+        output_jd.timestamps = jd.timestamps[0 : jd.seqlen_offsets[-1]]
     output_jd.padding_length = 0
     return output_jd

@@ -80,7 +80,7 @@ def create_hstu_config(
     position_encoding_config = PositionEncodingConfig(
         num_position_buckets=network_args.num_position_buckets,
         num_time_buckets=2048,
-        use_time_encoding=False,
+        use_time_encoding=network_args.use_time_encoding,
     )
     if network_args.item_embedding_dim > 0 or network_args.contextual_embedding_dim > 0:
         hstu_preprocessing_config = HSTUPreprocessingConfig(

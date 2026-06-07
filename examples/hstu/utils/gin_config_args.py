@@ -383,6 +383,7 @@ class NetworkArgs:
             Default: "cutlass".
         target_group_size (int): Target group size. Default: 1.
         num_position_buckets (int): Number of position buckets. Default: 8192.
+        use_time_encoding (bool): Use timestamp positional embeddings. Default: False.
         recompute_input_layernorm (bool): Recompute input layer normalization. Default: False.
         recompute_input_silu (bool): Recompute input SiLU activation. Default: False.
         item_embedding_dim (int): Item embedding dimension. Default: -1.
@@ -407,6 +408,7 @@ class NetworkArgs:
     target_group_size: int = 1
 
     num_position_buckets: int = 8192
+    use_time_encoding: bool = False
 
     recompute_input_layernorm: bool = False
     recompute_input_silu: bool = False

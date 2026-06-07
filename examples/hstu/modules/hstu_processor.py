@@ -467,6 +467,16 @@ def hstu_preprocess_embeddings(
         num_candidates = batch.num_candidates
         max_num_candidates = batch.max_num_candidates
 
+    sequence_timestamps = None
+    sequence_timestamps_kjt = getattr(batch, "sequence_timestamps", None)
+    if sequence_timestamps_kjt is not None:
+        timestamp_feature_name = getattr(
+            batch, "sequence_timestamp_feature_name", "sequence_timestamp"
+        )
+        sequence_timestamps = (
+            sequence_timestamps_kjt[timestamp_feature_name].values().to(torch.int64)
+        )
+
     contextual_max_seqlen = 0
     contextual_seqlen = None
     contextual_seqlen_offsets = None
@@ -494,6 +504,21 @@ def hstu_preprocess_embeddings(
         contextual_max_seqlen = max(
             len(batch.contextual_feature_names), sum(contextual_max_seqlens)
         )
+        if sequence_timestamps is not None:
+            contextual_sequence_timestamps = torch.zeros(
+                (contextual_sequence_embeddings.size(0), 1),
+                device=sequence_timestamps.device,
+                dtype=sequence_timestamps.dtype,
+            )
+            sequence_timestamps, _ = jagged_2D_tensor_concat(
+                [
+                    contextual_sequence_timestamps,
+                    sequence_timestamps.unsqueeze(-1),
+                ],
+                [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
+                [contextual_max_seqlen, sequence_max_seqlen],
+            )
+            sequence_timestamps = sequence_timestamps.squeeze(-1)
         (
             sequence_embeddings,
             sequence_embeddings_lengths,
@@ -550,6 +575,7 @@ def hstu_preprocess_embeddings(
             torch.int32
         ),  # contextual + history + candidate
         seqlen_offsets=sequence_embeddings_lengths_offsets.to(torch.int32),
+        timestamps=sequence_timestamps,
         max_seqlen=sequence_max_seqlen,
         max_num_candidates=max_num_candidates,
         num_candidates=num_candidates.to(torch.int32)
@@ -727,11 +753,19 @@ class HSTUBlockPreprocessor(torch.nn.Module):
         if self._sequence_parallel:
             jd = pad_jd_values(jd, self._tp_size)
         if self._positional_encoder is not None:
+            if (
+                getattr(self._positional_encoder, "_use_time_encoding", False)
+                and jd.timestamps is None
+            ):
+                raise ValueError(
+                    "HSTU time positional encoding is enabled but batch sequence "
+                    "timestamps are missing"
+                )
             jd.values = self._positional_encoder(
                 max_seq_len=jd.max_seqlen,
                 seq_lengths=jd.seqlen,
                 seq_offsets=jd.seqlen_offsets,
-                seq_timestamps=None,
+                seq_timestamps=jd.timestamps,
                 seq_embeddings=jd.values,
                 num_targets=jd.num_candidates,
                 seq_start_position=seq_start_position,

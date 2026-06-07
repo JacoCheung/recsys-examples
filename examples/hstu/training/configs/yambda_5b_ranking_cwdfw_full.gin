@@ -44,6 +44,7 @@ NetworkArgs.hidden_size = 512
 NetworkArgs.kv_channels = 128
 NetworkArgs.target_group_size = 1
 NetworkArgs.num_position_buckets = 8192
+NetworkArgs.use_time_encoding = True
 NetworkArgs.item_embedding_dim = 512
 NetworkArgs.contextual_embedding_dim = 512
 NetworkArgs.enable_yambda_action_encoder = True
