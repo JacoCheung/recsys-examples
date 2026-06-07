@@ -4,7 +4,7 @@ TrainerArgs.log_interval = 50
 # Ignored by TrainerArgs.training_mode="yambda_streaming_train_eval".
 # Reference Yambda eval is window-based, not step-interval based.
 TrainerArgs.eval_interval = None
-TrainerArgs.max_train_iters = 842983
+TrainerArgs.max_train_iters = None
 TrainerArgs.max_eval_iters = None
 TrainerArgs.seed = 1234
 TrainerArgs.profile = False
