@@ -635,7 +635,15 @@ class YambdaDataset(IterableDataset[YambdaHSTUBatch]):
             "artist_id": artists.tolist() + [target_artist],
             "album_id": albums.tolist() + [target_album],
         }
-        sequence_timestamps = history_timestamps.tolist() + [target_ts]
+        # Match the reference Yambda path: the target query timestamp is the
+        # last history timestamp, falling back to the target timestamp only when
+        # the user has no history.
+        query_ts = (
+            int(history_timestamps[-1])
+            if history_timestamps.shape[0] > 0
+            else target_ts
+        )
+        sequence_timestamps = history_timestamps.tolist() + [query_ts]
         return (
             contextual,
             sequence_features,

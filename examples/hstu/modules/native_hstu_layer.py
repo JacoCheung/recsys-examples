@@ -59,7 +59,7 @@ class HSTULayer(MegatronModule):
         self._attention_dim_per_head: int = config.kv_channels
         self._eps = config.layernorm_epsilon
         # dropout on proj_linear
-        self._dropout_ratio: float = config.hidden_dropout
+        self._dropout_ratio: float = config.hstu_linear_dropout_rate
         # dropout on QK; not used now
         self._num_heads: int = config.num_attention_heads
         if self._tp_size > self._num_heads:

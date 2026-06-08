@@ -122,6 +122,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         wgrad_event: Optional[torch.cuda.Event] = None,
         recompute_input_layernorm: bool = False,
         recompute_input_silu: bool = False,
+        concat_ux_output: bool = False,
     ) -> torch.Tensor:
         """Forward pass of the fused HSTU layer.
         Args:
@@ -173,6 +174,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.wgrad_event = wgrad_event
         ctx.recompute_input_layernorm = recompute_input_layernorm
         ctx.recompute_input_silu = recompute_input_silu
+        ctx.concat_ux_output = concat_ux_output
         saved_tensor_map = OrderedDict()
         if attn_backend == KernelBackend.TRITON:
             if num_contextuals is None:
@@ -432,6 +434,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             dropout_ratio: float,
             training: bool,
             dropout_seed: Optional[int] = None,
+            concat_ux: bool = False,
         ):
             (
                 y,
@@ -448,7 +451,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 eps=eps,
                 dropout_ratio=dropout_ratio,
                 training=training,
-                concat_ux=False,
+                concat_ux=concat_ux,
                 seed=dropout_seed,
             )
 
@@ -554,6 +557,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 dropout_ratio=ctx.dropout_ratio,
                 training=ctx.training,
                 dropout_seed=seed,
+                concat_ux=ctx.concat_ux_output,
             )
         if ctx.recompute_input_silu:
             clear_tensor_data(tu, tq, tk, tv)
@@ -642,6 +646,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             seed: Optional[int] = None,
             wait_event: Optional[torch.cuda.Event] = None,
             du: Optional[torch.Tensor] = None,
+            concat_ux: bool = False,
         ):
             dx, du, dweight, dbias, _ = triton_layer_norm_mul_dropout_bwd(
                 dy=dy,
@@ -657,7 +662,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 training=training,
                 dropout_ratio=dropout_ratio,
                 seed=seed,
-                concat_ux=False,
+                concat_ux=concat_ux,
                 compute_y=False,
                 wait_event=wait_event,
                 du=du,
@@ -1019,6 +1024,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 seed=ctx.dropout_seed,
                 wait_event=ctx.wgrad_event,
                 du=pre_du,
+                concat_ux=ctx.concat_ux_output,
             )
         clear_tensor_data(saved_tensor_map["out_ln_input"], clear_storage=True)
         saved_tensor_map["out_ln_input"] = None

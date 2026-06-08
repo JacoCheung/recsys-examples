@@ -189,6 +189,77 @@ class YambdaContextualEmbeddingLinear(torch.nn.Module):
         return transformed.reshape(-1, self._bias.size(1))
 
 
+class YambdaTimestampLayerNormPostprocessor(torch.nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        time_duration_features: Tuple[Tuple[int, int], ...] = (
+            (60 * 60, 24),
+            (24 * 60 * 60, 7),
+        ),
+        eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self._layer_norm = torch.nn.LayerNorm(
+            normalized_shape=[embedding_dim],
+            eps=eps,
+        )
+        self.register_buffer(
+            "_period_units",
+            torch.tensor(
+                [f[0] for f in time_duration_features],
+                dtype=torch.float32,
+            ).view(1, -1),
+        )
+        self.register_buffer(
+            "_units_per_period",
+            torch.tensor(
+                [f[1] for f in time_duration_features],
+                dtype=torch.float32,
+            ).view(1, -1),
+        )
+        self._time_feature_combiner = torch.nn.Linear(
+            embedding_dim + 2 * len(time_duration_features),
+            embedding_dim,
+        ).apply(init_mlp_weights_optional_bias)
+
+    def _concat_time_features(
+        self,
+        embeddings: torch.Tensor,
+        timestamps: torch.Tensor,
+    ) -> torch.Tensor:
+        output_dtype = embeddings.dtype
+        units_since_epoch = torch.div(
+            timestamps.unsqueeze(-1).float(),
+            self._period_units,
+            rounding_mode="floor",
+        )
+        units_elapsed = (
+            torch.remainder(units_since_epoch, self._units_per_period)
+            / self._units_per_period
+            * 2
+            * 3.14
+        )
+        units_elapsed = torch.view_as_real(
+            torch.polar(
+                torch.ones_like(units_elapsed, dtype=torch.float32),
+                units_elapsed.to(torch.float32),
+            )
+        ).flatten(-2, -1)
+        return torch.cat([embeddings, units_elapsed.to(output_dtype)], dim=-1)
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        timestamps: torch.Tensor,
+    ) -> torch.Tensor:
+        combined = self._concat_time_features(embeddings, timestamps)
+        postprocessed = self._time_feature_combiner(
+            combined.to(self._time_feature_combiner.weight.dtype)
+        )
+        return self._layer_norm(postprocessed)
+
+
 class YambdaActionEncoder(torch.nn.Module):
     def __init__(
         self,
@@ -769,6 +840,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
                 seq_embeddings=jd.values,
                 num_targets=jd.num_candidates,
                 seq_start_position=seq_start_position,
+                max_contextual_seq_len=jd.contextual_max_seqlen,
             )
 
         jd.values = torch.nn.functional.dropout(
@@ -797,11 +869,13 @@ class HSTUBlockPostprocessor(torch.nn.Module):
         is_inference: bool,
         sequence_parallel: bool = False,
         normalize_output: bool = True,
+        timestamp_postprocessor: Optional[torch.nn.Module] = None,
     ):
         super().__init__()
         self._is_inference = is_inference
         self._sequence_parallel = sequence_parallel
         self._normalize_output = normalize_output
+        self._timestamp_postprocessor = timestamp_postprocessor
 
         if self._is_inference:
             self._sequence_parallel = False
@@ -821,6 +895,7 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             JaggedData: The postprocessed jagged data.
         """
         sequence_embeddings: torch.Tensor
+        sequence_timestamps: Optional[torch.Tensor] = None
         seqlen_offsets: torch.Tensor
         max_seqlen: int
         # the following compute is duplicated among TP ranks, we need to AG and remove the padding,
@@ -856,6 +931,16 @@ class HSTUBlockPostprocessor(torch.nn.Module):
                 seq_len_a=precomputed_a,
                 seq_len_b=precomputed_b,
             )
+            if jd.timestamps is not None:
+                _, sequence_timestamps_2d = triton_split_2D_jagged(
+                    jd.timestamps.unsqueeze(-1),
+                    jd.max_seqlen,
+                    offsets_a=jd.seqlen_offsets - jd.num_candidates_offsets,
+                    offsets_b=seqlen_offsets,
+                    seq_len_a=precomputed_a,
+                    seq_len_b=precomputed_b,
+                )
+                sequence_timestamps = sequence_timestamps_2d.squeeze(-1)
         elif jd.contextual_max_seqlen > 0:
             seqlen_offsets = jd.seqlen_offsets - jd.contextual_seqlen_offsets
             max_seqlen = jd.max_seqlen - jd.contextual_max_seqlen
@@ -867,19 +952,34 @@ class HSTUBlockPostprocessor(torch.nn.Module):
                 seq_len_a=precomputed_a,
                 seq_len_b=precomputed_b,
             )
+            if jd.timestamps is not None:
+                _, sequence_timestamps_2d = triton_split_2D_jagged(
+                    jd.timestamps.unsqueeze(-1),
+                    jd.max_seqlen,
+                    offsets_a=jd.contextual_seqlen_offsets,
+                    offsets_b=seqlen_offsets,
+                    seq_len_a=precomputed_a,
+                    seq_len_b=precomputed_b,
+                )
+                sequence_timestamps = sequence_timestamps_2d.squeeze(-1)
         else:
             sequence_embeddings = jd.values
+            sequence_timestamps = jd.timestamps
             seqlen_offsets = jd.seqlen_offsets
             max_seqlen = jd.max_seqlen
 
         if jd.has_interleaved_action and not self._is_inference:
             if not torch.compiler.is_compiling():
                 sequence_embeddings = sequence_embeddings[0::2, ...]
+                if sequence_timestamps is not None:
+                    sequence_timestamps = sequence_timestamps[0::2]
             else:
                 sequence_embeddings = sequence_embeddings.view(
                     sequence_embeddings.size(0) // 2, 2, -1
                 )
                 sequence_embeddings = sequence_embeddings[:, 0, ...]
+                if sequence_timestamps is not None:
+                    sequence_timestamps = sequence_timestamps.view(-1, 2)[:, 0]
             seqlen_offsets = seqlen_offsets // 2
             max_seqlen = max_seqlen // 2
 
@@ -887,9 +987,19 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             sequence_embeddings = sequence_embeddings / torch.linalg.norm(
                 sequence_embeddings, ord=2, dim=-1, keepdim=True
             ).clamp(min=1e-6)
+        if self._timestamp_postprocessor is not None:
+            if sequence_timestamps is None:
+                raise ValueError(
+                    "Yambda timestamp postprocessor is enabled but timestamps are missing"
+                )
+            sequence_embeddings = self._timestamp_postprocessor(
+                sequence_embeddings,
+                sequence_timestamps,
+            )
 
         return JaggedData(
             values=sequence_embeddings,
+            timestamps=sequence_timestamps,
             seqlen=torch.diff(seqlen_offsets).to(jd.seqlen.dtype),
             seqlen_offsets=seqlen_offsets.to(jd.seqlen_offsets.dtype),
             max_seqlen=max_seqlen,

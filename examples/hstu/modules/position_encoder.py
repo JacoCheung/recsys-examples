@@ -107,6 +107,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
         num_targets: Optional[torch.Tensor],
         seq_timestamps: Optional[torch.Tensor] = None,
         seq_start_position: Optional[torch.Tensor] = None,
+        max_contextual_seq_len: int = 0,
     ) -> torch.Tensor:
         alpha = self._embedding_dim**0.5
         if self._use_time_encoding:
@@ -118,7 +119,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
                 ts_embeddings=self._timestamp_embeddings_weight,
                 timestamps=seq_timestamps,
                 max_seq_len=max_seq_len,
-                max_contextual_seq_len=0,
+                max_contextual_seq_len=max_contextual_seq_len,
                 seq_lengths=seq_lengths,
                 num_targets=num_targets,
                 interleave_targets=False,

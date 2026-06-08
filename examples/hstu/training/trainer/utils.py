@@ -100,6 +100,7 @@ def create_hstu_config(
         num_attention_heads=network_args.num_attention_heads,
         num_layers=network_args.num_layers,
         hidden_dropout=network_args.hidden_dropout,
+        hstu_linear_dropout_rate=network_args.hstu_linear_dropout_rate,
         norm_epsilon=network_args.norm_epsilon,
         is_causal=network_args.is_causal,
         dtype=dtype,
@@ -112,6 +113,7 @@ def create_hstu_config(
         recompute_input_silu=network_args.recompute_input_silu,
         scaling_seqlen=network_args.scaling_seqlen,
         disable_contextual_mask=network_args.disable_contextual_mask,
+        hstu_concat_ux_output=network_args.hstu_concat_ux_output,
     )
 
 

@@ -138,6 +138,8 @@ class HSTUConfig(TransformerConfig):
     fuse_norm_mul_dropout: bool = True
     scaling_seqlen: int = -1
     disable_contextual_mask: bool = False
+    hstu_linear_dropout_rate: float = 0.2
+    hstu_concat_ux_output: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -169,6 +171,8 @@ def get_hstu_config(
     fuse_norm_mul_dropout: bool = True,
     scaling_seqlen: int = -1,
     disable_contextual_mask: bool = False,
+    hstu_linear_dropout_rate: float = 0.2,
+    hstu_concat_ux_output: bool = False,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -182,6 +186,7 @@ def get_hstu_config(
         hstu_preprocessing_config (Optional[HSTUPreprocessingConfig], optional): HSTU preprocessing config. Defaults to None.
         position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.
         hidden_dropout (float, optional): Dropout rate for hidden layers. Defaults to 0.2.
+        hstu_linear_dropout_rate (float, optional): Dropout rate for the HSTU output projection. Defaults to 0.2.
         norm_epsilon (float, optional): Epsilon value for normalization. Defaults to 1e-5.
         is_causal (bool, optional): Whether the attention is causal. Defaults to False.
         kernel_backend (KernelBackend, optional): Backend for kernel operations. Defaults to KernelBackend.CUTLASS.
@@ -246,4 +251,6 @@ def get_hstu_config(
         fuse_norm_mul_dropout=fuse_norm_mul_dropout,
         scaling_seqlen=scaling_seqlen,
         disable_contextual_mask=disable_contextual_mask,
+        hstu_linear_dropout_rate=hstu_linear_dropout_rate,
+        hstu_concat_ux_output=hstu_concat_ux_output,
     )

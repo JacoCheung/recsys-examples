@@ -375,7 +375,8 @@ class NetworkArgs:
         hidden_size (int): **Required**. Hidden layer size.
         num_attention_heads (int): **Required**. Number of attention heads.
         kv_channels (int): **Required**. Key-value channels.
-        hidden_dropout (float): Hidden layer dropout rate. Default: 0.2.
+        hidden_dropout (float): Input/preprocessor dropout rate. Default: 0.2.
+        hstu_linear_dropout_rate (float): HSTU output projection dropout rate. Default: 0.2.
         norm_epsilon (float): Normalization epsilon. Default: 1e-5.
         is_causal (bool): Use causal attention mask. Default: True.
         dtype_str (str): Data type: "bfloat16" or "float16". Default: "bfloat16".
@@ -391,6 +392,7 @@ class NetworkArgs:
         scaling_seqlen (int): Scaling sequence length. By default, the max sequence length in the batch is used. Default: -1.
         embedding_backend (str): Embedding backend. Default: None.
         disable_contextual_mask (bool): Whether to disable contextual mask. Default: False.
+        hstu_concat_ux_output (bool): Whether to project concatenated [u, x, norm(attn) * u]. Default: False.
     """
 
     num_layers: int
@@ -399,6 +401,7 @@ class NetworkArgs:
     kv_channels: int
 
     hidden_dropout: float = 0.2
+    hstu_linear_dropout_rate: float = 0.2
     norm_epsilon: float = 1e-5
     is_causal: bool = True
 
@@ -425,6 +428,7 @@ class NetworkArgs:
     embedding_backend: Optional[str] = None
 
     disable_contextual_mask: bool = False
+    hstu_concat_ux_output: bool = False
 
     def __post_init__(self):
         assert self.dtype_str in [

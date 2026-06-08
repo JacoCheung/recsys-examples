@@ -9,7 +9,11 @@ from configs.hstu_config import HSTUConfig, HSTULayerType
 from megatron.core.transformer.module import MegatronModule
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
-from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
+from modules.hstu_processor import (
+    HSTUBlockPostprocessor,
+    HSTUBlockPreprocessor,
+    YambdaTimestampLayerNormPostprocessor,
+)
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
 from torchrec.sparse.jagged_tensor import JaggedTensor
@@ -38,12 +42,18 @@ class HSTUBlock(MegatronModule):
             config,
             is_inference=config.is_inference,
         )  # sequence parallel is from config
+        is_yambda_reference_preprocessor = (
+            config.hstu_preprocessing_config is not None
+            and config.hstu_preprocessing_config.enable_yambda_action_encoder
+        )
         self._postprocessor = HSTUBlockPostprocessor(
             is_inference=config.is_inference,
             sequence_parallel=config.sequence_parallel,
-            normalize_output=not (
-                config.hstu_preprocessing_config is not None
-                and config.hstu_preprocessing_config.enable_yambda_action_encoder
+            normalize_output=not is_yambda_reference_preprocessor,
+            timestamp_postprocessor=(
+                YambdaTimestampLayerNormPostprocessor(config.hidden_size)
+                if is_yambda_reference_preprocessor
+                else None
             ),
         )
 

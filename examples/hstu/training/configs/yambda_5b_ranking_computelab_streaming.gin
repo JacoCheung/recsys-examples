@@ -14,7 +14,7 @@ TrainerArgs.enable_balanced_shuffler = False
 TrainerArgs.yambda_streaming_start_ts = 150
 TrainerArgs.yambda_streaming_num_train_ts = 149
 TrainerArgs.yambda_streaming_eval_each_window = True
-TrainerArgs.yambda_streaming_eval_every_n_windows = 5
+TrainerArgs.yambda_streaming_eval_every_n_windows = 1
 TrainerArgs.yambda_streaming_num_train_batches = 0
 TrainerArgs.yambda_streaming_num_eval_batches = 0
 
@@ -36,6 +36,8 @@ DatasetArgs.yambda_disable_cross_features = False
 
 NetworkArgs.dtype_str = "bfloat16"
 NetworkArgs.kernel_backend = "cutlass"
+NetworkArgs.hidden_dropout = 0.2
+NetworkArgs.hstu_linear_dropout_rate = 0.1
 NetworkArgs.recompute_input_layernorm = True
 NetworkArgs.recompute_input_silu = True
 NetworkArgs.num_layers = 5
@@ -52,7 +54,8 @@ NetworkArgs.yambda_action_embedding_dim = 8
 NetworkArgs.yambda_action_mlp_hidden_dim = 256
 NetworkArgs.yambda_num_contextual_features = 8
 NetworkArgs.yambda_additional_embedding_dim = 1024
-NetworkArgs.disable_contextual_mask = False
+NetworkArgs.disable_contextual_mask = True
+NetworkArgs.hstu_concat_ux_output = True
 
 RankingArgs.prediction_head_arch = [512, 1]
 RankingArgs.prediction_head_act_type = "swish_layernorm"

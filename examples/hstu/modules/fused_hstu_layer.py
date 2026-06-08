@@ -49,7 +49,7 @@ class FusedHSTULayer(MegatronModule):
         # dropout
         self._seed = None
         # dropout on proj_linear output
-        self._dropout_ratio: float = config.hidden_dropout
+        self._dropout_ratio: float = config.hstu_linear_dropout_rate
         # dropout on QK; not used now
         self._num_heads: int = config.num_attention_heads
 
@@ -59,6 +59,7 @@ class FusedHSTULayer(MegatronModule):
         self._alpha = 1.0 / (self._attention_dim_per_head**0.5)
         self._residual = config.residual
         self._attn_backend = config.kernel_backend
+        self._concat_ux_output = config.hstu_concat_ux_output
 
         # stream and event are shared across all layers
         self._wgrad_stream = config.async_wgrad_stream
@@ -104,10 +105,13 @@ class FusedHSTULayer(MegatronModule):
         )
 
         # linear_proj no bias
+        linear_proj_input_dim = self._linear_dim_per_head * self._num_heads
+        if self._concat_ux_output:
+            linear_proj_input_dim *= 3
         self._linear_proj_weight = torch.nn.Parameter(
             torch.empty(
                 (
-                    self._linear_dim_per_head * self._num_heads,
+                    linear_proj_input_dim,
                     self._embedding_dim,
                 )
             )
@@ -160,5 +164,6 @@ class FusedHSTULayer(MegatronModule):
             wgrad_event=self._wgrad_event,
             recompute_input_layernorm=self._recompute_input_layernorm,
             recompute_input_silu=self._recompute_input_silu,
+            concat_ux_output=self._concat_ux_output,
         )
         return jd.copy_others_but_set_values(values=output)
