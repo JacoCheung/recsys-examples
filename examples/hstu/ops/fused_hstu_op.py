@@ -1163,6 +1163,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -1200,6 +1201,7 @@ def fused_hstu_op(
     wgrad_event: Optional[torch.cuda.Event] = None,
     recompute_input_layernorm: bool = False,
     recompute_input_silu: bool = False,
+    concat_ux_output: bool = False,
 ):
     out = FusedHSTULayerFunction.apply(
         input,
@@ -1231,6 +1233,7 @@ def fused_hstu_op(
         wgrad_event,
         recompute_input_layernorm,
         recompute_input_silu,
+        concat_ux_output,
     )
 
     return out
