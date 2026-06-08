@@ -93,6 +93,7 @@ class TrainerArgs:
     yambda_streaming_eval_every_n_windows: int = 1
     yambda_streaming_num_train_batches: Optional[int] = None
     yambda_streaming_num_eval_batches: Optional[int] = None
+    yambda_streaming_ckpt_save_every_n_windows: int = 0
 
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
@@ -104,6 +105,10 @@ class TrainerArgs:
         if isinstance(self.yambda_streaming_num_eval_batches, str):
             self.yambda_streaming_num_eval_batches = int(
                 self.yambda_streaming_num_eval_batches
+            )
+        if isinstance(self.yambda_streaming_ckpt_save_every_n_windows, str):
+            self.yambda_streaming_ckpt_save_every_n_windows = int(
+                self.yambda_streaming_ckpt_save_every_n_windows
             )
 
 

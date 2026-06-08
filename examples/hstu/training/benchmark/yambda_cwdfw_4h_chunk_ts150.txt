@@ -1,0 +1,8 @@
+# First 4h-only checkpointed Yambda chunk.
+# This keeps the reference-aligned model/eval template and only limits the
+# streaming TS span so the job can save a checkpoint before the 4h wall time.
+#
+# Continue with the next chunk by setting:
+#   TrainerArgs.yambda_streaming_start_ts = streaming_state["next_train_ts"]
+#   TrainerArgs.ckpt_load_dir = <previous checkpoint path>
+yambda_5b_ranking_cwdfw_4h_ts150,--template-file training/configs/yambda_5b_ranking_cwdfw_full.gin --set TrainerArgs.ckpt_save_interval=-1 --set TrainerArgs.ckpt_save_dir="/lustre/fsw/portfolios/coreai/users/junzhang/checkpoints/yambda_hstu_ref_16n" --set TrainerArgs.yambda_streaming_num_train_ts=12 --set TrainerArgs.yambda_streaming_ckpt_save_every_n_windows=12

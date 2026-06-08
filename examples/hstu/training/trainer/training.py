@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import csv
+import json
 import os
 from itertools import chain, count, cycle, islice
 from typing import Any, Dict, Iterator, Optional, Union
@@ -156,6 +157,35 @@ def _positive_or_none(value: Optional[int]) -> Optional[int]:
     if value is None or value <= 0:
         return None
     return value
+
+
+def _write_yambda_streaming_state(
+    ckpt_path: str,
+    *,
+    start_ts: int,
+    configured_num_train_ts: int,
+    window_index: int,
+    completed_train_ts: int,
+    eval_ts: Optional[int],
+    global_train_iter: int,
+) -> None:
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    state_path = os.path.join(ckpt_path, "streaming_state.json")
+    state = {
+        "start_ts": start_ts,
+        "configured_num_train_ts": configured_num_train_ts,
+        "window_index": window_index,
+        "completed_train_ts": completed_train_ts,
+        "next_train_ts": completed_train_ts + 1,
+        "eval_ts": eval_ts,
+        "global_train_iter": global_train_iter,
+    }
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print_rank_0(f"[yambda_streaming_train_eval] wrote state {state_path}")
 
 
 def _log_train_step(
@@ -345,6 +375,7 @@ def train_yambda_streaming_with_pipeline(
         trainer_args.yambda_streaming_num_train_batches
     )
     max_eval_batches = _positive_or_none(trainer_args.yambda_streaming_num_eval_batches)
+    ckpt_save_every_n_windows = trainer_args.yambda_streaming_ckpt_save_every_n_windows
 
     if hasattr(train_dataset, "num_windows"):
         available_windows = train_dataset.num_windows()
@@ -363,7 +394,8 @@ def train_yambda_streaming_with_pipeline(
         f"start_ts={start_ts}, num_train_ts={num_train_ts}, "
         f"eval_each_window={eval_each_window}, eval_every_n_windows={eval_every}, "
         f"num_train_batches={max_train_batches or 'full'}, "
-        f"num_eval_batches={max_eval_batches or 'full'}"
+        f"num_eval_batches={max_eval_batches or 'full'}, "
+        f"ckpt_save_every_n_windows={ckpt_save_every_n_windows}"
     )
     pipeline._model.train()
     _warm_up_data_parallel_collective()
@@ -401,6 +433,7 @@ def train_yambda_streaming_with_pipeline(
             or window_index % eval_every == 0
             or window_index == num_train_ts - 1
         )
+        eval_ts = None
         if should_eval:
             eval_ts = train_ts + 1
             eval_dataset.set_window(
@@ -430,6 +463,23 @@ def train_yambda_streaming_with_pipeline(
                 },
             )
             pipeline._model.train()
+
+        should_save_ckpt = ckpt_save_every_n_windows > 0 and (
+            (window_index + 1) % ckpt_save_every_n_windows == 0
+            or window_index == num_train_ts - 1
+        )
+        if should_save_ckpt:
+            save_path = os.path.join(trainer_args.ckpt_save_dir, f"yambda_ts{train_ts}")
+            save_ckpts(save_path, pipeline._model, dense_optimizer)
+            _write_yambda_streaming_state(
+                save_path,
+                start_ts=start_ts,
+                configured_num_train_ts=num_train_ts,
+                window_index=window_index,
+                completed_train_ts=train_ts,
+                eval_ts=eval_ts,
+                global_train_iter=global_train_iter,
+            )
 
 
 def maybe_load_ckpts(
@@ -466,6 +516,7 @@ def save_ckpts(
             raise Exception("can't build path:", ckpt_save_dir) from e
     dist.barrier(device_ids=[torch.cuda.current_device()])
     checkpoint.save(ckpt_save_dir, model, dense_optimizer=dense_optimizer)
+    dist.barrier(device_ids=[torch.cuda.current_device()])
     print_rank_0(f"Checkpoints saved!!")
 
 
