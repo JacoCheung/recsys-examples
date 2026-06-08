@@ -1,0 +1,5 @@
+# Yambda 5B cw-dfw nsys profile.
+# submit_remote.sh supplies --nsys so slurm_job.sub wraps each rank with:
+#   nsys profile -c cudaProfilerApi ...
+# TrainerArgs.profile starts/stops the CUDA profiler API range.
+yambda_5b_ranking_cwdfw_nsys_1000_1050_1060,--template-file training/configs/yambda_5b_ranking_cwdfw_full.gin --set TrainerArgs.profile=True --set TrainerArgs.profile_step_start=1000 --set TrainerArgs.profile_step_end=1050 --set TrainerArgs.max_train_iters=1060 --set TrainerArgs.yambda_streaming_eval_each_window=False --set TrainerArgs.yambda_streaming_num_train_ts=2 --set TrainerArgs.ckpt_save_interval=-1 --set TrainerArgs.yambda_streaming_ckpt_save_every_n_windows=0
