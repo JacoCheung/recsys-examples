@@ -152,8 +152,10 @@ class FusedHSTULayer(MegatronModule):
             # attn related
             attn_backend=self._attn_backend,
             num_targets=jd.num_candidates,
-            num_contextuals=jd.contextual_seqlen
-            if not self._disable_contextual_mask
+            # Debug ablation: keep contextual tokens in the sequence, but tell
+            # the fused attention kernel that there are zero contextual tokens.
+            num_contextuals=torch.zeros_like(jd.contextual_seqlen)
+            if jd.contextual_seqlen is not None
             else None,
             target_group_size=self._target_group_size,
             alpha=self._alpha,

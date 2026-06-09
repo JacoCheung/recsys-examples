@@ -1,0 +1,3 @@
+# Yambda 5B cw-dfw debug ablation.
+# Code branch forces fused HSTU kernel-level num_contextuals to zero.
+yambda_5b_ranking_cwdfw_numctx0,--template-file training/configs/yambda_5b_ranking_cwdfw_full.gin --set TrainerArgs.yambda_streaming_eval_every_n_windows=5 --set TrainerArgs.ckpt_save_interval=-1 --set TrainerArgs.yambda_streaming_ckpt_save_every_n_windows=0
