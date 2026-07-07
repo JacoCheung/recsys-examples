@@ -31,6 +31,7 @@ Usage (run from examples/hstu/):
         --seqlens 128,256,512,1024,2048,4096,8192,16384 \\
         --phase fwd,bwd,e2e \\
         --warmup-iters 10 --bench-iters 50 \\
+        --timing-mode aggregate \\
         --profiler-start-iter 0 --profiler-stop-iter -1 \\
         --cuda-graph
 
@@ -47,10 +48,12 @@ are read from the gin-config file.
 
 import argparse
 import contextlib
+import inspect
 import json
 import os
 import statistics
 import warnings
+from typing import Callable
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
@@ -68,6 +71,7 @@ import torch
 # even when the config file contains bindings for unrelated classes.
 import utils.gin_config_args as _gin_args  # noqa: F401
 from commons.utils.perf import _compute_attn_fwd_flops, get_current_device_spec
+from commons.utils.nvtx_op import nvtx_hooks_enabled
 from configs.hstu_config import KernelBackend
 from modules.hstu_attention import create_hstu_attention
 from utils.gin_config_args import NetworkArgs
@@ -82,6 +86,7 @@ PHASE_LABELS = {
     "e2e": "End-to-End",
 }
 ALL_PHASES = tuple(PHASE_LABELS)
+TIMING_MODES = ("per-iter", "aggregate")
 
 
 def _parse_phases(value: str) -> tuple[str, ...]:
@@ -104,16 +109,29 @@ def _make_uniform_offsets(
     return torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen
 
 
+def _get_unwrapped_attention_forward(
+    attn_module: torch.nn.Module,
+) -> Callable[..., torch.Tensor]:
+    """Bypass benchmark-external module and NVTX autograd hooks."""
+    raw_forward = inspect.unwrap(type(attn_module).forward)
+    return raw_forward.__get__(attn_module, type(attn_module))
+
+
 def _make_cuda_events(
     bench_iters: int,
+    timing_mode: str,
 ) -> list[tuple[torch.cuda.Event, torch.cuda.Event]]:
     """Allocate and eagerly initialize CUDA events before a timed loop."""
+    if timing_mode not in TIMING_MODES:
+        raise ValueError(f"Unsupported timing mode: {timing_mode}")
+
+    event_pair_count = bench_iters if timing_mode == "per-iter" else 1
     events = [
         (
             torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True),
         )
-        for _ in range(bench_iters)
+        for _ in range(event_pair_count)
     ]
     # torch.cuda.Event creates its underlying cudaEvent_t lazily on first use.
     # Record every event once so cudaEventCreateWithFlags stays outside profiling.
@@ -122,6 +140,40 @@ def _make_cuda_events(
         end.record()
     torch.cuda.synchronize()
     return events
+
+
+def _record_timing_start(
+    events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    iter_idx: int,
+    timing_mode: str,
+) -> None:
+    if timing_mode == "per-iter":
+        events[iter_idx][0].record()
+    elif iter_idx == 0:
+        events[0][0].record()
+
+
+def _record_timing_end(
+    events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    iter_idx: int,
+    bench_iters: int,
+    timing_mode: str,
+) -> None:
+    if timing_mode == "per-iter":
+        events[iter_idx][1].record()
+    elif iter_idx == bench_iters - 1:
+        events[0][1].record()
+
+
+def _summarize_cuda_time(
+    events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    bench_iters: int,
+    timing_mode: str,
+) -> float:
+    if timing_mode == "aggregate":
+        start, end = events[0]
+        return start.elapsed_time(end) / bench_iters
+    return statistics.median(start.elapsed_time(end) for start, end in events)
 
 
 def _profiler_start_if_needed(iter_idx: int, profiler_start_iter: int) -> None:
@@ -139,20 +191,21 @@ def _profiler_stop_if_needed(iter_idx: int, profiler_stop_iter: int) -> None:
 def _time_cuda_graph(
     graph: torch.cuda.CUDAGraph,
     bench_iters: int,
+    timing_mode: str,
     profiler_start_iter: int,
     profiler_stop_iter: int,
 ) -> float:
-    """Return the median CUDA event time in milliseconds for graph replay."""
-    events = _make_cuda_events(bench_iters)
-    for iter_idx, (start, end) in enumerate(events):
+    """Return the per-replay CUDA event time in milliseconds."""
+    events = _make_cuda_events(bench_iters, timing_mode)
+    for iter_idx in range(bench_iters):
         _profiler_start_if_needed(iter_idx, profiler_start_iter)
-        start.record()
+        _record_timing_start(events, iter_idx, timing_mode)
         graph.replay()
-        end.record()
+        _record_timing_end(events, iter_idx, bench_iters, timing_mode)
         _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
 
     torch.cuda.synchronize()
-    return statistics.median(start.elapsed_time(end) for start, end in events)
+    return _summarize_cuda_time(events, bench_iters, timing_mode)
 
 
 @contextlib.contextmanager
@@ -174,7 +227,7 @@ def _cutlass_current_stream_for_capture():
 
 def _capture_and_time_cuda_graph(
     phase: str,
-    attn_module: torch.nn.Module,
+    attn_fn: Callable[..., torch.Tensor],
     tq: torch.Tensor,
     tk: torch.Tensor,
     tv: torch.Tensor,
@@ -182,10 +235,11 @@ def _capture_and_time_cuda_graph(
     seqlen: int,
     grad_output: torch.Tensor,
     bench_iters: int,
+    timing_mode: str,
     profiler_start_iter: int,
     profiler_stop_iter: int,
 ) -> float:
-    """Capture one benchmark phase and return its median replay time."""
+    """Capture one benchmark phase and return its per-replay time."""
     requires_grad = phase != "fwd"
     static_tq = tq.detach().requires_grad_(requires_grad)
     static_tk = tk.detach().requires_grad_(requires_grad)
@@ -196,7 +250,7 @@ def _capture_and_time_cuda_graph(
     with _cutlass_current_stream_for_capture():
         if phase == "bwd":
             with torch.cuda.stream(capture_stream):
-                static_out = attn_module(
+                static_out = attn_fn(
                     static_tq, static_tk, static_tv, offsets, seqlen, seqlen
                 )
             capture_stream.synchronize()
@@ -204,31 +258,49 @@ def _capture_and_time_cuda_graph(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_stream):
             if phase == "fwd":
-                static_out = attn_module(
+                static_out = attn_fn(
                     static_tq, static_tk, static_tv, offsets, seqlen, seqlen
                 )
             elif phase == "bwd":
-                static_out.backward(grad_output, retain_graph=True)
+                static_grads = torch.autograd.grad(
+                    static_out,
+                    (static_tq, static_tk, static_tv),
+                    grad_outputs=grad_output,
+                    retain_graph=True,
+                )
             elif phase == "e2e":
-                static_out = attn_module(
+                static_out = attn_fn(
                     static_tq, static_tk, static_tv, offsets, seqlen, seqlen
                 )
-                static_out.backward(grad_output)
+                static_grads = torch.autograd.grad(
+                    static_out,
+                    (static_tq, static_tk, static_tv),
+                    grad_outputs=grad_output,
+                )
             else:
                 raise ValueError(f"Unsupported CUDA graph benchmark phase: {phase}")
 
     torch.cuda.current_stream().wait_stream(capture_stream)
     torch.cuda.synchronize()
-    return _time_cuda_graph(
+
+    # Exclude first-launch graph setup and upload costs from benchmark timing.
+    graph.replay()
+    torch.cuda.synchronize()
+
+    phase_time = _time_cuda_graph(
         graph,
         bench_iters,
+        timing_mode,
         profiler_start_iter,
         profiler_stop_iter,
     )
+    if phase != "fwd":
+        del static_grads
+    return phase_time
 
 
 def _benchmark_one(
-    attn_module: torch.nn.Module,
+    attn_fn: Callable[..., torch.Tensor],
     batch_size: int,
     seqlen: int,
     num_heads: int,
@@ -238,6 +310,7 @@ def _benchmark_one(
     dtype: torch.dtype,
     warmup_iters: int = 10,
     bench_iters: int = 50,
+    timing_mode: str = "per-iter",
     use_cuda_graph: bool = False,
     phases: tuple[str, ...] = ALL_PHASES,
     profiler_start_iter: int = 0,
@@ -279,9 +352,13 @@ def _benchmark_one(
         tq.requires_grad_(warmup_backward)
         tk.requires_grad_(warmup_backward)
         tv.requires_grad_(warmup_backward)
-        out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
+        out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
         if warmup_backward:
-            out.backward(grad_output)
+            torch.autograd.grad(
+                out,
+                (tq, tk, tv),
+                grad_outputs=grad_output,
+            )
             tq = tq.detach()
             tk = tk.detach()
             tv = tv.detach()
@@ -292,7 +369,7 @@ def _benchmark_one(
         for phase in phases:
             phase_times[phase] = _capture_and_time_cuda_graph(
                 phase,
-                attn_module,
+                attn_fn,
                 tq,
                 tk,
                 tv,
@@ -300,64 +377,87 @@ def _benchmark_one(
                 seqlen,
                 grad_output,
                 bench_iters,
+                timing_mode,
                 profiler_start_iter,
                 profiler_stop_iter,
             )
     else:
         if "fwd" in phases:
-            fwd_events = _make_cuda_events(bench_iters)
+            fwd_events = _make_cuda_events(bench_iters, timing_mode)
             tq = tq.detach()
             tk = tk.detach()
             tv = tv.detach()
-            for iter_idx, (start, end) in enumerate(fwd_events):
+            for iter_idx in range(bench_iters):
                 _profiler_start_if_needed(iter_idx, profiler_start_iter)
-                start.record()
-                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-                end.record()
+                _record_timing_start(fwd_events, iter_idx, timing_mode)
+                out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
+                _record_timing_end(fwd_events, iter_idx, bench_iters, timing_mode)
                 _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
             torch.cuda.synchronize()
-            phase_times["fwd"] = statistics.median(
-                start.elapsed_time(end) for start, end in fwd_events
+            phase_times["fwd"] = _summarize_cuda_time(
+                fwd_events, bench_iters, timing_mode
             )
 
         if "bwd" in phases:
-            bwd_events = _make_cuda_events(bench_iters)
-            for iter_idx, (start, end) in enumerate(bwd_events):
+            bwd_events = _make_cuda_events(bench_iters, timing_mode)
+            if timing_mode == "aggregate":
                 tq.requires_grad_(True)
                 tk.requires_grad_(True)
                 tv.requires_grad_(True)
-                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
+                out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
+
+            for iter_idx in range(bench_iters):
+                if timing_mode == "per-iter":
+                    tq.requires_grad_(True)
+                    tk.requires_grad_(True)
+                    tv.requires_grad_(True)
+                    out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
                 _profiler_start_if_needed(iter_idx, profiler_start_iter)
-                start.record()
-                out.backward(grad_output)
-                end.record()
+                _record_timing_start(bwd_events, iter_idx, timing_mode)
+                torch.autograd.grad(
+                    out,
+                    (tq, tk, tv),
+                    grad_outputs=grad_output,
+                    retain_graph=timing_mode == "aggregate",
+                )
+                _record_timing_end(bwd_events, iter_idx, bench_iters, timing_mode)
                 _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
+                if timing_mode == "per-iter":
+                    tq = tq.detach()
+                    tk = tk.detach()
+                    tv = tv.detach()
+            torch.cuda.synchronize()
+            phase_times["bwd"] = _summarize_cuda_time(
+                bwd_events, bench_iters, timing_mode
+            )
+            if timing_mode == "aggregate":
+                del out
                 tq = tq.detach()
                 tk = tk.detach()
                 tv = tv.detach()
-            torch.cuda.synchronize()
-            phase_times["bwd"] = statistics.median(
-                start.elapsed_time(end) for start, end in bwd_events
-            )
 
         if "e2e" in phases:
-            e2e_events = _make_cuda_events(bench_iters)
-            for iter_idx, (start, end) in enumerate(e2e_events):
+            e2e_events = _make_cuda_events(bench_iters, timing_mode)
+            for iter_idx in range(bench_iters):
                 tq.requires_grad_(True)
                 tk.requires_grad_(True)
                 tv.requires_grad_(True)
                 _profiler_start_if_needed(iter_idx, profiler_start_iter)
-                start.record()
-                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-                out.backward(grad_output)
-                end.record()
+                _record_timing_start(e2e_events, iter_idx, timing_mode)
+                out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
+                torch.autograd.grad(
+                    out,
+                    (tq, tk, tv),
+                    grad_outputs=grad_output,
+                )
+                _record_timing_end(e2e_events, iter_idx, bench_iters, timing_mode)
                 _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
                 tq = tq.detach()
                 tk = tk.detach()
                 tv = tv.detach()
             torch.cuda.synchronize()
-            phase_times["e2e"] = statistics.median(
-                start.elapsed_time(end) for start, end in e2e_events
+            phase_times["e2e"] = _summarize_cuda_time(
+                e2e_events, bench_iters, timing_mode
             )
 
     phase_flops = {
@@ -609,7 +709,17 @@ def main():
         "--bench-iters",
         type=int,
         default=50,
-        help="Benchmark iterations per config (median is reported).",
+        help="Benchmark iterations per config.",
+    )
+    parser.add_argument(
+        "--timing-mode",
+        choices=TIMING_MODES,
+        default="per-iter",
+        help=(
+            "CUDA event timing method: per-iter uses one event pair per iteration "
+            "and reports the median; aggregate uses one pair around the full loop "
+            "and reports total elapsed time divided by the iteration count."
+        ),
     )
     parser.add_argument(
         "--cuda-graph",
@@ -678,6 +788,7 @@ def main():
     )
     attn = attn.to(dtype).cuda()
     attn.eval()  # deterministic (no dropout)
+    attn_fn = _get_unwrapped_attention_forward(attn)
 
     # ---- Device info ----
     device_spec = get_current_device_spec()
@@ -700,6 +811,9 @@ def main():
     print(f"  is_causal       : {is_causal}")
     print(f"  dtype           : {dtype_str}")
     print(f"  warmup/bench    : {args.warmup_iters}/{args.bench_iters} iters")
+    print(f"  timing_mode     : {args.timing_mode}")
+    print("  attention_call  : unwrapped forward")
+    print(f"  nvtx_hooks      : {'enabled' if nvtx_hooks_enabled() else 'disabled'}")
     print(f"  phases          : {','.join(args.phase)}")
     print(f"  cuda_graph      : {'enabled' if args.cuda_graph else 'disabled'}")
     print(
@@ -726,7 +840,7 @@ def main():
             tokens = bs * sl
             try:
                 r = _benchmark_one(
-                    attn,
+                    attn_fn,
                     bs,
                     sl,
                     num_heads,
@@ -736,6 +850,7 @@ def main():
                     dtype,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    timing_mode=args.timing_mode,
                     use_cuda_graph=args.cuda_graph,
                     phases=args.phase,
                     profiler_start_iter=args.profiler_start_iter,
@@ -793,6 +908,9 @@ def main():
         "seqlens": seqlens,
         "warmup_iters": args.warmup_iters,
         "bench_iters": args.bench_iters,
+        "timing_mode": args.timing_mode,
+        "attention_call": "unwrapped_forward",
+        "nvtx_hooks_enabled": nvtx_hooks_enabled(),
         "phases": list(args.phase),
         "cuda_graph": args.cuda_graph,
         "profiler_start_iter": args.profiler_start_iter,
