@@ -1,0 +1,7 @@
+NetworkArgs.num_layers = 1
+NetworkArgs.hidden_size = 512
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.kv_channels = 128
+NetworkArgs.kernel_backend = "triton"
+NetworkArgs.dtype_str = "bfloat16"
+NetworkArgs.is_causal = True
