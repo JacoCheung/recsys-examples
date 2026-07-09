@@ -1,0 +1,72 @@
+TrainerArgs.train_batch_size = 32
+TrainerArgs.eval_batch_size = 32
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 5000
+TrainerArgs.profile = True
+TrainerArgs.profile_step_start = 50
+TrainerArgs.profile_step_end = 80
+TrainerArgs.max_train_iters = 512
+TrainerArgs.max_eval_iters = 16
+
+# Item-ID value distribution: Zipf (long-tail), values in [0, +inf)
+item_value_dist/RandomDistribution.dist_type = 'zipf'
+item_value_dist/RandomDistribution.alpha = 1.2
+
+item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
+item_and_action_feature/FeatureArgs.max_sequence_length = 4096
+# Generate a full 4096-token sequence for every user.
+item_and_action_feature/FeatureArgs.is_jagged = False
+item_and_action_feature/FeatureArgs.value_dists = {
+    'item': @item_value_dist/RandomDistribution(),
+}
+
+BenchmarkDatasetArgs.feature_args = [
+    @item_and_action_feature/FeatureArgs(),
+]
+
+item_embedding/DynamicEmbeddingArgs.feature_names = ['item']
+item_embedding/DynamicEmbeddingArgs.table_name = 'item'
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 600000000
+item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1
+# Explicit value bytes preserve a 10% cache ratio despite hidden_size differing
+# from item_embedding_dim in the current DynamicEmb option construction path.
+item_embedding/DynamicEmbeddingArgs.global_hbm_for_values = 92160000000
+item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
+item_embedding/DynamicEmbeddingArgs.caching = True
+
+action_embedding/EmbeddingArgs.feature_names = ['action']
+action_embedding/EmbeddingArgs.table_name = 'action'
+action_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 100
+action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
+
+BenchmarkDatasetArgs.embedding_args = [
+    @item_embedding/DynamicEmbeddingArgs(),
+    @action_embedding/EmbeddingArgs(),
+]
+
+BenchmarkDatasetArgs.item_feature_name='item'
+BenchmarkDatasetArgs.contextual_feature_names=[]
+BenchmarkDatasetArgs.action_feature_name='action'
+BenchmarkDatasetArgs.max_num_candidates=0
+
+NetworkArgs.item_embedding_dim = 128
+NetworkArgs.contextual_embedding_dim = 256
+NetworkArgs.num_layers = 1
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 1024
+# per head dim
+NetworkArgs.kv_channels = 256
+NetworkArgs.kernel_backend = 'cutlass'
+
+# recompute can incurs perf regression, but save memory
+NetworkArgs.recompute_input_layernorm = True
+NetworkArgs.recompute_input_silu = False
+
+RankingArgs.prediction_head_arch = [
+    512, 8,
+]
+RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 8
+
+OptimizerArgs.optimizer_str = 'adam'
+OptimizerArgs.learning_rate = 1e-3
