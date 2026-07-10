@@ -14,6 +14,7 @@
 # limitations under the License.
 
 # pyre-strict
+import os
 from typing import Dict, Tuple, Union
 
 import torch
@@ -153,6 +154,13 @@ _optimizer_str_to_optim_type = {
 }
 
 
+def _enable_index_dedup() -> bool:
+    value = os.environ.get("ENABLE_DEDUP", "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"ENABLE_DEDUP must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
 def apply_dmp(
     model: torch.nn.Module,
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
@@ -210,7 +218,7 @@ def apply_dmp(
         ),
         DynamicEmbeddingCollectionSharder(
             qcomm_codecs_registry=qcomm_codecs_registry,
-            use_index_dedup=True,
+            use_index_dedup=_enable_index_dedup(),
             fused_params=fused_params,
         ),
     ]
