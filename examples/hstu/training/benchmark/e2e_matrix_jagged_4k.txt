@@ -1,0 +1,6 @@
+# E2E benchmark matrix: jagged data, maximum sequence length 4096.
+# Keep this list aligned with the first three experiments in experiments.txt.
+
+exp0_baseline,--value_dist zipf --value_dist_alpha 1.05 --max_sequence_length 4096 --include-contextual --log_interval 100 --max_train_iters 1000
+exp1_shuffler,--balanced_shuffler --value_dist zipf --value_dist_alpha 1.05 --max_sequence_length 4096 --include-contextual --log_interval 100 --max_train_iters 1000
+exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.05 --max_sequence_length 4096 --include-contextual --log_interval 100 --max_train_iters 1000
