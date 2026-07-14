@@ -1,0 +1,5 @@
+# E2E benchmark matrix for Blackwell: dense data, head dim 128, sequence 4096.
+
+exp0_baseline,--kv_channels 128 --non_jagged --value_dist zipf --value_dist_alpha 1.05 --max_sequence_length 4096 --include-contextual --log_interval 100 --max_train_iters 1000
+exp1_shuffler,--kv_channels 128 --non_jagged --balanced_shuffler --value_dist zipf --value_dist_alpha 1.05 --max_sequence_length 4096 --include-contextual --log_interval 100 --max_train_iters 1000
+exp2_cutlass,--kv_channels 128 --non_jagged --balanced_shuffler --kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.05 --max_sequence_length 4096 --include-contextual --log_interval 100 --max_train_iters 1000
